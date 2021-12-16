@@ -477,13 +477,28 @@ func (sys *IAMSys) DeletePolicy(ctx context.Context, policyName string, notifyPe
 	return nil
 }
 
-// InfoPolicy - expands the canned policy into its JSON structure.
-func (sys *IAMSys) InfoPolicy(policyName string) (iampolicy.Policy, error) {
+// InfoPolicy - returns the policy definition with some metadata.
+func (sys *IAMSys) InfoPolicy(policyName string) (*madmin.PolicyInfo, error) {
 	if !sys.Initialized() {
-		return iampolicy.Policy{}, errServerNotInitialized
+		return nil, errServerNotInitialized
 	}
 
-	return sys.store.GetPolicy(policyName)
+	d, err := sys.store.GetPolicyDoc(policyName)
+	if err != nil {
+		return nil, err
+	}
+
+	pdata, err := json.Marshal(d.Policy)
+	if err != nil {
+		return nil, err
+	}
+
+	return &madmin.PolicyInfo{
+		PolicyName: policyName,
+		Policy:     pdata,
+		CreateDate: d.CreateDate,
+		UpdateDate: d.UpdateDate,
+	}, nil
 }
 
 // ListPolicies - lists all canned policies.
@@ -1176,7 +1191,7 @@ func (sys *IAMSys) PolicyDBSet(ctx context.Context, name, policy string, isGroup
 
 	err := sys.store.PolicyDBSet(ctx, name, policy, userType, isGroup)
 	if err != nil {
-		return nil
+		return err
 	}
 
 	// Notify all other MinIO peers to reload policy

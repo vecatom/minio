@@ -113,6 +113,7 @@ func main() {
 				continue
 			}
 			parts := 1
+			multipart := false
 			s := strings.Split(object.ETag, "-")
 			switch len(s) {
 			case 1:
@@ -121,11 +122,13 @@ func main() {
 				if p, err := strconv.Atoi(s[1]); err == nil {
 					parts = p
 				} else {
-					log.Fatalln("ETAG: wrong format:", err)
+					log.Println("ETAG: wrong format:", err)
 					continue
 				}
+				multipart = true
 			default:
-				log.Fatalln("Unexpected ETAG format", object.ETag)
+				log.Println("Unexpected ETAG format", object.ETag)
+				continue
 			}
 
 			var partsMD5Sum [][]byte
@@ -134,12 +137,12 @@ func main() {
 				obj, err := s3Client.GetObject(context.Background(), bucket, object.Key,
 					minio.GetObjectOptions{VersionID: object.VersionID, PartNumber: p})
 				if err != nil {
-					log.Fatalln("GET", bucket, object.Key, object.VersionID, "=>", err)
+					log.Println("GET", bucket, object.Key, object.VersionID, "=>", err)
 					continue
 				}
 				h := md5.New()
 				if _, err := io.Copy(h, obj); err != nil {
-					log.Fatalln("MD5 calculation error:", bucket, object.Key, object.VersionID, "=>", err)
+					log.Println("MD5 calculation error:", bucket, object.Key, object.VersionID, "=>", err)
 					continue
 				}
 				partsMD5Sum = append(partsMD5Sum, h.Sum(nil))
@@ -147,13 +150,12 @@ func main() {
 
 			corrupted := false
 
-			switch parts {
-			case 1:
+			if !multipart {
 				md5sum := fmt.Sprintf("%x", partsMD5Sum[0])
 				if md5sum != object.ETag {
 					corrupted = true
 				}
-			default:
+			} else {
 				var totalMD5SumBytes []byte
 				for _, sum := range partsMD5Sum {
 					totalMD5SumBytes = append(totalMD5SumBytes, sum...)
@@ -165,10 +167,10 @@ func main() {
 			}
 
 			if corrupted {
-				log.Fatalln("CORRUPTED object:", bucket, object.Key, object.VersionID)
+				log.Println("CORRUPTED object:", bucket, object.Key, object.VersionID)
+			} else {
+				log.Println("INTACT", bucket, object.Key, object.VersionID)
 			}
-
-			log.Println("INTACT", bucket, object.Key, object.VersionID)
 		}
 	}
 }
