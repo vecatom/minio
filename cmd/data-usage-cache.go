@@ -225,7 +225,6 @@ type dataUsageEntryV6 struct {
 type dataUsageCache struct {
 	Info  dataUsageCacheInfo
 	Cache map[string]dataUsageEntry
-	Disks []string
 }
 
 //msgp:encode ignore dataUsageCacheV2 dataUsageCacheV3 dataUsageCacheV4 dataUsageCacheV5 dataUsageCacheV6
@@ -234,35 +233,30 @@ type dataUsageCache struct {
 // dataUsageCacheV2 contains a cache of data usage entries version 2.
 type dataUsageCacheV2 struct {
 	Info  dataUsageCacheInfo
-	Disks []string
 	Cache map[string]dataUsageEntryV2
 }
 
 // dataUsageCacheV3 contains a cache of data usage entries version 3.
 type dataUsageCacheV3 struct {
 	Info  dataUsageCacheInfo
-	Disks []string
 	Cache map[string]dataUsageEntryV3
 }
 
 // dataUsageCacheV4 contains a cache of data usage entries version 4.
 type dataUsageCacheV4 struct {
 	Info  dataUsageCacheInfo
-	Disks []string
 	Cache map[string]dataUsageEntryV4
 }
 
 // dataUsageCacheV5 contains a cache of data usage entries version 5.
 type dataUsageCacheV5 struct {
 	Info  dataUsageCacheInfo
-	Disks []string
 	Cache map[string]dataUsageEntryV5
 }
 
 // dataUsageCacheV6 contains a cache of data usage entries version 6.
 type dataUsageCacheV6 struct {
 	Info  dataUsageCacheInfo
-	Disks []string
 	Cache map[string]dataUsageEntryV6
 }
 
@@ -373,6 +367,17 @@ func (h dataUsageHash) mod(cycle uint32, cycles uint32) bool {
 		return cycles == 1
 	}
 	return uint32(xxhash.Sum64String(string(h)))%cycles == cycle%cycles
+}
+
+// modAlt returns true if the hash mod cycles == cycle.
+// This is out of sync with mod.
+// If cycles is 0 false is always returned.
+// If cycles is 1 true is always returned (as expected).
+func (h dataUsageHash) modAlt(cycle uint32, cycles uint32) bool {
+	if cycles <= 1 {
+		return cycles == 1
+	}
+	return uint32(xxhash.Sum64String(string(h))>>32)%(cycles) == cycle%cycles
 }
 
 // addChild will add a child based on its hash.
@@ -624,7 +629,7 @@ func (d *dataUsageCache) reduceChildrenOf(path dataUsageHash, limit int, compact
 	// Appears to be printed with _MINIO_SERVER_DEBUG=off
 	// console.Debugf(" %d children found, compacting %v\n", total, path)
 
-	var leaves = make([]struct {
+	leaves := make([]struct {
 		objects uint64
 		path    dataUsageHash
 	}, total)
@@ -774,7 +779,7 @@ func (d *dataUsageCache) tiersUsageInfo(buckets []BucketInfo) *allTierStats {
 // bucketsUsageInfo returns the buckets usage info as a map, with
 // key as bucket name
 func (d *dataUsageCache) bucketsUsageInfo(buckets []BucketInfo) map[string]BucketUsageInfo {
-	var dst = make(map[string]BucketUsageInfo, len(buckets))
+	dst := make(map[string]BucketUsageInfo, len(buckets))
 	for _, bucket := range buckets {
 		e := d.find(bucket.Name)
 		if e == nil {
@@ -797,41 +802,11 @@ func (d *dataUsageCache) bucketsUsageInfo(buckets []BucketInfo) map[string]Bucke
 					ReplicationPendingCount: stat.PendingCount,
 					ReplicationFailedCount:  stat.FailedCount,
 				}
-
 			}
 		}
 		dst[bucket.Name] = bui
 	}
 	return dst
-}
-
-// bucketUsageInfo returns the buckets usage info.
-// If not found all values returned are zero values.
-func (d *dataUsageCache) bucketUsageInfo(bucket string) BucketUsageInfo {
-	e := d.find(bucket)
-	if e == nil {
-		return BucketUsageInfo{}
-	}
-	flat := d.flatten(*e)
-	bui := BucketUsageInfo{
-		Size:                 uint64(flat.Size),
-		ObjectsCount:         flat.Objects,
-		ObjectSizesHistogram: flat.ObjSizes.toMap(),
-	}
-	if flat.ReplicationStats != nil {
-		bui.ReplicaSize = flat.ReplicationStats.ReplicaSize
-		bui.ReplicationInfo = make(map[string]BucketTargetUsageInfo, len(flat.ReplicationStats.Targets))
-		for arn, stat := range flat.ReplicationStats.Targets {
-			bui.ReplicationInfo[arn] = BucketTargetUsageInfo{
-				ReplicationPendingSize:  stat.PendingSize,
-				ReplicatedSize:          stat.ReplicatedSize,
-				ReplicationFailedSize:   stat.FailedSize,
-				ReplicationPendingCount: stat.PendingCount,
-				ReplicationFailedCount:  stat.FailedCount,
-			}
-		}
-	}
-	return bui
 }
 
 // sizeRecursive returns the path as a flattened entry.
@@ -922,6 +897,7 @@ func (d *dataUsageCache) load(ctx context.Context, store objectIO, name string) 
 	// Abandon if more than 5 minutes, so we don't hold up scanner.
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
+
 	r, err := store.GetObjectNInfo(ctx, dataUsageBucket, name, nil, http.Header{}, readLock, ObjectOptions{})
 	if err != nil {
 		switch err.(type) {
@@ -1037,7 +1013,6 @@ func (d *dataUsageCache) deserialize(r io.Reader) error {
 			return err
 		}
 		d.Info = dold.Info
-		d.Disks = dold.Disks
 		d.Cache = make(map[string]dataUsageEntry, len(dold.Cache))
 		for k, v := range dold.Cache {
 			d.Cache[k] = dataUsageEntry{
@@ -1061,7 +1036,6 @@ func (d *dataUsageCache) deserialize(r io.Reader) error {
 			return err
 		}
 		d.Info = dold.Info
-		d.Disks = dold.Disks
 		d.Cache = make(map[string]dataUsageEntry, len(dold.Cache))
 		for k, v := range dold.Cache {
 			due := dataUsageEntry{
@@ -1101,7 +1075,6 @@ func (d *dataUsageCache) deserialize(r io.Reader) error {
 			return err
 		}
 		d.Info = dold.Info
-		d.Disks = dold.Disks
 		d.Cache = make(map[string]dataUsageEntry, len(dold.Cache))
 		for k, v := range dold.Cache {
 			due := dataUsageEntry{
@@ -1153,7 +1126,6 @@ func (d *dataUsageCache) deserialize(r io.Reader) error {
 			return err
 		}
 		d.Info = dold.Info
-		d.Disks = dold.Disks
 		d.Cache = make(map[string]dataUsageEntry, len(dold.Cache))
 		for k, v := range dold.Cache {
 			due := dataUsageEntry{
@@ -1205,7 +1177,6 @@ func (d *dataUsageCache) deserialize(r io.Reader) error {
 			return err
 		}
 		d.Info = dold.Info
-		d.Disks = dold.Disks
 		d.Cache = make(map[string]dataUsageEntry, len(dold.Cache))
 		for k, v := range dold.Cache {
 			var replicationStats *replicationAllStats

@@ -45,8 +45,7 @@ func (a adminAPIHandlers) SiteReplicationAdd(w http.ResponseWriter, r *http.Requ
 	}
 
 	var sites []madmin.PeerSite
-	err := parseJSONBody(ctx, r.Body, &sites, cred.SecretKey)
-	if err != nil {
+	if err := parseJSONBody(ctx, r.Body, &sites, cred.SecretKey); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
@@ -67,12 +66,12 @@ func (a adminAPIHandlers) SiteReplicationAdd(w http.ResponseWriter, r *http.Requ
 	writeSuccessResponseJSON(w, body)
 }
 
-// SRInternalJoin - PUT /minio/admin/v3/site-replication/join
+// SRPeerJoin - PUT /minio/admin/v3/site-replication/join
 //
 // used internally to tell current cluster to enable SR with
 // the provided peer clusters and service account.
-func (a adminAPIHandlers) SRInternalJoin(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "SRInternalJoin")
+func (a adminAPIHandlers) SRPeerJoin(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "SRPeerJoin")
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
@@ -81,22 +80,22 @@ func (a adminAPIHandlers) SRInternalJoin(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	var joinArg madmin.SRInternalJoinReq
+	var joinArg madmin.SRPeerJoinReq
 	if err := parseJSONBody(ctx, r.Body, &joinArg, cred.SecretKey); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
-	if err := globalSiteReplicationSys.InternalJoinReq(ctx, joinArg); err != nil {
+	if err := globalSiteReplicationSys.PeerJoinReq(ctx, joinArg); err != nil {
 		logger.LogIf(ctx, err)
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 }
 
-// SRInternalBucketOps - PUT /minio/admin/v3/site-replication/bucket-ops?bucket=x&operation=y
-func (a adminAPIHandlers) SRInternalBucketOps(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "SRInternalBucketOps")
+// SRPeerBucketOps - PUT /minio/admin/v3/site-replication/bucket-ops?bucket=x&operation=y
+func (a adminAPIHandlers) SRPeerBucketOps(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "SRPeerBucketOps")
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
@@ -134,12 +133,11 @@ func (a adminAPIHandlers) SRInternalBucketOps(w http.ResponseWriter, r *http.Req
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
-
 }
 
-// SRInternalReplicateIAMItem - PUT /minio/admin/v3/site-replication/iam-item
-func (a adminAPIHandlers) SRInternalReplicateIAMItem(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "SRInternalReplicateIAMItem")
+// SRPeerReplicateIAMItem - PUT /minio/admin/v3/site-replication/iam-item
+func (a adminAPIHandlers) SRPeerReplicateIAMItem(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "SRPeerReplicateIAMItem")
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
@@ -179,6 +177,10 @@ func (a adminAPIHandlers) SRInternalReplicateIAMItem(w http.ResponseWriter, r *h
 		err = globalSiteReplicationSys.PeerPolicyMappingHandler(ctx, item.PolicyMapping)
 	case madmin.SRIAMItemSTSAcc:
 		err = globalSiteReplicationSys.PeerSTSAccHandler(ctx, item.STSCredential)
+	case madmin.SRIAMItemIAMUser:
+		err = globalSiteReplicationSys.PeerIAMUserChangeHandler(ctx, item.IAMUser)
+	case madmin.SRIAMItemGroupInfo:
+		err = globalSiteReplicationSys.PeerGroupInfoChangeHandler(ctx, item.GroupInfo)
 	}
 	if err != nil {
 		logger.LogIf(ctx, err)
@@ -187,9 +189,9 @@ func (a adminAPIHandlers) SRInternalReplicateIAMItem(w http.ResponseWriter, r *h
 	}
 }
 
-// SRInternalReplicateBucketItem - PUT /minio/admin/v3/site-replication/bucket-meta
-func (a adminAPIHandlers) SRInternalReplicateBucketItem(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "SRInternalReplicateBucketItem")
+// SRPeerReplicateBucketItem - PUT /minio/admin/v3/site-replication/bucket-meta
+func (a adminAPIHandlers) SRPeerReplicateBucketItem(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "SRPeerReplicateBucketItem")
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
@@ -223,6 +225,20 @@ func (a adminAPIHandlers) SRInternalReplicateBucketItem(w http.ResponseWriter, r
 				err = globalSiteReplicationSys.PeerBucketPolicyHandler(ctx, item.Bucket, bktPolicy)
 			}
 		}
+	case madmin.SRBucketMetaTypeQuotaConfig:
+		if item.Quota == nil {
+			err = globalSiteReplicationSys.PeerBucketQuotaConfigHandler(ctx, item.Bucket, nil)
+		} else {
+			quotaConfig, err := parseBucketQuota(item.Bucket, item.Quota)
+			if err != nil {
+				writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+				return
+			}
+			if err = globalSiteReplicationSys.PeerBucketQuotaConfigHandler(ctx, item.Bucket, quotaConfig); err != nil {
+				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+				return
+			}
+		}
 	case madmin.SRBucketMetaTypeTags:
 		err = globalSiteReplicationSys.PeerBucketTaggingHandler(ctx, item.Bucket, item.Tags)
 	case madmin.SRBucketMetaTypeObjectLockConfig:
@@ -233,18 +249,6 @@ func (a adminAPIHandlers) SRInternalReplicateBucketItem(w http.ResponseWriter, r
 	if err != nil {
 		logger.LogIf(ctx, err)
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
-	}
-}
-
-// SiteReplicationDisable - PUT /minio/admin/v3/site-replication/disable
-func (a adminAPIHandlers) SiteReplicationDisable(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "SiteReplicationDisable")
-
-	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
-
-	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.SiteReplicationDisableAction)
-	if objectAPI == nil {
 		return
 	}
 }
@@ -272,7 +276,7 @@ func (a adminAPIHandlers) SiteReplicationInfo(w http.ResponseWriter, r *http.Req
 	}
 }
 
-func (a adminAPIHandlers) SRInternalGetIDPSettings(w http.ResponseWriter, r *http.Request) {
+func (a adminAPIHandlers) SRPeerGetIDPSettings(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "SiteReplicationGetIDPSettings")
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
@@ -297,7 +301,6 @@ func parseJSONBody(ctx context.Context, body io.Reader, v interface{}, encryptio
 			Code:  ErrSiteReplicationInvalidRequest,
 		}
 	}
-
 	if encryptionKey != "" {
 		data, err = madmin.DecryptData(encryptionKey, bytes.NewReader(data))
 		if err != nil {
@@ -308,6 +311,182 @@ func parseJSONBody(ctx context.Context, body io.Reader, v interface{}, encryptio
 			}
 		}
 	}
-
 	return json.Unmarshal(data, v)
+}
+
+// SiteReplicationStatus - GET /minio/admin/v3/site-replication/status
+func (a adminAPIHandlers) SiteReplicationStatus(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "SiteReplicationStatus")
+
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.SiteReplicationInfoAction)
+	if objectAPI == nil {
+		return
+	}
+	opts := getSRStatusOptions(r)
+	// default options to all if status options are unset for backward compatibility
+	var dfltOpts madmin.SRStatusOptions
+	if opts == dfltOpts {
+		opts.Buckets = true
+		opts.Users = true
+		opts.Policies = true
+		opts.Groups = true
+	}
+	info, err := globalSiteReplicationSys.SiteReplicationStatus(ctx, objectAPI, opts)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+
+	if err = json.NewEncoder(w).Encode(info); err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+}
+
+// SiteReplicationMetaInfo - GET /minio/admin/v3/site-replication/metainfo
+func (a adminAPIHandlers) SiteReplicationMetaInfo(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "SiteReplicationMetaInfo")
+
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.SiteReplicationInfoAction)
+	if objectAPI == nil {
+		return
+	}
+
+	opts := getSRStatusOptions(r)
+	info, err := globalSiteReplicationSys.SiteReplicationMetaInfo(ctx, objectAPI, opts)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+
+	if err = json.NewEncoder(w).Encode(info); err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+}
+
+// SiteReplicationEdit - PUT /minio/admin/v3/site-replication/edit
+func (a adminAPIHandlers) SiteReplicationEdit(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "SiteReplicationEdit")
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	objectAPI, cred := validateAdminReq(ctx, w, r, iampolicy.SiteReplicationAddAction)
+	if objectAPI == nil {
+		return
+	}
+	var site madmin.PeerInfo
+	err := parseJSONBody(ctx, r.Body, &site, cred.SecretKey)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+	status, err := globalSiteReplicationSys.EditPeerCluster(ctx, site)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+	body, err := json.Marshal(status)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+
+	writeSuccessResponseJSON(w, body)
+}
+
+// SRPeerEdit - PUT /minio/admin/v3/site-replication/peer/edit
+//
+// used internally to tell current cluster to update endpoint for peer
+func (a adminAPIHandlers) SRPeerEdit(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "SRPeerEdit")
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.SiteReplicationAddAction)
+	if objectAPI == nil {
+		return
+	}
+
+	var pi madmin.PeerInfo
+	if err := parseJSONBody(ctx, r.Body, &pi, ""); err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+
+	if err := globalSiteReplicationSys.PeerEditReq(ctx, pi); err != nil {
+		logger.LogIf(ctx, err)
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+}
+
+func getSRStatusOptions(r *http.Request) (opts madmin.SRStatusOptions) {
+	q := r.Form
+	opts.Buckets = q.Get("buckets") == "true"
+	opts.Policies = q.Get("policies") == "true"
+	opts.Groups = q.Get("groups") == "true"
+	opts.Users = q.Get("users") == "true"
+	opts.Entity = madmin.GetSREntityType(q.Get("entity"))
+	opts.EntityValue = q.Get("entityvalue")
+	return
+}
+
+// SiteReplicationRemove - PUT /minio/admin/v3/site-replication/remove
+func (a adminAPIHandlers) SiteReplicationRemove(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "SiteReplicationRemove")
+
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.SiteReplicationRemoveAction)
+	if objectAPI == nil {
+		return
+	}
+	var rreq madmin.SRRemoveReq
+	err := parseJSONBody(ctx, r.Body, &rreq, "")
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+	status, err := globalSiteReplicationSys.RemovePeerCluster(ctx, objectAPI, rreq)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+
+	body, err := json.Marshal(status)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+	writeSuccessResponseJSON(w, body)
+}
+
+// SRPeerRemove - PUT /minio/admin/v3/site-replication/peer/remove
+//
+// used internally to tell current cluster to update endpoint for peer
+func (a adminAPIHandlers) SRPeerRemove(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "SRPeerRemove")
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.SiteReplicationRemoveAction)
+	if objectAPI == nil {
+		return
+	}
+
+	var req madmin.SRRemoveReq
+	if err := parseJSONBody(ctx, r.Body, &req, ""); err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+
+	if err := globalSiteReplicationSys.InternalRemoveReq(ctx, objectAPI, req); err != nil {
+		logger.LogIf(ctx, err)
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
 }

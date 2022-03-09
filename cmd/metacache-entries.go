@@ -191,6 +191,16 @@ func (e *metaCacheEntry) fileInfo(bucket string) (FileInfo, error) {
 		}, nil
 	}
 	if e.cached != nil {
+		if len(e.cached.versions) == 0 {
+			// This special case is needed to handle xlMeta.versions == 0
+			return FileInfo{
+				Volume:   bucket,
+				Name:     e.name,
+				Deleted:  true,
+				IsLatest: true,
+				ModTime:  timeSentinel1970,
+			}, nil
+		}
 		return e.cached.ToFileInfo(bucket, e.name, "")
 	}
 	return getFileInfo(e.metadata, bucket, e.name, "", false)
@@ -379,11 +389,11 @@ func (m metaCacheEntries) resolve(r *metadataResolutionParams) (selected *metaCa
 
 // firstFound returns the first found and the number of set entries.
 func (m metaCacheEntries) firstFound() (first *metaCacheEntry, n int) {
-	for _, entry := range m {
+	for i, entry := range m {
 		if entry.name != "" {
 			n++
 			if first == nil {
-				first = &entry
+				first = &m[i]
 			}
 		}
 	}

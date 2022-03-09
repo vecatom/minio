@@ -18,6 +18,8 @@
 package subnet
 
 import (
+	"net/url"
+
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/pkg/env"
 )
@@ -33,6 +35,10 @@ var (
 			Key:   config.APIKey,
 			Value: "",
 		},
+		config.KV{
+			Key:   config.Proxy,
+			Value: "",
+		},
 	}
 
 	// HelpSubnet - provides help for subnet api key config
@@ -42,12 +48,21 @@ var (
 			Type:        "string",
 			Description: "[DEPRECATED use api_key] Subnet license token for the cluster",
 			Optional:    true,
+			Sensitive:   true,
 		},
 		config.HelpKV{
 			Key:         config.APIKey,
 			Type:        "string",
 			Description: "Subnet api key for the cluster",
 			Optional:    true,
+			Sensitive:   true,
+		},
+		config.HelpKV{
+			Key:         config.Proxy,
+			Type:        "string",
+			Description: "HTTP(S) proxy URL to use for connecting to SUBNET",
+			Optional:    true,
+			Sensitive:   true,
 		},
 	}
 )
@@ -59,11 +74,20 @@ type Config struct {
 
 	// The subnet api key
 	APIKey string `json:"api_key"`
+
+	// The HTTP(S) proxy URL to use for connecting to SUBNET
+	Proxy string `json:"proxy"`
 }
 
 // LookupConfig - lookup config and override with valid environment settings if any.
 func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 	if err = config.CheckValidKeys(config.SubnetSubSys, kvs, DefaultKVS); err != nil {
+		return cfg, err
+	}
+
+	cfg.Proxy = env.Get(config.EnvMinIOSubnetProxy, kvs.Get(config.Proxy))
+	_, err = url.Parse(cfg.Proxy)
+	if err != nil {
 		return cfg, err
 	}
 

@@ -118,6 +118,9 @@ const (
 
 	// diskMinInodes is the minimum number of inodes we want free on a disk to perform writes.
 	diskMinInodes = 1000
+
+	// tlsClientSessionCacheSize is the cache size for client sessions.
+	tlsClientSessionCacheSize = 100
 )
 
 var globalCLIContext = struct {
@@ -334,6 +337,18 @@ var (
 	// Only needed for tracking
 	globalServiceFreezeCnt int32
 	globalServiceFreezeMu  sync.Mutex // Updates.
+
+	// List of local drives to this node, this is only set during server startup.
+	globalLocalDrives []StorageAPI
+
+	// Is MINIO_CI_CD set?
+	globalIsCICD bool
+
+	globalRootDiskThreshold uint64
+
+	// Used for collecting stats for netperf
+	globalNetPerfMinDuration = time.Second * 10
+	globalNetPerfRX          netPerfRX
 
 	// Add new variable global values here.
 )

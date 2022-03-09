@@ -62,6 +62,7 @@ const (
 	SecretKey  = "secret_key"
 	License    = "license" // Deprecated Dec 2021
 	APIKey     = "api_key"
+	Proxy      = "proxy"
 )
 
 // Top level config constants.
@@ -105,6 +106,27 @@ const (
 	// Add new constants here if you add new fields to config.
 )
 
+// NotifySubSystems - all notification sub-systems
+var NotifySubSystems = set.CreateStringSet(
+	NotifyKafkaSubSys,
+	NotifyMQTTSubSys,
+	NotifyMySQLSubSys,
+	NotifyNATSSubSys,
+	NotifyNSQSubSys,
+	NotifyESSubSys,
+	NotifyAMQPSubSys,
+	NotifyPostgresSubSys,
+	NotifyRedisSubSys,
+	NotifyWebhookSubSys,
+)
+
+// LoggerSubSystems - all sub-systems related to logger
+var LoggerSubSystems = set.CreateStringSet(
+	LoggerWebhookSubSys,
+	AuditWebhookSubSys,
+	AuditKafkaSubSys,
+)
+
 // SubSystems - all supported sub-systems
 var SubSystems = set.CreateStringSet(
 	CredentialsSubSys,
@@ -144,6 +166,9 @@ var SubSystemsDynamic = set.CreateStringSet(
 	ScannerSubSys,
 	HealSubSys,
 	SubnetSubSys,
+	LoggerWebhookSubSys,
+	AuditWebhookSubSys,
+	AuditKafkaSubSys,
 )
 
 // SubSystemsSingleTargets - subsystems which only support single target.
@@ -252,7 +277,7 @@ func (kvs KVS) GetWithDefault(key string, defaultKVS KVS) string {
 
 // Keys returns the list of keys for the current KVS
 func (kvs KVS) Keys() []string {
-	var keys = make([]string, len(kvs))
+	keys := make([]string, len(kvs))
 	var foundComment bool
 	for i := range kvs {
 		if kvs[i].Key == madmin.CommentKey {
@@ -783,41 +808,50 @@ func (c Config) Clone() Config {
 	return cp
 }
 
-// SetKVS - set specific key values per sub-system.
-func (c Config) SetKVS(s string, defaultKVS map[string]KVS) (dynamic bool, err error) {
+// GetSubSys - extracts subssystem info from given config string
+func GetSubSys(s string) (subSys string, inputs []string, tgt string, e error) {
+	tgt = Default
 	if len(s) == 0 {
-		return false, Errorf("input arguments cannot be empty")
+		return subSys, inputs, tgt, Errorf("input arguments cannot be empty")
 	}
-	inputs := strings.SplitN(s, KvSpaceSeparator, 2)
-	if len(inputs) <= 1 {
-		return false, Errorf("invalid number of arguments '%s'", s)
-	}
+	inputs = strings.SplitN(s, KvSpaceSeparator, 2)
+
 	subSystemValue := strings.SplitN(inputs[0], SubSystemSeparator, 2)
-	if len(subSystemValue) == 0 {
-		return false, Errorf("invalid number of arguments %s", s)
+	subSys = subSystemValue[0]
+	if !SubSystems.Contains(subSys) {
+		return subSys, inputs, tgt, Errorf("unknown sub-system %s", s)
 	}
 
-	if !SubSystems.Contains(subSystemValue[0]) {
-		return false, Errorf("unknown sub-system %s", s)
+	if len(inputs) == 1 {
+		return subSys, inputs, tgt, nil
 	}
 
 	if SubSystemsSingleTargets.Contains(subSystemValue[0]) && len(subSystemValue) == 2 {
-		return false, Errorf("sub-system '%s' only supports single target", subSystemValue[0])
+		return subSys, inputs, tgt, Errorf("sub-system '%s' only supports single target", subSystemValue[0])
 	}
-	dynamic = SubSystemsDynamic.Contains(subSystemValue[0])
 
-	tgt := Default
-	subSys := subSystemValue[0]
 	if len(subSystemValue) == 2 {
 		tgt = subSystemValue[1]
 	}
+
+	return subSys, inputs, tgt, e
+}
+
+// SetKVS - set specific key values per sub-system.
+func (c Config) SetKVS(s string, defaultKVS map[string]KVS) (dynamic bool, err error) {
+	subSys, inputs, tgt, err := GetSubSys(s)
+	if err != nil {
+		return false, err
+	}
+
+	dynamic = SubSystemsDynamic.Contains(subSys)
 
 	fields := madmin.KvFields(inputs[1], defaultKVS[subSys].Keys())
 	if len(fields) == 0 {
 		return false, Errorf("sub-system '%s' cannot have empty keys", subSys)
 	}
 
-	var kvs = KVS{}
+	kvs := KVS{}
 	var prevK string
 	for _, v := range fields {
 		kv := strings.SplitN(v, KvSeparator, 2)

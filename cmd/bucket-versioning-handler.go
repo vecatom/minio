@@ -95,7 +95,7 @@ func (api objectAPIHandlers) PutBucketVersioningHandler(w http.ResponseWriter, r
 		return
 	}
 
-	if err = globalBucketMetadataSys.Update(bucket, bucketVersioningConfig, configData); err != nil {
+	if err = globalBucketMetadataSys.Update(ctx, bucket, bucketVersioningConfig, configData); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -144,5 +144,4 @@ func (api objectAPIHandlers) GetBucketVersioningHandler(w http.ResponseWriter, r
 
 	// Write bucket versioning configuration to client
 	writeSuccessResponseXML(w, configData)
-
 }

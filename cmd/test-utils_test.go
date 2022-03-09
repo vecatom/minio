@@ -111,7 +111,7 @@ func TestMain(m *testing.M) {
 
 	resetTestGlobals()
 
-	os.Setenv("MINIO_CI_CD", "ci")
+	globalIsCICD = true
 
 	os.Exit(m.Run())
 }
@@ -223,7 +223,7 @@ func initFSObjects(disk string, t *testing.T) (obj ObjectLayer) {
 
 	newTestConfig(globalMinioDefaultRegion, obj)
 
-	newAllSubsystems()
+	initAllSubsystems()
 	return obj
 }
 
@@ -256,8 +256,10 @@ const (
 // Random number state.
 // We generate random temporary file names so that there's a good
 // chance the file doesn't exist yet.
-var randN uint32
-var randmu sync.Mutex
+var (
+	randN  uint32
+	randmu sync.Mutex
+)
 
 // Temp files created in default Tmp dir
 var globalTestTmpDir = os.TempDir()
@@ -353,13 +355,13 @@ func initTestServerWithBackend(ctx context.Context, t TestErrHandler, testServer
 	globalMinioPort = port
 	globalMinioAddr = getEndpointsLocalAddr(testServer.Disks)
 
-	newAllSubsystems()
+	initAllSubsystems()
 
 	globalEtcdClient = nil
 
 	initConfigSubsystem(ctx, objLayer)
 
-	globalIAMSys.Init(ctx, objLayer, globalEtcdClient, globalNotificationSys, 2*time.Second)
+	globalIAMSys.Init(ctx, objLayer, globalEtcdClient, 2*time.Second)
 
 	return testServer
 }
@@ -723,8 +725,8 @@ func newTestStreamingRequest(method, urlStr string, dataLength, chunkSize int64,
 }
 
 func assembleStreamingChunks(req *http.Request, body io.ReadSeeker, chunkSize int64,
-	secretKey, signature string, currTime time.Time) (*http.Request, error) {
-
+	secretKey, signature string, currTime time.Time) (*http.Request, error,
+) {
 	regionStr := globalSite.Region
 	var stream []byte
 	var buffer []byte
@@ -1204,13 +1206,11 @@ func randString(n int) string {
 // generate random object name.
 func getRandomObjectName() string {
 	return randString(16)
-
 }
 
 // generate random bucket name.
 func getRandomBucketName() string {
 	return randString(60)
-
 }
 
 // construct URL for http requests for bucket operations.
@@ -1262,7 +1262,6 @@ func getMultiDeleteObjectURL(endPoint, bucketName string) string {
 	queryValue := url.Values{}
 	queryValue.Set("delete", "")
 	return makeTestTargetURL(endPoint, bucketName, "", queryValue)
-
 }
 
 // return URL for HEAD on the object.
@@ -1475,7 +1474,7 @@ func newTestObjectLayer(ctx context.Context, endpointServerPools EndpointServerP
 		return nil, err
 	}
 
-	newAllSubsystems()
+	initAllSubsystems()
 
 	return z, nil
 }
@@ -1519,11 +1518,11 @@ func removeDiskN(disks []string, n int) {
 // initialies the root and returns its path.
 // return credentials.
 func initAPIHandlerTest(ctx context.Context, obj ObjectLayer, endpoints []string) (string, http.Handler, error) {
-	newAllSubsystems()
+	initAllSubsystems()
 
 	initConfigSubsystem(ctx, obj)
 
-	globalIAMSys.Init(ctx, obj, globalEtcdClient, globalNotificationSys, 2*time.Second)
+	globalIAMSys.Init(ctx, obj, globalEtcdClient, 2*time.Second)
 
 	// get random bucket name.
 	bucketName := getRandomBucketName()
@@ -1575,8 +1574,8 @@ func prepareTestBackend(ctx context.Context, instanceType string) (ObjectLayer, 
 // The test works in 2 steps, here is the description of the steps.
 //   STEP 1: Call the handler with the unsigned HTTP request (anonReq), assert for the `ErrAccessDenied` error response.
 func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketName, objectName, instanceType string, apiRouter http.Handler,
-	anonReq *http.Request, bucketPolicy *policy.Policy) {
-
+	anonReq *http.Request, bucketPolicy *policy.Policy,
+) {
 	anonTestStr := "Anonymous HTTP request test"
 	unknownSignTestStr := "Unknown HTTP signature test"
 
@@ -1664,7 +1663,6 @@ func ExecObjectLayerAPIAnonTest(t *testing.T, obj ObjectLayer, testName, bucketN
 	if rec.Code != unsupportedSignature {
 		t.Fatal(failTestStr(unknownSignTestStr, fmt.Sprintf("Object API Unknow auth test for \"%s\", expected to fail with %d, but failed with %d", testName, unsupportedSignature, rec.Code)))
 	}
-
 }
 
 // ExecObjectLayerAPINilTest - Sets the object layer to `nil`, and calls rhe registered object layer API endpoint,
@@ -1801,7 +1799,7 @@ func ExecObjectLayerTest(t TestErrHandler, objTest objTestType) {
 		}
 		setObjectLayer(objLayer)
 
-		newAllSubsystems()
+		initAllSubsystems()
 
 		// initialize the server and obtain the credentials and root.
 		// credentials are necessary to sign the HTTP request.
@@ -1809,7 +1807,7 @@ func ExecObjectLayerTest(t TestErrHandler, objTest objTestType) {
 			t.Fatal("Unexpected error", err)
 		}
 		initConfigSubsystem(ctx, objLayer)
-		globalIAMSys.Init(ctx, objLayer, globalEtcdClient, globalNotificationSys, 2*time.Second)
+		globalIAMSys.Init(ctx, objLayer, globalEtcdClient, 2*time.Second)
 
 		// Executing the object layer tests for single node setup.
 		objTest(objLayer, FSTestStr, t)
@@ -1827,14 +1825,14 @@ func ExecObjectLayerTest(t TestErrHandler, objTest objTestType) {
 			localMetacacheMgr.deleteAll()
 		}
 
-		newAllSubsystems()
+		initAllSubsystems()
 		objLayer, fsDirs, err := prepareErasureSets32(ctx)
 		if err != nil {
 			t.Fatalf("Initialization of object layer failed for Erasure setup: %s", err)
 		}
 		setObjectLayer(objLayer)
 		initConfigSubsystem(ctx, objLayer)
-		globalIAMSys.Init(ctx, objLayer, globalEtcdClient, globalNotificationSys, 2*time.Second)
+		globalIAMSys.Init(ctx, objLayer, globalEtcdClient, 2*time.Second)
 
 		// Executing the object layer tests for Erasure.
 		objTest(objLayer, ErasureTestStr, t)
@@ -2159,6 +2157,7 @@ func mustGetPoolEndpoints(args ...string) EndpointServerPools {
 		SetCount:     setCount,
 		DrivesPerSet: drivesPerSet,
 		Endpoints:    endpoints,
+		CmdLine:      strings.Join(args, " "),
 	}}
 }
 
@@ -2227,8 +2226,8 @@ func TestToErrIsNil(t *testing.T) {
 // All upload failures are considered test errors - this function is
 // intended as a helper for other tests.
 func uploadTestObject(t *testing.T, apiRouter http.Handler, creds auth.Credentials, bucketName, objectName string,
-	partSizes []int64, metadata map[string]string, asMultipart bool) {
-
+	partSizes []int64, metadata map[string]string, asMultipart bool,
+) {
 	if len(partSizes) == 0 {
 		t.Fatalf("Cannot upload an object without part sizes")
 	}

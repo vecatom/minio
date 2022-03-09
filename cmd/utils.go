@@ -37,13 +37,14 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"runtime/trace"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/coreos/go-oidc"
 	"github.com/dustin/go-humanize"
+	"github.com/felixge/fgprof"
 	"github.com/gorilla/mux"
 	"github.com/minio/madmin-go"
 	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
@@ -58,6 +59,7 @@ import (
 	"github.com/minio/minio/internal/rest"
 	"github.com/minio/pkg/certs"
 	"github.com/minio/pkg/env"
+	"golang.org/x/oauth2"
 )
 
 const (
@@ -109,10 +111,6 @@ func path2BucketObjectWithBasePath(basePath, path string) (bucket, prefix string
 
 func path2BucketObject(s string) (bucket, prefix string) {
 	return path2BucketObjectWithBasePath("", s)
-}
-
-func getReadQuorum(drive int) int {
-	return drive - getDefaultParityBlocks(drive)
 }
 
 func getWriteQuorum(drive int) int {
@@ -322,6 +320,41 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			defer os.RemoveAll(dirPath)
 			return ioutil.ReadFile(fn)
 		}
+		// TODO(klauspost): Replace with madmin.ProfilerCPUIO on next update.
+	case "cpuio":
+		// at 10k or more goroutines fgprof is likely to become
+		// unable to maintain its sampling rate and to significantly
+		// degrade the performance of your application
+		// https://github.com/felixge/fgprof#fgprof
+		if n := runtime.NumGoroutine(); n > 10000 && !globalIsCICD {
+			return nil, fmt.Errorf("unable to perform CPU IO profile with %d goroutines", n)
+		}
+		dirPath, err := ioutil.TempDir("", "profile")
+		if err != nil {
+			return nil, err
+		}
+		fn := filepath.Join(dirPath, "cpuio.out")
+		f, err := os.Create(fn)
+		if err != nil {
+			return nil, err
+		}
+		stop := fgprof.Start(f, fgprof.FormatPprof)
+		err = pprof.StartCPUProfile(f)
+		if err != nil {
+			return nil, err
+		}
+		prof.stopFn = func() ([]byte, error) {
+			err := stop()
+			if err != nil {
+				return nil, err
+			}
+			err = f.Close()
+			if err != nil {
+				return nil, err
+			}
+			defer os.RemoveAll(dirPath)
+			return ioutil.ReadFile(fn)
+		}
 	case madmin.ProfilerMEM:
 		runtime.GC()
 		prof.record("heap", 0, "before")
@@ -406,8 +439,10 @@ type minioProfiler interface {
 }
 
 // Global profiler to be used by service go-routine.
-var globalProfiler map[string]minioProfiler
-var globalProfilerMu sync.Mutex
+var (
+	globalProfiler   map[string]minioProfiler
+	globalProfilerMu sync.Mutex
+)
 
 // dump the request into a string in JSON format.
 func dumpRequest(r *http.Request) string {
@@ -598,6 +633,7 @@ func NewGatewayHTTPTransportWithClientCerts(clientCert, clientKey string) *http.
 				err.Error()))
 		}
 		if c != nil {
+			c.UpdateReloadDuration(10 * time.Second)
 			c.ReloadOnSignal(syscall.SIGHUP) // allow reloads upon SIGHUP
 			transport.TLSClientConfig.GetClientCertificate = c.GetClientCertificate
 		}
@@ -613,7 +649,8 @@ func NewGatewayHTTPTransport() *http.Transport {
 
 func newGatewayHTTPTransport(timeout time.Duration) *http.Transport {
 	tr := newCustomHTTPTransport(&tls.Config{
-		RootCAs: globalRootCAs,
+		RootCAs:            globalRootCAs,
+		ClientSessionCache: tls.NewLRUClientSessionCache(tlsClientSessionCacheSize),
 	}, defaultDialTimeout)()
 
 	// Customize response header timeout for gateway transport.
@@ -639,7 +676,8 @@ func NewRemoteTargetHTTPTransport() *http.Transport {
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 5 * time.Second,
 		TLSClientConfig: &tls.Config{
-			RootCAs: globalRootCAs,
+			RootCAs:            globalRootCAs,
+			ClientSessionCache: tls.NewLRUClientSessionCache(tlsClientSessionCacheSize),
 		},
 		// Go net/http automatically unzip if content-type is
 		// gzip disable this feature, as we are always interested
@@ -752,6 +790,21 @@ func likelyUnescapeGeneric(p string, escapeFn func(string) (string, error)) stri
 	return ep
 }
 
+func updateReqContext(ctx context.Context, objects ...ObjectV) context.Context {
+	req := logger.GetReqInfo(ctx)
+	if req != nil {
+		req.Objects = make([]logger.ObjectVersion, 0, len(objects))
+		for _, ov := range objects {
+			req.Objects = append(req.Objects, logger.ObjectVersion{
+				ObjectName: ov.ObjectName,
+				VersionID:  ov.VersionID,
+			})
+		}
+		return logger.SetReqInfo(ctx, req)
+	}
+	return ctx
+}
+
 // Returns context with ReqInfo details set in the context.
 func newContext(r *http.Request, w http.ResponseWriter, api string) context.Context {
 	vars := mux.Vars(r)
@@ -770,6 +823,7 @@ func newContext(r *http.Request, w http.ResponseWriter, api string) context.Cont
 		API:          api,
 		BucketName:   bucket,
 		ObjectName:   object,
+		VersionID:    strings.TrimSpace(r.Form.Get(xhttp.VersionID)),
 	}
 	return logger.SetReqInfo(r.Context(), reqInfo)
 }
@@ -979,136 +1033,6 @@ func auditLogInternal(ctx context.Context, bucket, object string, opts AuditLogO
 	logger.AuditLog(ctx, nil, nil, nil)
 }
 
-type speedTestOpts struct {
-	throughputSize   int
-	concurrencyStart int
-	duration         time.Duration
-	autotune         bool
-	storageClass     string
-}
-
-// Get the max throughput and iops numbers.
-func speedTest(ctx context.Context, opts speedTestOpts) chan madmin.SpeedTestResult {
-	ch := make(chan madmin.SpeedTestResult, 1)
-	go func() {
-		defer close(ch)
-
-		concurrency := opts.concurrencyStart
-
-		throughputHighestGet := uint64(0)
-		throughputHighestPut := uint64(0)
-		var throughputHighestResults []SpeedtestResult
-
-		sendResult := func() {
-			var result madmin.SpeedTestResult
-
-			durationSecs := opts.duration.Seconds()
-
-			result.GETStats.ThroughputPerSec = throughputHighestGet / uint64(durationSecs)
-			result.GETStats.ObjectsPerSec = throughputHighestGet / uint64(opts.throughputSize) / uint64(durationSecs)
-			result.PUTStats.ThroughputPerSec = throughputHighestPut / uint64(durationSecs)
-			result.PUTStats.ObjectsPerSec = throughputHighestPut / uint64(opts.throughputSize) / uint64(durationSecs)
-			for i := 0; i < len(throughputHighestResults); i++ {
-				errStr := ""
-				if throughputHighestResults[i].Error != "" {
-					errStr = throughputHighestResults[i].Error
-				}
-				result.PUTStats.Servers = append(result.PUTStats.Servers, madmin.SpeedTestStatServer{
-					Endpoint:         throughputHighestResults[i].Endpoint,
-					ThroughputPerSec: throughputHighestResults[i].Uploads / uint64(durationSecs),
-					ObjectsPerSec:    throughputHighestResults[i].Uploads / uint64(opts.throughputSize) / uint64(durationSecs),
-					Err:              errStr,
-				})
-				result.GETStats.Servers = append(result.GETStats.Servers, madmin.SpeedTestStatServer{
-					Endpoint:         throughputHighestResults[i].Endpoint,
-					ThroughputPerSec: throughputHighestResults[i].Downloads / uint64(durationSecs),
-					ObjectsPerSec:    throughputHighestResults[i].Downloads / uint64(opts.throughputSize) / uint64(durationSecs),
-					Err:              errStr,
-				})
-			}
-
-			result.Size = opts.throughputSize
-			result.Disks = globalEndpoints.NEndpoints()
-			result.Servers = len(globalNotificationSys.peerClients) + 1
-			result.Version = Version
-			result.Concurrent = concurrency
-
-			ch <- result
-		}
-
-		for {
-			select {
-			case <-ctx.Done():
-				// If the client got disconnected stop the speedtest.
-				return
-			default:
-			}
-
-			results := globalNotificationSys.Speedtest(ctx,
-				opts.throughputSize, concurrency,
-				opts.duration, opts.storageClass)
-			sort.Slice(results, func(i, j int) bool {
-				return results[i].Endpoint < results[j].Endpoint
-			})
-
-			totalPut := uint64(0)
-			totalGet := uint64(0)
-			for _, result := range results {
-				totalPut += result.Uploads
-				totalGet += result.Downloads
-			}
-
-			if totalGet < throughputHighestGet {
-				// Following check is for situations
-				// when Writes() scale higher than Reads()
-				// - practically speaking this never happens
-				// and should never happen - however it has
-				// been seen recently due to hardware issues
-				// causes Reads() to go slower than Writes().
-				//
-				// Send such results anyways as this shall
-				// expose a problem underneath.
-				if totalPut > throughputHighestPut {
-					throughputHighestResults = results
-					throughputHighestPut = totalPut
-					// let the client see lower value as well
-					throughputHighestGet = totalGet
-				}
-				sendResult()
-				break
-			}
-
-			doBreak := float64(totalGet-throughputHighestGet)/float64(totalGet) < 0.025
-
-			throughputHighestGet = totalGet
-			throughputHighestResults = results
-			throughputHighestPut = totalPut
-
-			if doBreak {
-				sendResult()
-				break
-			}
-
-			for _, result := range results {
-				if result.Error != "" {
-					// Break out on errors.
-					sendResult()
-					return
-				}
-			}
-
-			sendResult()
-			if !opts.autotune {
-				break
-			}
-
-			// Try with a higher concurrency to see if we get better throughput
-			concurrency += (concurrency + 1) / 2
-		}
-	}()
-	return ch
-}
-
 func newTLSConfig(getCert certs.GetCertificateFunc) *tls.Config {
 	if getCert == nil {
 		return nil
@@ -1119,6 +1043,7 @@ func newTLSConfig(getCert certs.GetCertificateFunc) *tls.Config {
 		MinVersion:               tls.VersionTLS12,
 		NextProtos:               []string{"http/1.1", "h2"},
 		GetCertificate:           getCert,
+		ClientSessionCache:       tls.NewLRUClientSessionCache(tlsClientSessionCacheSize),
 	}
 
 	tlsClientIdentity := env.Get(xtls.EnvIdentityTLSEnabled, "") == config.EnableOn
@@ -1138,4 +1063,143 @@ func newTLSConfig(getCert certs.GetCertificateFunc) *tls.Config {
 		}
 	}
 	return tlsConfig
+}
+
+/////////// Types and functions for OpenID IAM testing
+
+// OpenIDClientAppParams - contains openID client application params, used in
+// testing.
+type OpenIDClientAppParams struct {
+	ClientID, ClientSecret, ProviderURL, RedirectURL string
+}
+
+// MockOpenIDTestUserInteraction - tries to login to dex using provided credentials.
+// It performs the user's browser interaction to login and retrieves the auth
+// code from dex and exchanges it for a JWT.
+func MockOpenIDTestUserInteraction(ctx context.Context, pro OpenIDClientAppParams, username, password string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	provider, err := oidc.NewProvider(ctx, pro.ProviderURL)
+	if err != nil {
+		return "", fmt.Errorf("unable to create provider: %v", err)
+	}
+
+	// Configure an OpenID Connect aware OAuth2 client.
+	oauth2Config := oauth2.Config{
+		ClientID:     pro.ClientID,
+		ClientSecret: pro.ClientSecret,
+		RedirectURL:  pro.RedirectURL,
+
+		// Discovery returns the OAuth2 endpoints.
+		Endpoint: provider.Endpoint(),
+
+		// "openid" is a required scope for OpenID Connect flows.
+		Scopes: []string{oidc.ScopeOpenID, "groups"},
+	}
+
+	state := fmt.Sprintf("x%dx", time.Now().Unix())
+	authCodeURL := oauth2Config.AuthCodeURL(state)
+	// fmt.Printf("authcodeurl: %s\n", authCodeURL)
+
+	var lastReq *http.Request
+	checkRedirect := func(req *http.Request, via []*http.Request) error {
+		// fmt.Printf("CheckRedirect:\n")
+		// fmt.Printf("Upcoming: %s %s\n", req.Method, req.URL.String())
+		// for i, c := range via {
+		// 	fmt.Printf("Sofar %d: %s %s\n", i, c.Method, c.URL.String())
+		// }
+		// Save the last request in a redirect chain.
+		lastReq = req
+		// We do not follow redirect back to client application.
+		if req.URL.Path == "/oauth_callback" {
+			return http.ErrUseLastResponse
+		}
+		return nil
+	}
+
+	dexClient := http.Client{
+		CheckRedirect: checkRedirect,
+	}
+
+	u, err := url.Parse(authCodeURL)
+	if err != nil {
+		return "", fmt.Errorf("url parse err: %v", err)
+	}
+
+	// Start the user auth flow. This page would present the login with
+	// email or LDAP option.
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", fmt.Errorf("new request err: %v", err)
+	}
+	_, err = dexClient.Do(req)
+	// fmt.Printf("Do: %#v %#v\n", resp, err)
+	if err != nil {
+		return "", fmt.Errorf("auth url request err: %v", err)
+	}
+
+	// Modify u to choose the ldap option
+	u.Path += "/ldap"
+	// fmt.Println(u)
+
+	// Pick the LDAP login option. This would return a form page after
+	// following some redirects. `lastReq` would be the URL of the form
+	// page, where we need to POST (submit) the form.
+	req, err = http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", fmt.Errorf("new request err (/ldap): %v", err)
+	}
+	_, err = dexClient.Do(req)
+	// fmt.Printf("Fetch LDAP login page: %#v %#v\n", resp, err)
+	if err != nil {
+		return "", fmt.Errorf("request err: %v", err)
+	}
+	// {
+	// 	bodyBuf, err := ioutil.ReadAll(resp.Body)
+	// 	if err != nil {
+	// 		return "", fmt.Errorf("Error reading body: %v", err)
+	// 	}
+	// 	fmt.Printf("bodyBuf (for LDAP login page): %s\n", string(bodyBuf))
+	// }
+
+	// Fill the login form with our test creds:
+	// fmt.Printf("login form url: %s\n", lastReq.URL.String())
+	formData := url.Values{}
+	formData.Set("login", username)
+	formData.Set("password", password)
+	req, err = http.NewRequestWithContext(ctx, http.MethodPost, lastReq.URL.String(), strings.NewReader(formData.Encode()))
+	if err != nil {
+		return "", fmt.Errorf("new request err (/login): %v", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	_, err = dexClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("post form err: %v", err)
+	}
+	// fmt.Printf("resp: %#v %#v\n", resp.StatusCode, resp.Header)
+	// bodyBuf, err := ioutil.ReadAll(resp.Body)
+	// if err != nil {
+	// 	return "", fmt.Errorf("Error reading body: %v", err)
+	// }
+	// fmt.Printf("resp body: %s\n", string(bodyBuf))
+	// fmt.Printf("lastReq: %#v\n", lastReq.URL.String())
+
+	// On form submission, the last redirect response contains the auth
+	// code, which we now have in `lastReq`. Exchange it for a JWT id_token.
+	q := lastReq.URL.Query()
+	// fmt.Printf("lastReq.URL: %#v q: %#v\n", lastReq.URL, q)
+	code := q.Get("code")
+	oauth2Token, err := oauth2Config.Exchange(ctx, code)
+	if err != nil {
+		return "", fmt.Errorf("unable to exchange code for id token: %v", err)
+	}
+
+	rawIDToken, ok := oauth2Token.Extra("id_token").(string)
+	if !ok {
+		return "", fmt.Errorf("id_token not found!")
+	}
+
+	// fmt.Printf("TOKEN: %s\n", rawIDToken)
+	return rawIDToken, nil
 }

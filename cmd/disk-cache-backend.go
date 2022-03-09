@@ -24,6 +24,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -190,7 +191,7 @@ func newDiskCache(ctx context.Context, dir string, config cache.Config) (*diskCa
 		quotaPct = config.Quota
 	}
 
-	if err := os.MkdirAll(dir, 0777); err != nil {
+	if err := os.MkdirAll(dir, 0o777); err != nil {
 		return nil, fmt.Errorf("Unable to initialize '%s' dir, %w", dir, err)
 	}
 	cache := diskCache{
@@ -252,16 +253,17 @@ func (c *diskCache) diskUsageLow() bool {
 // Returns if the disk usage reaches  or exceeds configured cache quota when size is added.
 // If current usage without size exceeds high watermark a GC is automatically queued.
 func (c *diskCache) diskSpaceAvailable(size int64) bool {
+	reqInfo := (&logger.ReqInfo{}).AppendTags("cachePath", c.dir)
+	ctx := logger.SetReqInfo(GlobalContext, reqInfo)
+
 	gcTriggerPct := c.quotaPct * c.highWatermark / 100
 	di, err := disk.GetInfo(c.dir)
 	if err != nil {
-		reqInfo := (&logger.ReqInfo{}).AppendTags("cachePath", c.dir)
-		ctx := logger.SetReqInfo(GlobalContext, reqInfo)
 		logger.LogIf(ctx, err)
 		return false
 	}
 	if di.Total == 0 {
-		logger.Info("diskCache: Received 0 total disk size")
+		logger.LogIf(ctx, errors.New("diskCache: Received 0 total disk size"))
 		return false
 	}
 	usedPercent := float64(di.Used) * 100 / float64(di.Total)
@@ -619,10 +621,10 @@ func (c *diskCache) saveMetadata(ctx context.Context, bucket, object string, met
 	cachedPath := getCacheSHADir(c.dir, bucket, object)
 	metaPath := pathJoin(cachedPath, cacheMetaJSONFile)
 	// Create cache directory if needed
-	if err := os.MkdirAll(cachedPath, 0777); err != nil {
+	if err := os.MkdirAll(cachedPath, 0o777); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE, 0666)
+	f, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE, 0o666)
 	if err != nil {
 		return err
 	}
@@ -682,10 +684,10 @@ func (c *diskCache) updateMetadata(ctx context.Context, bucket, object, etag str
 	cachedPath := getCacheSHADir(c.dir, bucket, object)
 	metaPath := pathJoin(cachedPath, cacheMetaJSONFile)
 	// Create cache directory if needed
-	if err := os.MkdirAll(cachedPath, 0777); err != nil {
+	if err := os.MkdirAll(cachedPath, 0o777); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(metaPath, os.O_RDWR, 0666)
+	f, err := os.OpenFile(metaPath, os.O_RDWR, 0o666)
 	if err != nil {
 		return err
 	}
@@ -732,7 +734,7 @@ func getCacheWriteBackSHADir(dir, bucket, object string) string {
 
 // Cache data to disk with bitrot checksum added for each block of 1MB
 func (c *diskCache) bitrotWriteToCache(cachePath, fileName string, reader io.Reader, size uint64) (int64, string, error) {
-	if err := os.MkdirAll(cachePath, 0777); err != nil {
+	if err := os.MkdirAll(cachePath, 0o777); err != nil {
 		return 0, "", err
 	}
 	filePath := pathJoin(cachePath, fileName)
@@ -807,6 +809,7 @@ func newCacheEncryptReader(content io.Reader, bucket, object string, metadata ma
 	}
 	return reader, nil
 }
+
 func newCacheEncryptMetadata(bucket, object string, metadata map[string]string) ([]byte, error) {
 	var sealedKey crypto.SealedKey
 	if globalCacheKMS == nil {
@@ -827,6 +830,7 @@ func newCacheEncryptMetadata(bucket, object string, metadata map[string]string) 
 	metadata[SSECacheEncrypted] = ""
 	return objectKey[:], nil
 }
+
 func (c *diskCache) GetLockContext(ctx context.Context, bucket, object string) (RWLocker, LockContext, error) {
 	cachePath := getCacheSHADir(c.dir, bucket, object)
 	cLock := c.NewNSLockFn(cachePath)
@@ -879,12 +883,12 @@ func (c *diskCache) put(ctx context.Context, bucket, object string, data io.Read
 		cachePath = getCacheWriteBackSHADir(c.dir, bucket, object)
 	}
 
-	if err := os.MkdirAll(cachePath, 0777); err != nil {
+	if err := os.MkdirAll(cachePath, 0o777); err != nil {
 		return oi, err
 	}
-	var metadata = cloneMSS(opts.UserDefined)
-	var reader = data
-	var actualSize = uint64(size)
+	metadata := cloneMSS(opts.UserDefined)
+	reader := data
+	actualSize := uint64(size)
 	if globalCacheKMS != nil {
 		reader, err = newCacheEncryptReader(data, bucket, object, metadata)
 		if err != nil {
@@ -933,14 +937,14 @@ func (c *diskCache) putRange(ctx context.Context, bucket, object string, data io
 		return errDiskFull
 	}
 	cachePath := getCacheSHADir(c.dir, bucket, object)
-	if err := os.MkdirAll(cachePath, 0777); err != nil {
+	if err := os.MkdirAll(cachePath, 0o777); err != nil {
 		return err
 	}
-	var metadata = cloneMSS(opts.UserDefined)
-	var reader = data
-	var actualSize = uint64(rlen)
+	metadata := cloneMSS(opts.UserDefined)
+	reader := data
+	actualSize := uint64(rlen)
 	// objSize is the actual size of object (with encryption overhead if any)
-	var objSize = uint64(size)
+	objSize := uint64(size)
 	if globalCacheKMS != nil {
 		reader, err = newCacheEncryptReader(data, bucket, object, metadata)
 		if err != nil {
@@ -1269,12 +1273,12 @@ func (c *diskCache) NewMultipartUpload(ctx context.Context, bucket, object, uID 
 
 	cachePath := getMultipartCacheSHADir(c.dir, bucket, object)
 	uploadIDDir := path.Join(cachePath, uploadID)
-	if err := os.MkdirAll(uploadIDDir, 0777); err != nil {
+	if err := os.MkdirAll(uploadIDDir, 0o777); err != nil {
 		return uploadID, err
 	}
 	metaPath := pathJoin(uploadIDDir, cacheMetaJSONFile)
 
-	f, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE, 0666)
+	f, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE, 0o666)
 	if err != nil {
 		return uploadID, err
 	}
@@ -1331,7 +1335,7 @@ func (c *diskCache) PutObjectPart(ctx context.Context, bucket, object, uploadID 
 		return oi, errDiskFull
 	}
 	reader := data
-	var actualSize = uint64(size)
+	actualSize := uint64(size)
 	if globalCacheKMS != nil {
 		reader, err = newCachePartEncryptReader(ctx, bucket, object, partID, data, size, meta.Meta)
 		if err != nil {
@@ -1380,7 +1384,7 @@ func (c *diskCache) SavePartMetadata(ctx context.Context, bucket, object, upload
 	defer uploadLock.Unlock(ulkctx.Cancel)
 
 	metaPath := pathJoin(uploadDir, cacheMetaJSONFile)
-	f, err := os.OpenFile(metaPath, os.O_RDWR, 0666)
+	f, err := os.OpenFile(metaPath, os.O_RDWR, 0o666)
 	if err != nil {
 		return err
 	}
@@ -1558,7 +1562,7 @@ func (c *diskCache) CompleteMultipartUpload(ctx context.Context, bucket, object,
 	uploadMeta.Hits++
 	metaPath := pathJoin(uploadIDDir, cacheMetaJSONFile)
 
-	f, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE, 0666)
+	f, err := os.OpenFile(metaPath, os.O_RDWR|os.O_CREATE, 0o666)
 	if err != nil {
 		return oi, err
 	}

@@ -326,7 +326,7 @@ func (sys *NotificationSys) DownloadProfilingData(ctx context.Context, writer io
 			header, zerr := zip.FileInfoHeader(dummyFileInfo{
 				name:    fmt.Sprintf("profile-%s-%s", client.host.String(), typ),
 				size:    int64(len(data)),
-				mode:    0600,
+				mode:    0o600,
 				modTime: UTCNow(),
 				isDir:   false,
 				sys:     nil,
@@ -376,7 +376,7 @@ func (sys *NotificationSys) DownloadProfilingData(ctx context.Context, writer io
 		header, zerr := zip.FileInfoHeader(dummyFileInfo{
 			name:    fmt.Sprintf("profile-%s-%s", thisAddr, typ),
 			size:    int64(len(data)),
-			mode:    0600,
+			mode:    0o600,
 			modTime: UTCNow(),
 			isDir:   false,
 			sys:     nil,
@@ -432,7 +432,7 @@ func (sys *NotificationSys) SignalService(sig serviceSignal) []NotificationPeerE
 // updateBloomFilter will cycle all servers to the current index and
 // return a merged bloom filter if a complete one can be retrieved.
 func (sys *NotificationSys) updateBloomFilter(ctx context.Context, current uint64) (*bloomFilter, error) {
-	var req = bloomFilterRequest{
+	req := bloomFilterRequest{
 		Current: current,
 		Oldest:  current - dataUsageUpdateDirCycles,
 	}
@@ -563,6 +563,7 @@ func (sys *NotificationSys) DeleteBucketMetadata(ctx context.Context, bucketName
 	globalReplicationStats.Delete(bucketName)
 	globalBucketMetadataSys.Remove(bucketName)
 	globalBucketTargetSys.Delete(bucketName)
+	globalNotificationSys.RemoveNotification(bucketName)
 	if localMetacacheMgr != nil {
 		localMetacacheMgr.deleteBucketCache(bucketName)
 	}
@@ -616,6 +617,26 @@ func (sys *NotificationSys) GetClusterBucketStats(ctx context.Context, bucketNam
 	return bucketStats
 }
 
+// ReloadPoolMeta reloads on disk updates on pool metadata
+func (sys *NotificationSys) ReloadPoolMeta(ctx context.Context) {
+	ng := WithNPeers(len(sys.peerClients))
+	for idx, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		client := client
+		ng.Go(ctx, func() error {
+			return client.ReloadPoolMeta(ctx)
+		}, idx, *client.host)
+	}
+	for _, nErr := range ng.Wait() {
+		reqInfo := (&logger.ReqInfo{}).AppendTags("peerAddress", nErr.Host.String())
+		if nErr.Err != nil {
+			logger.LogIf(logger.SetReqInfo(ctx, reqInfo), nErr.Err)
+		}
+	}
+}
+
 // LoadTransitionTierConfig notifies remote peers to load their remote tier
 // configs from config store.
 func (sys *NotificationSys) LoadTransitionTierConfig(ctx context.Context) {
@@ -652,8 +673,8 @@ func (sys *NotificationSys) set(bucket BucketInfo, meta BucketMetadata) {
 	sys.AddRulesMap(bucket.Name, config.ToRulesMap())
 }
 
-// Init - initializes notification system from notification.xml and listenxl.meta of all buckets.
-func (sys *NotificationSys) Init(ctx context.Context, buckets []BucketInfo, objAPI ObjectLayer) error {
+// InitBucketTargets - initializes notification system from notification.xml of all buckets.
+func (sys *NotificationSys) InitBucketTargets(ctx context.Context, objAPI ObjectLayer) error {
 	if objAPI == nil {
 		return errServerNotInitialized
 	}
@@ -1532,6 +1553,58 @@ func (sys *NotificationSys) ServiceFreeze(ctx context.Context, freeze bool) []No
 	return nerrs
 }
 
+// Netperf - perform mesh style network throughput test
+func (sys *NotificationSys) Netperf(ctx context.Context, duration time.Duration) []madmin.NetperfNodeResult {
+	length := len(sys.allPeerClients)
+	if length == 0 {
+		// For single node erasure setup.
+		return nil
+	}
+	results := make([]madmin.NetperfNodeResult, length)
+
+	scheme := "http"
+	if globalIsTLS {
+		scheme = "https"
+	}
+
+	var wg sync.WaitGroup
+	for index := range sys.peerClients {
+		if sys.peerClients[index] == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			r, err := sys.peerClients[index].Netperf(ctx, duration)
+			u := &url.URL{
+				Scheme: scheme,
+				Host:   sys.peerClients[index].host.String(),
+			}
+			if err != nil {
+				results[index].Error = err.Error()
+			} else {
+				results[index] = r
+			}
+			results[index].Endpoint = u.String()
+		}(index)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		r := netperf(ctx, duration)
+		u := &url.URL{
+			Scheme: scheme,
+			Host:   globalLocalNodeName,
+		}
+		results[len(results)-1] = r
+		results[len(results)-1].Endpoint = u.String()
+	}()
+	wg.Wait()
+
+	return results
+}
+
 // Speedtest run GET/PUT tests at input concurrency for requested object size,
 // optionally you can extend the tests longer with time.Duration.
 func (sys *NotificationSys) Speedtest(ctx context.Context, size int,
@@ -1591,6 +1664,39 @@ func (sys *NotificationSys) Speedtest(ctx context.Context, size int,
 	return results
 }
 
+// DriveSpeedTest - Drive performance information
+func (sys *NotificationSys) DriveSpeedTest(ctx context.Context, opts madmin.DriveSpeedTestOpts) chan madmin.DriveSpeedTestResult {
+	ch := make(chan madmin.DriveSpeedTestResult)
+	var wg sync.WaitGroup
+
+	for _, client := range sys.peerClients {
+		if client == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(client *peerRESTClient) {
+			defer wg.Done()
+			resp, err := client.DriveSpeedTest(ctx, opts)
+			if err != nil {
+				resp.Error = err.Error()
+			}
+
+			ch <- resp
+
+			reqInfo := (&logger.ReqInfo{}).AppendTags("remotePeer", client.host.String())
+			ctx := logger.SetReqInfo(GlobalContext, reqInfo)
+			logger.LogIf(ctx, err)
+		}(client)
+	}
+
+	go func() {
+		wg.Wait()
+		close(ch)
+	}()
+
+	return ch
+}
+
 // ReloadSiteReplicationConfig - tells all peer minio nodes to reload the
 // site-replication configuration.
 func (sys *NotificationSys) ReloadSiteReplicationConfig(ctx context.Context) []error {
@@ -1609,4 +1715,32 @@ func (sys *NotificationSys) ReloadSiteReplicationConfig(ctx context.Context) []e
 
 	wg.Wait()
 	return errs
+}
+
+// GetLastDayTierStats fetches per-tier stats of the last 24hrs from all peers
+func (sys *NotificationSys) GetLastDayTierStats(ctx context.Context) dailyAllTierStats {
+	errs := make([]error, len(sys.allPeerClients))
+	lastDayStats := make([]dailyAllTierStats, len(sys.allPeerClients))
+	var wg sync.WaitGroup
+	for index := range sys.peerClients {
+		if sys.peerClients[index] == nil {
+			continue
+		}
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			lastDayStats[index], errs[index] = sys.peerClients[index].GetLastDayTierStats(ctx)
+		}(index)
+	}
+
+	wg.Wait()
+	merged := globalTransitionState.getDailyAllTierStats()
+	for i, stat := range lastDayStats {
+		if errs[i] != nil {
+			logger.LogIf(ctx, fmt.Errorf("failed to fetch last day tier stats: %w", errs[i]))
+			continue
+		}
+		merged.merge(stat)
+	}
+	return merged
 }

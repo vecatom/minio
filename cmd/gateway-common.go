@@ -130,7 +130,6 @@ func FromMinioClientListMultipartsInfo(lmur minio.ListMultipartUploadsResult) Li
 		CommonPrefixes:     commonPrefixes,
 		EncodingType:       lmur.EncodingType,
 	}
-
 }
 
 // FromMinioClientObjectInfo converts minio ObjectInfo to gateway ObjectInfo
@@ -336,6 +335,8 @@ func ErrorRespToObjectError(err error, params ...string) error {
 	switch minioErr.StatusCode {
 	case http.StatusMethodNotAllowed:
 		err = toObjectErr(errMethodNotAllowed, bucket, object)
+	case http.StatusBadGateway:
+		return BackendDown{Err: err.Error()}
 	}
 	return err
 }

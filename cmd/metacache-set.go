@@ -137,7 +137,7 @@ func (o *listPathOptions) debugln(data ...interface{}) {
 // The returned function will return the results once there is enough or input is closed,
 // or the context is canceled.
 func (o *listPathOptions) gatherResults(ctx context.Context, in <-chan metaCacheEntry) func() (metaCacheEntriesSorted, error) {
-	var resultsDone = make(chan metaCacheEntriesSorted)
+	resultsDone := make(chan metaCacheEntriesSorted)
 	// Copy so we can mutate
 	resCh := resultsDone
 	var done bool
@@ -218,7 +218,7 @@ func (o *listPathOptions) findFirstPart(fi FileInfo) (int, error) {
 	}
 	o.debugln("searching for ", search)
 	var tmp metacacheBlock
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	i := 0
 	for {
 		partKey := fmt.Sprintf("%s-metacache-part-%d", ReservedMetadataPrefixLower, i)
@@ -542,13 +542,9 @@ func (er *erasureObjects) listPath(ctx context.Context, o listPathOptions, resul
 	var fallbackDisks []StorageAPI
 
 	// Special case: ask all disks if the drive count is 4
-	if askDisks == -1 || er.setDriveCount == 4 {
-		askDisks = len(disks) // with 'strict' quorum list on all online disks.
-		listingQuorum = getReadQuorum(er.setDriveCount)
-	}
-	if askDisks == 0 {
-		askDisks = globalAPIConfig.getListQuorum()
-		listingQuorum = askDisks
+	if askDisks <= 0 || er.setDriveCount == 4 {
+		askDisks = len(disks)          // with 'strict' quorum list on all online disks.
+		listingQuorum = len(disks) / 2 // keep this such that we can list all objects with different quorum ratio.
 	}
 	if askDisks > 0 && len(disks) > askDisks {
 		rand.Shuffle(len(disks), func(i, j int) {

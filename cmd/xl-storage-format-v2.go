@@ -264,9 +264,13 @@ func (x xlMetaV2VersionHeader) String() string {
 
 // matchesNotStrict returns whether x and o have both have non-zero version,
 // their versions match and their type match.
+// If they have zero version, modtime must match.
 func (x xlMetaV2VersionHeader) matchesNotStrict(o xlMetaV2VersionHeader) bool {
-	return x.VersionID != [16]byte{} &&
-		x.VersionID == o.VersionID &&
+	if x.VersionID == [16]byte{} {
+		return x.VersionID == o.VersionID &&
+			x.Type == o.Type && o.ModTime == x.ModTime
+	}
+	return x.VersionID == o.VersionID &&
 		x.Type == o.Type
 }
 
@@ -508,7 +512,14 @@ func (j *xlMetaV2Object) Signature() [4]byte {
 	c.ErasureIndex = 0
 
 	// Nil 0 size allownil, so we don't differentiate between nil and 0 len.
-	if len(c.PartETags) == 0 {
+	allEmpty := true
+	for _, tag := range c.PartETags {
+		if len(tag) != 0 {
+			allEmpty = false
+			break
+		}
+	}
+	if allEmpty {
 		c.PartETags = nil
 	}
 	if len(c.PartActualSizes) == 0 {
@@ -834,7 +845,7 @@ func (x *xlMetaV2) LoadOrConvert(buf []byte) error {
 	}
 
 	xlMeta := &xlMetaV1Object{}
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	if err := json.Unmarshal(buf, xlMeta); err != nil {
 		return errFileCorrupt
 	}
@@ -869,7 +880,7 @@ func (x *xlMetaV2) loadIndexed(buf xlMetaBuf, data xlMetaInlineData) error {
 	x.metaV = metaV
 	if err = x.data.validate(); err != nil {
 		x.data.repair()
-		logger.Info("xlMetaV2.loadIndexed: data validation failed: %v. %d entries after repair", err, x.data.entries())
+		logger.LogIf(GlobalContext, fmt.Errorf("xlMetaV2.loadIndexed: data validation failed: %v. %d entries after repair", err, x.data.entries()))
 	}
 
 	return decodeVersions(buf, versions, func(i int, hdr, meta []byte) error {
@@ -918,7 +929,7 @@ func (x *xlMetaV2) loadLegacy(buf []byte) error {
 			x.data = buf
 			if err = x.data.validate(); err != nil {
 				x.data.repair()
-				logger.Info("xlMetaV2.Load: data validation failed: %v. %d entries after repair", err, x.data.entries())
+				logger.LogIf(GlobalContext, fmt.Errorf("xlMetaV2.Load: data validation failed: %v. %d entries after repair", err, x.data.entries()))
 			}
 		default:
 			return errors.New("unknown minor metadata version")
@@ -927,7 +938,7 @@ func (x *xlMetaV2) loadLegacy(buf []byte) error {
 		return errors.New("unknown major metadata version")
 	}
 	if allMeta == nil {
-		return errCorruptedFormat
+		return errFileCorrupt
 	}
 	// bts will shrink as we decode.
 	bts := allMeta
@@ -1139,7 +1150,7 @@ func (x *xlMetaV2) sortByModTime() {
 // DeleteVersion deletes the version specified by version id.
 // returns to the caller which dataDir to delete, also
 // indicates if this is the last version.
-func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, bool, error) {
+func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, error) {
 	// This is a situation where versionId is explicitly
 	// specified as "null", as we do not save "null"
 	// string it is considered empty. But empty also
@@ -1153,7 +1164,7 @@ func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, bool, error) {
 	if fi.VersionID != "" {
 		uv, err = uuid.Parse(fi.VersionID)
 		if err != nil {
-			return "", false, errFileVersionNotFound
+			return "", errFileVersionNotFound
 		}
 	}
 
@@ -1168,7 +1179,7 @@ func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, bool, error) {
 			},
 		}
 		if !ventry.Valid() {
-			return "", false, errors.New("internal error: invalid version entry generated")
+			return "", errors.New("internal error: invalid version entry generated")
 		}
 	}
 	updateVersion := false
@@ -1214,18 +1225,18 @@ func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, bool, error) {
 		case LegacyType:
 			ver, err := x.getIdx(i)
 			if err != nil {
-				return "", false, err
+				return "", err
 			}
 			x.versions = append(x.versions[:i], x.versions[i+1:]...)
 			if fi.Deleted {
 				err = x.addVersion(ventry)
 			}
-			return ver.ObjectV1.DataDir, len(x.versions) == 0, err
+			return ver.ObjectV1.DataDir, err
 		case DeleteType:
 			if updateVersion {
 				ver, err := x.getIdx(i)
 				if err != nil {
-					return "", false, err
+					return "", err
 				}
 				if len(ver.DeleteMarker.MetaSys) == 0 {
 					ver.DeleteMarker.MetaSys = make(map[string][]byte)
@@ -1247,26 +1258,26 @@ func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, bool, error) {
 					ver.DeleteMarker.MetaSys[k] = []byte(v)
 				}
 				err = x.setIdx(i, *ver)
-				return "", len(x.versions) == 0, err
+				return "", err
 			}
 			var err error
 			x.versions = append(x.versions[:i], x.versions[i+1:]...)
 			if fi.MarkDeleted && (fi.VersionPurgeStatus().Empty() || (fi.VersionPurgeStatus() != Complete)) {
 				err = x.addVersion(ventry)
 			}
-			return "", len(x.versions) == 0, err
+			return "", err
 		case ObjectType:
 			if updateVersion && !fi.Deleted {
 				ver, err := x.getIdx(i)
 				if err != nil {
-					return "", false, err
+					return "", err
 				}
 				ver.ObjectV2.MetaSys[VersionPurgeStatusKey] = []byte(fi.ReplicationState.VersionPurgeStatusInternal)
 				for k, v := range fi.ReplicationState.ResetStatusesMap {
 					ver.ObjectV2.MetaSys[k] = []byte(v)
 				}
 				err = x.setIdx(i, *ver)
-				return "", len(x.versions) == 0, err
+				return "", err
 			}
 		}
 	}
@@ -1277,7 +1288,7 @@ func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, bool, error) {
 		}
 		ver, err := x.getIdx(i)
 		if err != nil {
-			return "", false, err
+			return "", err
 		}
 		switch {
 		case fi.ExpireRestored:
@@ -1303,16 +1314,16 @@ func (x *xlMetaV2) DeleteVersion(fi FileInfo) (string, bool, error) {
 		if x.SharedDataDirCount(ver.ObjectV2.VersionID, ver.ObjectV2.DataDir) > 0 {
 			// Found that another version references the same dataDir
 			// we shouldn't remove it, and only remove the version instead
-			return "", len(x.versions) == 0, nil
+			return "", nil
 		}
-		return uuid.UUID(ver.ObjectV2.DataDir).String(), len(x.versions) == 0, err
+		return uuid.UUID(ver.ObjectV2.DataDir).String(), err
 	}
 
 	if fi.Deleted {
 		err = x.addVersion(ventry)
-		return "", false, err
+		return "", err
 	}
-	return "", false, errFileVersionNotFound
+	return "", errFileVersionNotFound
 }
 
 // xlMetaDataDirDecoder is a shallow decoder for decoding object datadir only.
@@ -1676,6 +1687,9 @@ func (x xlMetaV2) ListVersions(volume, path string) ([]FileInfo, error) {
 // Quorum should be > 1 and <= len(versions).
 // If strict is set to false, entries that match type
 func mergeXLV2Versions(quorum int, strict bool, versions ...[]xlMetaV2ShallowVersion) (merged []xlMetaV2ShallowVersion) {
+	if quorum <= 0 {
+		quorum = 1
+	}
 	if len(versions) < quorum || len(versions) == 0 {
 		return nil
 	}
@@ -1686,14 +1700,16 @@ func mergeXLV2Versions(quorum int, strict bool, versions ...[]xlMetaV2ShallowVer
 		// No need for non-strict checks if quorum is 1.
 		strict = true
 	}
+	// Shallow copy input
+	versions = append(make([][]xlMetaV2ShallowVersion, 0, len(versions)), versions...)
+
 	// Our result
 	merged = make([]xlMetaV2ShallowVersion, 0, len(versions[0]))
 	tops := make([]xlMetaV2ShallowVersion, len(versions))
 	for {
 		// Step 1 create slice with all top versions.
 		tops = tops[:0]
-		var topSig [4]byte
-		var topID [16]byte
+		var topSig xlMetaV2VersionHeader
 		consistent := true // Are all signatures consistent (shortcut)
 		for _, vers := range versions {
 			if len(vers) == 0 {
@@ -1703,10 +1719,9 @@ func mergeXLV2Versions(quorum int, strict bool, versions ...[]xlMetaV2ShallowVer
 			ver := vers[0]
 			if len(tops) == 0 {
 				consistent = true
-				topSig = ver.header.Signature
-				topID = ver.header.VersionID
+				topSig = ver.header
 			} else {
-				consistent = consistent && topSig == ver.header.Signature && topID == ver.header.VersionID
+				consistent = consistent && ver.header == topSig
 			}
 			tops = append(tops, vers[0])
 		}
@@ -1732,7 +1747,7 @@ func mergeXLV2Versions(quorum int, strict bool, versions ...[]xlMetaV2ShallowVer
 					continue
 				}
 				if i == 0 || ver.header.sortsBefore(latest.header) {
-					if i == 0 {
+					if i == 0 || latestCount == 0 {
 						latestCount = 1
 					} else if !strict && ver.header.matchesNotStrict(latest.header) {
 						latestCount++
@@ -1744,12 +1759,45 @@ func mergeXLV2Versions(quorum int, strict bool, versions ...[]xlMetaV2ShallowVer
 				}
 
 				// Mismatch, but older.
-				if !strict && ver.header.matchesNotStrict(latest.header) {
-					// If non-nil version ID and it matches, assume match, but keep newest.
-					if ver.header.sortsBefore(latest.header) {
-						latest = ver
-					}
+				if latestCount > 0 && !strict && ver.header.matchesNotStrict(latest.header) {
 					latestCount++
+					continue
+				}
+				if latestCount > 0 && ver.header.VersionID == latest.header.VersionID {
+					// Version IDs match, but otherwise unable to resolve.
+					// We are either strict, or don't have enough information to match.
+					// Switch to a pure counting algo.
+					x := make(map[xlMetaV2VersionHeader]int, len(tops))
+					for _, a := range tops {
+						if a.header.VersionID != ver.header.VersionID {
+							continue
+						}
+						if !strict {
+							a.header.Signature = [4]byte{}
+						}
+						x[a.header]++
+					}
+					latestCount = 0
+					for k, v := range x {
+						if v < latestCount {
+							continue
+						}
+						if v == latestCount && latest.header.sortsBefore(k) {
+							// Tiebreak, use sort.
+							continue
+						}
+						for _, a := range tops {
+							hdr := a.header
+							if !strict {
+								hdr.Signature = [4]byte{}
+							}
+							if hdr == k {
+								latest = a
+							}
+						}
+						latestCount = v
+					}
+					break
 				}
 			}
 			if latestCount >= quorum {
@@ -1790,7 +1838,7 @@ func mergeXLV2Versions(quorum int, strict bool, versions ...[]xlMetaV2ShallowVer
 	}
 	// Sanity check. Enable if duplicates show up.
 	if false {
-		var found = make(map[[16]byte]struct{})
+		found := make(map[[16]byte]struct{})
 		for _, ver := range merged {
 			if _, ok := found[ver.header.VersionID]; ok {
 				panic("found dupe")
@@ -1927,7 +1975,6 @@ func (x xlMetaBuf) IsLatestDeleteMarker() bool {
 		}
 		isDeleteMarker = xl.Type == DeleteType
 		return errDoneForNow
-
 	})
 	return isDeleteMarker
 }

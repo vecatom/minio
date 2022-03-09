@@ -74,6 +74,16 @@ type Lifecycle struct {
 	Rules   []Rule   `xml:"Rule"`
 }
 
+// HasTransition returns 'true' if lifecycle document has Transition enabled.
+func (lc Lifecycle) HasTransition() bool {
+	for _, rule := range lc.Rules {
+		if rule.Transition.IsEnabled() {
+			return true
+		}
+	}
+	return false
+}
+
 // UnmarshalXML - decodes XML data.
 func (lc *Lifecycle) UnmarshalXML(d *xml.Decoder, start xml.StartElement) (err error) {
 	switch start.Name.Local {
@@ -285,7 +295,7 @@ func (o ObjectOpts) ExpiredObjectDeleteMarker() bool {
 // ComputeAction returns the action to perform by evaluating all lifecycle rules
 // against the object name and its modification time.
 func (lc Lifecycle) ComputeAction(obj ObjectOpts) Action {
-	var action = NoneAction
+	action := NoneAction
 	if obj.ModTime.IsZero() {
 		return action
 	}

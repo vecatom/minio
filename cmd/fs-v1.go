@@ -97,22 +97,25 @@ func initMetaVolumeFS(fsPath, fsUUID string) error {
 	// if it doesn't exist yet.
 	metaBucketPath := pathJoin(fsPath, minioMetaBucket)
 
-	if err := os.MkdirAll(metaBucketPath, 0777); err != nil {
+	if err := os.MkdirAll(metaBucketPath, 0o777); err != nil {
 		return err
 	}
 
 	metaTmpPath := pathJoin(fsPath, minioMetaTmpBucket, fsUUID)
-	if err := os.MkdirAll(metaTmpPath, 0777); err != nil {
+	if err := os.MkdirAll(metaTmpPath, 0o777); err != nil {
 		return err
 	}
 
-	if err := os.MkdirAll(pathJoin(fsPath, dataUsageBucket), 0777); err != nil {
+	if err := os.MkdirAll(pathJoin(metaTmpPath, bgAppendsDirName), 0o777); err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(pathJoin(fsPath, dataUsageBucket), 0o777); err != nil {
 		return err
 	}
 
 	metaMultipartPath := pathJoin(fsPath, minioMetaMultipartBucket)
-	return os.MkdirAll(metaMultipartPath, 0777)
-
+	return os.MkdirAll(metaMultipartPath, 0o777)
 }
 
 // NewFSObjectLayer - initialize new fs object layer.
@@ -330,7 +333,7 @@ func (fs *FSObjects) NSScanner(ctx context.Context, bf *bloomFilter, updates cha
 		logger.LogIf(ctx, totalCache.save(ctx, fs, dataUsageCacheName))
 		cloned := totalCache.clone()
 		updates <- cloned.dui(dataUsageRoot, buckets)
-		enforceFIFOQuotaBucket(ctx, fs, b.Name, cloned.bucketUsageInfo(b.Name))
+
 	}
 
 	return nil
@@ -353,7 +356,7 @@ func (fs *FSObjects) scanBucket(ctx context.Context, bucket string, cache dataUs
 	}
 
 	// Load bucket info.
-	cache, err = scanDataFolder(ctx, fs.fsPath, cache, func(item scannerItem) (sizeSummary, error) {
+	cache, err = scanDataFolder(ctx, -1, -1, fs.fsPath, cache, func(item scannerItem) (sizeSummary, error) {
 		bucket, object := item.bucket, item.objectPath()
 		fsMetaBytes, err := xioutil.ReadFile(pathJoin(fs.fsPath, minioMetaBucket, bucketMetaPrefix, bucket, object, fs.metaJSONFile))
 		if err != nil && !osIsNotExist(err) {
@@ -366,7 +369,7 @@ func (fs *FSObjects) scanBucket(ctx context.Context, bucket string, cache dataUs
 		fsMeta := newFSMetaV1()
 		metaOk := false
 		if len(fsMetaBytes) > 0 {
-			var json = jsoniter.ConfigCompatibleWithStandardLibrary
+			json := jsoniter.ConfigCompatibleWithStandardLibrary
 			if err = json.Unmarshal(fsMetaBytes, &fsMeta); err == nil {
 				metaOk = true
 			}
@@ -474,7 +477,7 @@ func (fs *FSObjects) SetBucketPolicy(ctx context.Context, bucket string, p *poli
 		return err
 	}
 
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	configData, err := json.Marshal(p)
 	if err != nil {
 		return err
@@ -542,7 +545,7 @@ func (fs *FSObjects) ListBuckets(ctx context.Context) ([]BucketInfo, error) {
 			// Ignore any errors returned here.
 			continue
 		}
-		var created = fi.ModTime()
+		created := fi.ModTime()
 		meta, err := globalBucketMetadataSys.Get(fi.Name())
 		if err == nil {
 			created = meta.Created
@@ -705,7 +708,7 @@ func (fs *FSObjects) GetObjectNInfo(ctx context.Context, bucket, object string, 
 		return nil, toObjectErr(err, bucket)
 	}
 
-	var nsUnlocker = func() {}
+	nsUnlocker := func() {}
 
 	if lockType != noLock {
 		// Lock the object before reading.
@@ -843,7 +846,7 @@ func (fs *FSObjects) getObjectInfoNoFSLock(ctx context.Context, bucket, object s
 		fsMetaBuf, rerr := ioutil.ReadAll(rc)
 		rc.Close()
 		if rerr == nil {
-			var json = jsoniter.ConfigCompatibleWithStandardLibrary
+			json := jsoniter.ConfigCompatibleWithStandardLibrary
 			if rerr = json.Unmarshal(fsMetaBuf, &fsMeta); rerr != nil {
 				// For any error to read fsMeta, set default ETag and proceed.
 				fsMeta = fs.defaultFsJSON(object)
@@ -1029,7 +1032,7 @@ func (fs *FSObjects) putObject(ctx context.Context, bucket string, object string
 	// with a slash separator, we treat it like a valid operation
 	// and return success.
 	if isObjectDir(object, data.Size()) {
-		if err = mkdirAll(pathJoin(fs.fsPath, bucket, object), 0777); err != nil {
+		if err = mkdirAll(pathJoin(fs.fsPath, bucket, object), 0o777); err != nil {
 			logger.LogIf(ctx, err)
 			return ObjectInfo{}, toObjectErr(err, bucket, object)
 		}
@@ -1261,9 +1264,23 @@ func (fs *FSObjects) ListObjectVersions(ctx context.Context, bucket, prefix, mar
 
 // ListObjects - list all objects at prefix upto maxKeys., optionally delimited by '/'. Maintains the list pool
 // state for future re-entrant list requests.
-func (fs *FSObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi ListObjectsInfo, e error) {
-	return listObjects(ctx, fs, bucket, prefix, marker, delimiter, maxKeys, fs.listPool,
-		fs.listDirFactory(), fs.isLeaf, fs.isLeafDir, fs.getObjectInfoNoFSLock, fs.getObjectInfoNoFSLock)
+func (fs *FSObjects) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (loi ListObjectsInfo, err error) {
+	// listObjects may in rare cases not be able to find any valid results.
+	// Therefore, it cannot set a NextMarker.
+	// In that case we retry the operation, but we add a
+	// max limit, so we never end up in an infinite loop.
+	tries := 50
+	for {
+		loi, err = listObjects(ctx, fs, bucket, prefix, marker, delimiter, maxKeys, fs.listPool,
+			fs.listDirFactory(), fs.isLeaf, fs.isLeafDir, fs.getObjectInfoNoFSLock, fs.getObjectInfoNoFSLock)
+		if err != nil {
+			return loi, err
+		}
+		if !loi.IsTruncated || loi.NextMarker != "" || tries == 0 {
+			return loi, nil
+		}
+		tries--
+	}
 }
 
 // GetObjectTags - get object tags from an existing object

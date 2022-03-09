@@ -18,6 +18,8 @@
 package cmd
 
 import (
+	"errors"
+
 	"github.com/zeebo/xxh3"
 )
 
@@ -57,7 +59,19 @@ func getAllFileInfoVersions(xlMetaBuf []byte, volume, path string) (FileInfoVers
 		}
 		versions, err = xlMeta.ListVersions(volume, path)
 	}
-	if err != nil || len(versions) == 0 {
+	if err == nil && len(versions) == 0 {
+		// This special case is needed to handle len(xlMeta.versions) == 0
+		versions = []FileInfo{
+			{
+				Volume:   volume,
+				Name:     path,
+				Deleted:  true,
+				IsLatest: true,
+				ModTime:  timeSentinel1970,
+			},
+		}
+	}
+	if err != nil {
 		return FileInfoVersions{}, err
 	}
 
@@ -76,10 +90,32 @@ func getFileInfo(xlMetaBuf []byte, volume, path, versionID string, data bool) (F
 	if buf, data := isIndexedMetaV2(xlMetaBuf); buf != nil {
 		inData = data
 		fi, err = buf.ToFileInfo(volume, path, versionID)
+		if len(buf) != 0 && errors.Is(err, errFileNotFound) {
+			// This special case is needed to handle len(xlMeta.versions) == 0
+			return FileInfo{
+				Volume:    volume,
+				Name:      path,
+				VersionID: versionID,
+				Deleted:   true,
+				IsLatest:  true,
+				ModTime:   timeSentinel1970,
+			}, nil
+		}
 	} else {
 		var xlMeta xlMetaV2
 		if err := xlMeta.LoadOrConvert(xlMetaBuf); err != nil {
 			return FileInfo{}, err
+		}
+		if len(xlMeta.versions) == 0 {
+			// This special case is needed to handle len(xlMeta.versions) == 0
+			return FileInfo{
+				Volume:    volume,
+				Name:      path,
+				VersionID: versionID,
+				Deleted:   true,
+				IsLatest:  true,
+				ModTime:   timeSentinel1970,
+			}, nil
 		}
 		inData = xlMeta.data
 		fi, err = xlMeta.ToFileInfo(volume, path, versionID)
@@ -118,7 +154,7 @@ func getXLDiskLoc(diskID string) (poolIdx, setIdx, diskIdx int) {
 // Trivial collisions are avoided, but this is by no means a strong hash.
 func hashDeterministicString(m map[string]string) uint64 {
 	// Seed (random)
-	var crc = uint64(0xc2b40bbac11a7295)
+	crc := uint64(0xc2b40bbac11a7295)
 	// Xor each value to make order independent
 	for k, v := range m {
 		// Separate key and value with an individual xor with a random number.
@@ -131,7 +167,7 @@ func hashDeterministicString(m map[string]string) uint64 {
 // hashDeterministicBytes will return a deterministic (weak) hash for the map values.
 // Trivial collisions are avoided, but this is by no means a strong hash.
 func hashDeterministicBytes(m map[string][]byte) uint64 {
-	var crc = uint64(0x1bbc7e1dde654743)
+	crc := uint64(0x1bbc7e1dde654743)
 	for k, v := range m {
 		crc ^= (xxh3.HashString(k) ^ 0x4ee3bbaf7ab2506b) + (xxh3.Hash(v) ^ 0x8da4c8da66194257)
 	}

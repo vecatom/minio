@@ -86,14 +86,29 @@ func (s1 ServerSystemConfig) Diff(s2 ServerSystemConfig) error {
 		}
 	}
 	if !reflect.DeepEqual(s1.MinioEnv, s2.MinioEnv) {
-		return fmt.Errorf("Expected same MINIO_ environment variables and values")
+		var missing []string
+		var mismatching []string
+		for k, v := range s1.MinioEnv {
+			ev, ok := s2.MinioEnv[k]
+			if !ok {
+				missing = append(missing, k)
+			} else if v != ev {
+				mismatching = append(mismatching, k)
+			}
+		}
+		if len(mismatching) > 0 {
+			return fmt.Errorf(`Expected same MINIO_ environment variables and values across all servers: Missing environment values: %s / Mismatch environment values: %s`, missing, mismatching)
+		}
+		return fmt.Errorf(`Expected same MINIO_ environment variables and values across all servers: Missing environment values: %s`, missing)
 	}
 	return nil
 }
 
 var skipEnvs = map[string]struct{}{
-	"MINIO_OPTS":        {},
-	"MINIO_CERT_PASSWD": {},
+	"MINIO_OPTS":         {},
+	"MINIO_CERT_PASSWD":  {},
+	"MINIO_SERVER_DEBUG": {},
+	"MINIO_DSYNC_TRACE":  {},
 }
 
 func getServerSystemCfg() ServerSystemConfig {
@@ -190,11 +205,11 @@ func verifyServerSystemConfig(ctx context.Context, endpointServerPools EndpointS
 	for onlineServers < len(clnts)/2 {
 		for _, clnt := range clnts {
 			if err := clnt.Verify(ctx, srcCfg); err != nil {
-				if isNetworkError(err) {
-					offlineEndpoints = append(offlineEndpoints, clnt.String())
-					continue
+				if !isNetworkError(err) {
+					logger.LogIf(ctx, fmt.Errorf("%s has incorrect configuration: %w", clnt.String(), err))
 				}
-				return fmt.Errorf("%s as has incorrect configuration: %w", clnt.String(), err)
+				offlineEndpoints = append(offlineEndpoints, clnt.String())
+				continue
 			}
 			onlineServers++
 		}

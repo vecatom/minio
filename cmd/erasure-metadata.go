@@ -351,6 +351,17 @@ func findFileInfoInQuorum(ctx context.Context, metaArr []FileInfo, modTime time.
 	return FileInfo{}, errErasureReadQuorum
 }
 
+func pickValidDiskTimeWithQuorum(metaArr []FileInfo, quorum int) time.Time {
+	diskMTimes := listObjectDiskMtimes(metaArr)
+
+	diskMTime, diskMaxima := commonTimeAndOccurence(diskMTimes, shardDiskTimeDelta)
+	if diskMaxima >= quorum {
+		return diskMTime
+	}
+
+	return timeSentinel
+}
+
 // pickValidFileInfo - picks one valid FileInfo content and returns from a
 // slice of FileInfo.
 func pickValidFileInfo(ctx context.Context, metaArr []FileInfo, modTime time.Time, quorum int) (FileInfo, error) {
@@ -395,9 +406,25 @@ func objectQuorumFromMeta(ctx context.Context, partsMetaData []FileInfo, errs []
 		return 0, 0, err
 	}
 
+	if latestFileInfo.Deleted {
+		// For delete markers do not use 'defaultParityCount' as it is not expected to be the case.
+		// Use maximum allowed read quorum instead, writeQuorum+1 is returned for compatibility sake
+		// but there are no callers that shall be using this.
+		readQuorum := len(partsMetaData) / 2
+		return readQuorum, readQuorum + 1, nil
+	}
+
 	parityBlocks := globalStorageClass.GetParityForSC(latestFileInfo.Metadata[xhttp.AmzStorageClass])
 	if parityBlocks <= 0 {
 		parityBlocks = defaultParityCount
+	}
+
+	// For erasure code upgraded objects choose the parity
+	// blocks saved internally, instead of 'defaultParityCount'
+	if _, ok := latestFileInfo.Metadata[minIOErasureUpgraded]; ok {
+		if latestFileInfo.Erasure.ParityBlocks != 0 {
+			parityBlocks = latestFileInfo.Erasure.ParityBlocks
+		}
 	}
 
 	dataBlocks := latestFileInfo.Erasure.DataBlocks
@@ -448,6 +475,18 @@ func (fi *FileInfo) SetTierFreeVersion() {
 func (fi *FileInfo) TierFreeVersion() bool {
 	_, ok := fi.Metadata[ReservedMetadataPrefixLower+tierFVMarker]
 	return ok
+}
+
+// IsRestoreObjReq returns true if fi corresponds to a RestoreObject request.
+func (fi *FileInfo) IsRestoreObjReq() bool {
+	if restoreHdr, ok := fi.Metadata[xhttp.AmzRestore]; ok {
+		if restoreStatus, err := parseRestoreObjStatus(restoreHdr); err == nil {
+			if !restoreStatus.Ongoing() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // VersionPurgeStatus returns overall version purge status for this object version across targets

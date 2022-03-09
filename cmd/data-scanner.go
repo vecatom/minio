@@ -22,10 +22,10 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io/fs"
 	"math"
 	"math/rand"
-	"net/http"
 	"os"
 	"path"
 	"strings"
@@ -34,13 +34,13 @@ import (
 	"time"
 
 	"github.com/bits-and-blooms/bloom/v3"
+	"github.com/dustin/go-humanize"
 	"github.com/minio/madmin-go"
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/config/heal"
 	"github.com/minio/minio/internal/event"
-	"github.com/minio/minio/internal/hash"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/console"
 )
@@ -71,7 +71,19 @@ var (
 
 // initDataScanner will start the scanner in the background.
 func initDataScanner(ctx context.Context, objAPI ObjectLayer) {
-	go runDataScanner(ctx, objAPI)
+	go func() {
+		r := rand.New(rand.NewSource(time.Now().UnixNano()))
+		// Run the data scanner in a loop
+		for {
+			runDataScanner(ctx, objAPI)
+			duration := time.Duration(r.Float64() * float64(scannerCycle.Get()))
+			if duration < time.Second {
+				// Make sure to sleep atleast a second to avoid high CPU ticks.
+				duration = time.Second
+			}
+			time.Sleep(duration)
+		}
+	}()
 }
 
 type safeDuration struct {
@@ -96,36 +108,26 @@ func (s *safeDuration) Get() time.Duration {
 // There should only ever be one scanner running per cluster.
 func runDataScanner(pctx context.Context, objAPI ObjectLayer) {
 	// Make sure only 1 scanner is running on the cluster.
-	locker := objAPI.NewNSLock(minioMetaBucket, "runDataScanner.lock")
-	var ctx context.Context
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	for {
-		lkctx, err := locker.GetLock(pctx, dataScannerLeaderLockTimeout)
-		if err != nil {
-			time.Sleep(time.Duration(r.Float64() * float64(scannerCycle.Get())))
-			continue
+	locker := objAPI.NewNSLock(minioMetaBucket, "scanner/runDataScanner.lock")
+	lkctx, err := locker.GetLock(pctx, dataScannerLeaderLockTimeout)
+	if err != nil {
+		if intDataUpdateTracker.debug {
+			logger.LogIf(pctx, err)
 		}
-		ctx = lkctx.Context()
-		defer lkctx.Cancel()
-		break
-		// No unlock for "leader" lock.
+		return
 	}
+	ctx := lkctx.Context()
+	defer lkctx.Cancel()
+	// No unlock for "leader" lock.
 
 	// Load current bloom cycle
 	nextBloomCycle := intDataUpdateTracker.current() + 1
 
-	br, err := objAPI.GetObjectNInfo(ctx, dataUsageBucket, dataUsageBloomName, nil, http.Header{}, readLock, ObjectOptions{})
-	if err != nil {
-		if !isErrObjectNotFound(err) && !isErrBucketNotFound(err) {
+	buf, _ := readConfig(ctx, objAPI, dataUsageBloomNamePath)
+	if len(buf) >= 8 {
+		if err = binary.Read(bytes.NewReader(buf), binary.LittleEndian, &nextBloomCycle); err != nil {
 			logger.LogIf(ctx, err)
 		}
-	} else {
-		if br.ObjInfo.Size == 8 {
-			if err = binary.Read(br, binary.LittleEndian, &nextBloomCycle); err != nil {
-				logger.LogIf(ctx, err)
-			}
-		}
-		br.Close()
 	}
 
 	scannerTimer := time.NewTimer(scannerCycle.Get())
@@ -155,14 +157,7 @@ func runDataScanner(pctx context.Context, objAPI ObjectLayer) {
 				nextBloomCycle++
 				var tmp [8]byte
 				binary.LittleEndian.PutUint64(tmp[:], nextBloomCycle)
-				r, err := hash.NewReader(bytes.NewReader(tmp[:]), int64(len(tmp)), "", "", int64(len(tmp)))
-				if err != nil {
-					logger.LogIf(ctx, err)
-					continue
-				}
-
-				_, err = objAPI.PutObject(ctx, dataUsageBucket, dataUsageBloomName, NewPutObjReader(r), ObjectOptions{})
-				if !isErrBucketNotFound(err) {
+				if err = saveConfig(ctx, objAPI, dataUsageBloomNamePath, tmp[:]); err != nil {
 					logger.LogIf(ctx, err)
 				}
 			}
@@ -188,7 +183,8 @@ type folderScanner struct {
 	healFolderInclude     uint32 // Include a clean folder one in n cycles.
 	healObjectSelect      uint32 // Do a heal check on an object once every n cycles. Must divide into healFolderInclude
 
-	disks []StorageAPI
+	disks       []StorageAPI
+	disksQuorum int
 
 	// If set updates will be sent regularly to this channel.
 	// Will not be closed when returned.
@@ -254,7 +250,7 @@ var globalScannerStats scannerStats
 // The returned cache will always be valid, but may not be updated from the existing.
 // Before each operation sleepDuration is called which can be used to temporarily halt the scanner.
 // If the supplied context is canceled the function will return at the first chance.
-func scanDataFolder(ctx context.Context, basePath string, cache dataUsageCache, getSize getSizeFn) (dataUsageCache, error) {
+func scanDataFolder(ctx context.Context, poolIdx, setIdx int, basePath string, cache dataUsageCache, getSize getSizeFn) (dataUsageCache, error) {
 	t := UTCNow()
 
 	logPrefix := color.Green("data-usage: ")
@@ -267,7 +263,6 @@ func scanDataFolder(ctx context.Context, basePath string, cache dataUsageCache, 
 		defer func() {
 			console.Debugf(logPrefix+" Scanner time: %v %s\n", time.Since(t), logSuffix)
 		}()
-
 	}
 
 	switch cache.Info.Name {
@@ -288,13 +283,15 @@ func scanDataFolder(ctx context.Context, basePath string, cache dataUsageCache, 
 	}
 
 	// Add disks for set healing.
-	if len(cache.Disks) > 0 {
+	if poolIdx >= 0 && setIdx >= 0 {
 		objAPI, ok := newObjectLayerFn().(*erasureServerPools)
 		if ok {
-			s.disks = objAPI.GetDisksID(cache.Disks...)
-			if len(s.disks) != len(cache.Disks) {
-				console.Debugf(logPrefix+"Missing disks, want %d, found %d. Cannot heal. %s\n", len(cache.Disks), len(s.disks), logSuffix)
-				s.disks = s.disks[:0]
+			if poolIdx < len(objAPI.serverPools) && setIdx < len(objAPI.serverPools[poolIdx].sets) {
+				// Pass the disks belonging to the set.
+				s.disks = objAPI.serverPools[poolIdx].sets[setIdx].getDisks()
+				s.disksQuorum = len(s.disks) / 2
+			} else {
+				logger.LogIf(ctx, fmt.Errorf("Matching pool %s, set %s not found", humanize.Ordinal(poolIdx+1), humanize.Ordinal(setIdx+1)))
 			}
 		}
 	}
@@ -406,7 +403,7 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 		if filter != nil && ok && existing.Compacted {
 			// If folder isn't in filter and we have data, skip it completely.
 			if folder.name != dataUsageRoot && !filter.containsDir(folder.name) {
-				if f.healObjectSelect == 0 || !thisHash.mod(f.oldCache.Info.NextCycle, f.healFolderInclude/folder.objectHealProbDiv) {
+				if f.healObjectSelect == 0 || !thisHash.modAlt(f.oldCache.Info.NextCycle/folder.objectHealProbDiv, f.healFolderInclude/folder.objectHealProbDiv) {
 					f.newCache.copyWithChildren(&f.oldCache, thisHash, folder.parent)
 					f.updateCache.copyWithChildren(&f.oldCache, thisHash, folder.parent)
 					if f.dataUsageScannerDebug {
@@ -485,7 +482,7 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 				debug:       f.dataUsageScannerDebug,
 				lifeCycle:   activeLifeCycle,
 				replication: replicationCfg,
-				heal:        thisHash.mod(f.oldCache.Info.NextCycle, f.healObjectSelect/folder.objectHealProbDiv) && globalIsErasure,
+				heal:        thisHash.modAlt(f.oldCache.Info.NextCycle/folder.objectHealProbDiv, f.healObjectSelect/folder.objectHealProbDiv) && globalIsErasure,
 			}
 			// if the drive belongs to an erasure set
 			// that is already being healed, skip the
@@ -612,13 +609,13 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 			// and the entry itself is compacted.
 			if !into.Compacted && f.oldCache.isCompacted(h) {
 				if !h.mod(f.oldCache.Info.NextCycle, dataUsageUpdateDirCycles) {
-					if f.healObjectSelect == 0 || !h.mod(f.oldCache.Info.NextCycle, f.healFolderInclude/folder.objectHealProbDiv) {
+					if f.healObjectSelect == 0 || !h.modAlt(f.oldCache.Info.NextCycle/folder.objectHealProbDiv, f.healFolderInclude/folder.objectHealProbDiv) {
 						// Transfer and add as child...
 						f.newCache.copyWithChildren(&f.oldCache, h, folder.parent)
 						into.addChild(h)
 						continue
 					}
-					folder.objectHealProbDiv = dataUsageUpdateDirCycles
+					folder.objectHealProbDiv = f.healFolderInclude
 				}
 			}
 			scanFolder(folder)
@@ -631,7 +628,7 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 		}
 
 		objAPI, ok := newObjectLayerFn().(*erasureServerPools)
-		if !ok || len(f.disks) == 0 {
+		if !ok || len(f.disks) == 0 || f.disksQuorum == 0 {
 			break
 		}
 
@@ -653,8 +650,8 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 		// This means that the next run will not look for it.
 		// How to resolve results.
 		resolver := metadataResolutionParams{
-			dirQuorum: getReadQuorum(len(f.disks)),
-			objQuorum: getReadQuorum(len(f.disks)),
+			dirQuorum: f.disksQuorum,
+			objQuorum: f.disksQuorum,
 			bucket:    "",
 			strict:    false,
 		}
@@ -684,8 +681,7 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 				path:           prefix,
 				recursive:      true,
 				reportNotFound: true,
-				minDisks:       len(f.disks), // We want full consistency.
-				// Weird, maybe transient error.
+				minDisks:       f.disksQuorum,
 				agreed: func(entry metaCacheEntry) {
 					if f.dataUsageScannerDebug {
 						console.Debugf(healObjectsPrefix+" got agreement: %v\n", entry.name)
@@ -865,8 +861,10 @@ func (i *scannerItem) transformMetaDir() {
 	i.objectName = split[len(split)-1]
 }
 
-var applyActionsLogPrefix = color.Green("applyActions:")
-var applyVersionActionsLogPrefix = color.Green("applyVersionActions:")
+var (
+	applyActionsLogPrefix        = color.Green("applyActions:")
+	applyVersionActionsLogPrefix = color.Green("applyVersionActions:")
+)
 
 func (i *scannerItem) applyHealing(ctx context.Context, o ObjectLayer, oi ObjectInfo) (size int64) {
 	if i.debug {
@@ -969,7 +967,6 @@ func (i *scannerItem) applyTierObjSweep(ctx context.Context, o ObjectLayer, oi O
 	if ignoreNotFoundErr(err) != nil {
 		logger.LogIf(ctx, err)
 	}
-
 }
 
 // applyNewerNoncurrentVersionLimit removes noncurrent versions older than the most recent NewerNoncurrentVersions configured.
@@ -1016,8 +1013,10 @@ func (i *scannerItem) applyNewerNoncurrentVersionLimit(ctx context.Context, _ Ob
 		}
 
 		toDel = append(toDel, ObjectToDelete{
-			ObjectName: fi.Name,
-			VersionID:  fi.VersionID,
+			ObjectV: ObjectV{
+				ObjectName: fi.Name,
+				VersionID:  fi.VersionID,
+			},
 		})
 	}
 
@@ -1090,7 +1089,6 @@ func applyTransitionRule(obj ObjectInfo) bool {
 	}
 	globalTransitionState.queueTransitionTask(obj)
 	return true
-
 }
 
 func applyExpiryOnTransitionedObject(ctx context.Context, objLayer ObjectLayer, obj ObjectInfo, restoredObject bool) bool {
@@ -1259,6 +1257,7 @@ func (i *scannerItem) healReplicationDeletes(ctx context.Context, o ObjectLayer,
 				DeleteMarker:          roi.DeleteMarker,
 			},
 			Bucket: roi.Bucket,
+			OpType: replication.HealReplicationType,
 		}
 		if roi.ExistingObjResync.mustResync() {
 			doi.OpType = replication.ExistingObjectReplicationType

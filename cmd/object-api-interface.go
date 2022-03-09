@@ -46,7 +46,6 @@ type ObjectOptions struct {
 	ServerSideEncryption encrypt.ServerSide
 	VersionSuspended     bool      // indicates if the bucket was previously versioned but is currently suspended.
 	Versioned            bool      // indicates if the bucket is versioned
-	WalkVersions         bool      // indicates if the we are interested in walking versions
 	VersionID            string    // Specifies the versionID which needs to be overwritten or read
 	MTime                time.Time // Is only set in POST/PUT operations
 	Expires              time.Time // Is only used in POST/PUT operations
@@ -67,10 +66,16 @@ type ObjectOptions struct {
 	ReplicationSourceTaggingTimestamp   time.Time // set if MinIOSourceTaggingTimestamp received
 	ReplicationSourceLegalholdTimestamp time.Time // set if MinIOSourceObjectLegalholdTimestamp received
 	ReplicationSourceRetentionTimestamp time.Time // set if MinIOSourceObjectRetentionTimestamp received
-	DeletePrefix                        bool      //  set true to enforce a prefix deletion, only application for DeleteObject API,
+	DeletePrefix                        bool      // set true to enforce a prefix deletion, only application for DeleteObject API,
+
+	Speedtest bool // object call specifically meant for SpeedTest code, set to 'true' when invoked by SpeedtestHandler.
 
 	// Use the maximum parity (N/2), used when saving server configuration files
 	MaxParity bool
+
+	// Mutate set to 'true' if the call is namespace mutation call
+	Mutate        bool
+	WalkAscending bool // return Walk results in ascending order of versions
 }
 
 // ExpirationOptions represents object options for object expiration at objectLayer.
@@ -167,7 +172,6 @@ type ObjectLayer interface {
 	// Storage operations.
 	Shutdown(context.Context) error
 	NSScanner(ctx context.Context, bf *bloomFilter, updates chan<- DataUsageInfo, wantCycle uint32) error
-
 	BackendInfo() madmin.BackendInfo
 	StorageInfo(ctx context.Context) (StorageInfo, []error)
 	LocalStorageInfo(ctx context.Context) (StorageInfo, []error)
@@ -222,7 +226,6 @@ type ObjectLayer interface {
 	IsEncryptionSupported() bool
 	IsTaggingSupported() bool
 	IsCompressionSupported() bool
-
 	SetDriveCounts() []int // list of erasure stripe size for each pool in order.
 
 	// Healing operations.

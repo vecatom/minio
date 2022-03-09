@@ -47,7 +47,7 @@ type DiskInfo struct {
 // the number of calls of each API and the moving average of
 // the duration of each API.
 type DiskMetrics struct {
-	APILatencies map[string]string `json:"apiLatencies,omitempty"`
+	APILatencies map[string]uint64 `json:"apiLatencies,omitempty"`
 	APICalls     map[string]uint64 `json:"apiCalls,omitempty"`
 }
 
@@ -72,11 +72,12 @@ type FilesInfo struct {
 	IsTruncated bool
 }
 
-// FilesInfoVersions represents a list of file versions,
-// additionally indicates if the list is last.
-type FilesInfoVersions struct {
-	FilesVersions []FileInfoVersions
-	IsTruncated   bool
+// Size returns size of all versions for the object 'Name'
+func (f FileInfoVersions) Size() (size int64) {
+	for _, v := range f.Versions {
+		size += v.Size
+	}
+	return size
 }
 
 // FileInfoVersions represent a list of versions for a given file.
@@ -184,6 +185,25 @@ type FileInfo struct {
 	// no other caller must set this value other than multi-object delete call.
 	// usage in other calls in undefined please avoid.
 	Idx int `msg:"i"`
+
+	// DiskMTime indicates the mtime of the xl.meta on disk
+	// This is mainly used for detecting a particular issue
+	// reported in https://github.com/minio/minio/pull/13803
+	DiskMTime time.Time `msg:"dmt"`
+}
+
+// Equals checks if fi(FileInfo) matches ofi(FileInfo)
+func (fi FileInfo) Equals(ofi FileInfo) (ok bool) {
+	if !fi.MetadataEquals(ofi) {
+		return false
+	}
+	if !fi.ReplicationInfoEquals(ofi) {
+		return false
+	}
+	if !fi.TransitionInfoEquals(ofi) {
+		return false
+	}
+	return fi.ModTime.Equal(ofi.ModTime)
 }
 
 // GetDataDir returns an expected dataDir given FileInfo
@@ -216,7 +236,9 @@ func (fi *FileInfo) SetInlineData() {
 }
 
 // VersionPurgeStatusKey denotes purge status in metadata
-const VersionPurgeStatusKey = "purgestatus"
+const (
+	VersionPurgeStatusKey = ReservedMetadataPrefixLower + "purgestatus"
+)
 
 // newFileInfo - initializes new FileInfo, allocates a fresh erasure info.
 func newFileInfo(object string, dataBlocks, parityBlocks int) (fi FileInfo) {

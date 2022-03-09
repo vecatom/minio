@@ -19,10 +19,32 @@ package ioutil
 
 import (
 	"io"
+	"io/fs"
 	"os"
 
 	"github.com/minio/minio/internal/disk"
 )
+
+// ReadFileWithFileInfo reads the named file and returns the contents.
+// A successful call returns err == nil, not err == EOF.
+// Because ReadFile reads the whole file, it does not treat an EOF from Read
+// as an error to be reported, additionall returns os.FileInfo
+func ReadFileWithFileInfo(name string) ([]byte, fs.FileInfo, error) {
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer f.Close()
+
+	st, err := f.Stat()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	dst := make([]byte, st.Size())
+	_, err = io.ReadFull(f, dst)
+	return dst, st, err
+}
 
 // ReadFile reads the named file and returns the contents.
 // A successful call returns err == nil, not err == EOF.
@@ -31,11 +53,11 @@ import (
 //
 // passes NOATIME flag for reads on Unix systems to avoid atime updates.
 func ReadFile(name string) ([]byte, error) {
-	f, err := disk.OpenFileDirectIO(name, readMode, 0666)
+	f, err := disk.OpenFileDirectIO(name, readMode, 0o666)
 	if err != nil {
 		// fallback if there is an error to read
 		// 'name' with O_DIRECT
-		f, err = os.OpenFile(name, readMode, 0666)
+		f, err = os.OpenFile(name, readMode, 0o666)
 		if err != nil {
 			return nil, err
 		}

@@ -113,7 +113,6 @@ func cacheControlOpts(o ObjectInfo) *cacheControl {
 		if strings.EqualFold(k, "cache-control") {
 			headerVal = v
 		}
-
 	}
 	if headerVal == "" {
 		return nil
@@ -478,22 +477,6 @@ func (f *fileScorer) trimQueue() {
 	}
 }
 
-// fileObjInfos returns all queued file object infos
-func (f *fileScorer) fileObjInfos() []ObjectInfo {
-	res := make([]ObjectInfo, 0, f.queue.Len())
-	e := f.queue.Front()
-	for e != nil {
-		qfile := e.Value.(queuedFile)
-		res = append(res, ObjectInfo{
-			Name:      qfile.name,
-			Size:      int64(qfile.size),
-			VersionID: qfile.versionID,
-		})
-		e = e.Next()
-	}
-	return res
-}
-
 func (f *fileScorer) purgeFunc(p func(qfile queuedFile)) {
 	e := f.queue.Front()
 	for e != nil {
@@ -581,6 +564,7 @@ func (t *multiWriter) Write(p []byte) (n int, err error) {
 	}
 	return len(p), nil
 }
+
 func cacheMultiWriter(w1 io.Writer, w2 *io.PipeWriter) io.Writer {
 	return &multiWriter{backendWriter: w1, cacheWriter: w2}
 }

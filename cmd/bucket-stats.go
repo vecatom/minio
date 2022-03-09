@@ -18,7 +18,6 @@
 package cmd
 
 import (
-	"sync/atomic"
 	"time"
 )
 
@@ -39,7 +38,7 @@ func (rl ReplicationLatency) merge(other ReplicationLatency) (newReplLatency Rep
 // Get upload latency of each object size range
 func (rl ReplicationLatency) getUploadLatency() (ret map[string]uint64) {
 	ret = make(map[string]uint64)
-	avg := rl.UploadHistogram.GetAvg()
+	avg := rl.UploadHistogram.GetAvgData()
 	for k, v := range avg {
 		// Convert nanoseconds to milliseconds
 		ret[sizeTagToString(k)] = v.avg() / uint64(time.Millisecond)
@@ -50,13 +49,6 @@ func (rl ReplicationLatency) getUploadLatency() (ret map[string]uint64) {
 // Update replication upload latency with a new value
 func (rl *ReplicationLatency) update(size int64, duration time.Duration) {
 	rl.UploadHistogram.Add(size, duration)
-}
-
-// Clone replication latency
-func (rl ReplicationLatency) clone() ReplicationLatency {
-	return ReplicationLatency{
-		UploadHistogram: rl.UploadHistogram.Clone(),
-	}
 }
 
 // BucketStats bucket statistics
@@ -88,29 +80,18 @@ func (brs *BucketReplicationStats) Empty() bool {
 }
 
 // Clone creates a new BucketReplicationStats copy
-func (brs BucketReplicationStats) Clone() BucketReplicationStats {
-	c := BucketReplicationStats{
-		Stats: make(map[string]*BucketReplicationStat, len(brs.Stats)),
-	}
-	// This is called only by replicationStats cache and already holds a read lock before calling Clone()
+func (brs BucketReplicationStats) Clone() (c BucketReplicationStats) {
+	// This is called only by replicationStats cache and already holds a
+	// read lock before calling Clone()
+
+	c = brs
+	// We need to copy the map, so we do not reference the one in `brs`.
+	c.Stats = make(map[string]*BucketReplicationStat, len(brs.Stats))
 	for arn, st := range brs.Stats {
-		c.Stats[arn] = &BucketReplicationStat{
-			FailedSize:     atomic.LoadInt64(&st.FailedSize),
-			ReplicatedSize: atomic.LoadInt64(&st.ReplicatedSize),
-			ReplicaSize:    atomic.LoadInt64(&st.ReplicaSize),
-			FailedCount:    atomic.LoadInt64(&st.FailedCount),
-			PendingSize:    atomic.LoadInt64(&st.PendingSize),
-			PendingCount:   atomic.LoadInt64(&st.PendingCount),
-			Latency:        st.Latency.clone(),
-		}
+		// make a copy of `*st`
+		s := *st
+		c.Stats[arn] = &s
 	}
-	// update total counts across targets
-	c.FailedSize = atomic.LoadInt64(&brs.FailedSize)
-	c.FailedCount = atomic.LoadInt64(&brs.FailedCount)
-	c.PendingCount = atomic.LoadInt64(&brs.PendingCount)
-	c.PendingSize = atomic.LoadInt64(&brs.PendingSize)
-	c.ReplicaSize = atomic.LoadInt64(&brs.ReplicaSize)
-	c.ReplicatedSize = atomic.LoadInt64(&brs.ReplicatedSize)
 	return c
 }
 

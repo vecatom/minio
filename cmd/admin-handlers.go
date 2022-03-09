@@ -23,6 +23,7 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -36,6 +37,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -283,6 +285,7 @@ type ServerHTTPAPIStats struct {
 // including their average execution time.
 type ServerHTTPStats struct {
 	S3RequestsInQueue      int32              `json:"s3RequestsInQueue"`
+	S3RequestsIncoming     uint64             `json:"s3RequestsIncoming"`
 	CurrentS3Requests      ServerHTTPAPIStats `json:"currentS3Requests"`
 	TotalS3Requests        ServerHTTPAPIStats `json:"totalS3Requests"`
 	TotalS3Errors          ServerHTTPAPIStats `json:"totalS3Errors"`
@@ -333,7 +336,6 @@ func (a adminAPIHandlers) StorageInfoHandler(w http.ResponseWriter, r *http.Requ
 	// Reply with storage information (across nodes in a
 	// distributed setup) as json.
 	writeSuccessResponseJSON(w, jsonBytes)
-
 }
 
 // DataUsageInfoHandler - GET /minio/admin/v3/datausage
@@ -934,12 +936,61 @@ func (a adminAPIHandlers) BackgroundHealStatusHandler(w http.ResponseWriter, r *
 	}
 }
 
-// SpeedtestHandler - reports maximum speed of a cluster by performing PUT and
+// NetperfHandler - perform mesh style network throughput test
+func (a adminAPIHandlers) NetperfHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "NetperfHandler")
+
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.HealthInfoAdminAction)
+	if objectAPI == nil {
+		return
+	}
+
+	if !globalIsDistErasure {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
+		return
+	}
+
+	nsLock := objectAPI.NewNSLock(minioMetaBucket, "netperf")
+	lkctx, err := nsLock.GetLock(ctx, globalOperationTimeout)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(toAPIErrorCode(ctx, err)), r.URL)
+		return
+	}
+	defer nsLock.Unlock(lkctx.Cancel)
+
+	durationStr := r.Form.Get(peerRESTDuration)
+	duration, err := time.ParseDuration(durationStr)
+	if err != nil {
+		duration = globalNetPerfMinDuration
+	}
+
+	if duration < globalNetPerfMinDuration {
+		// We need sample size of minimum 10 secs.
+		duration = globalNetPerfMinDuration
+	}
+
+	duration = duration.Round(time.Second)
+
+	results := globalNotificationSys.Netperf(ctx, duration)
+	enc := json.NewEncoder(w)
+	if err := enc.Encode(madmin.NetperfResult{NodeResults: results}); err != nil {
+		return
+	}
+}
+
+// SpeedtestHandler - Deprecated. See ObjectSpeedtestHandler
+func (a adminAPIHandlers) SpeedtestHandler(w http.ResponseWriter, r *http.Request) {
+	a.ObjectSpeedtestHandler(w, r)
+}
+
+// ObjectSpeedtestHandler - reports maximum speed of a cluster by performing PUT and
 // GET operations on the server, supports auto tuning by default by automatically
 // increasing concurrency and stopping when we have reached the limits on the
 // system.
-func (a adminAPIHandlers) SpeedtestHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "SpeedtestHandler")
+func (a adminAPIHandlers) ObjectSpeedtestHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "ObjectSpeedtestHandler")
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
@@ -978,9 +1029,33 @@ func (a adminAPIHandlers) SpeedtestHandler(w http.ResponseWriter, r *http.Reques
 		duration = time.Second * 10
 	}
 
+	// ignores any errors here.
+	storageInfo, _ := objectAPI.StorageInfo(ctx)
+	capacityNeeded := uint64(concurrent * size)
+	capacity := uint64(GetTotalUsableCapacityFree(storageInfo.Disks, storageInfo))
+
+	if capacity < capacityNeeded {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, AdminError{
+			Code: "XMinioSpeedtestInsufficientCapacity",
+			Message: fmt.Sprintf("not enough usable space available to perform speedtest - expected %s, got %s",
+				humanize.IBytes(capacityNeeded), humanize.IBytes(capacity)),
+			StatusCode: http.StatusInsufficientStorage,
+		}), r.URL)
+		return
+	}
+
+	// Verify if we can employ autotune without running out of capacity,
+	// if we do run out of capacity, make sure to turn-off autotuning
+	// in such situations.
+	newConcurrent := concurrent + (concurrent+1)/2
+	autoTunedCapacityNeeded := uint64(newConcurrent * size)
+	if autotune && capacity < autoTunedCapacityNeeded {
+		// Turn-off auto-tuning if next possible concurrency would reach beyond disk capacity.
+		autotune = false
+	}
+
 	deleteBucket := func() {
-		loc := pathJoin(minioMetaSpeedTestBucket, minioMetaSpeedTestBucketPrefix)
-		objectAPI.DeleteBucket(context.Background(), loc, DeleteBucketOptions{
+		objectAPI.DeleteBucket(context.Background(), pathJoin(minioMetaBucket, "speedtest"), DeleteBucketOptions{
 			Force:      true,
 			NoRecreate: true,
 		})
@@ -1018,6 +1093,97 @@ func (a adminAPIHandlers) SpeedtestHandler(w http.ResponseWriter, r *http.Reques
 			w.(http.Flusher).Flush()
 		}
 	}
+}
+
+// NetSpeedtestHandler - reports maximum network throughput
+func (a adminAPIHandlers) NetSpeedtestHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "NetSpeedtestHandler")
+
+	writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
+}
+
+// DriveSpeedtestHandler - reports throughput of drives available in the cluster
+func (a adminAPIHandlers) DriveSpeedtestHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "DriveSpeedtestHandler")
+
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.HealthInfoAdminAction)
+	if objectAPI == nil {
+		return
+	}
+
+	if !globalIsErasure {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
+		return
+	}
+
+	// Freeze all incoming S3 API calls before running speedtest.
+	globalNotificationSys.ServiceFreeze(ctx, true)
+
+	// unfreeze all incoming S3 API calls after speedtest.
+	defer globalNotificationSys.ServiceFreeze(ctx, false)
+
+	serial := r.Form.Get("serial") == "true"
+	blockSizeStr := r.Form.Get("blocksize")
+	fileSizeStr := r.Form.Get("filesize")
+
+	blockSize, err := strconv.ParseUint(blockSizeStr, 10, 64)
+	if err != nil {
+		blockSize = 4 * humanize.MiByte // default value
+	}
+
+	fileSize, err := strconv.ParseUint(fileSizeStr, 10, 64)
+	if err != nil {
+		fileSize = 1 * humanize.GiByte // default value
+	}
+
+	opts := madmin.DriveSpeedTestOpts{
+		Serial:    serial,
+		BlockSize: blockSize,
+		FileSize:  fileSize,
+	}
+
+	keepAliveTicker := time.NewTicker(500 * time.Millisecond)
+	defer keepAliveTicker.Stop()
+
+	enc := json.NewEncoder(w)
+	ch := globalNotificationSys.DriveSpeedTest(ctx, opts)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+
+	// local driveSpeedTest
+	go func() {
+		defer wg.Done()
+		enc.Encode(driveSpeedTest(ctx, opts))
+		if wf, ok := w.(http.Flusher); ok {
+			wf.Flush()
+		}
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			goto endloop
+		case <-keepAliveTicker.C:
+			// Write a blank entry to prevent client from disconnecting
+			if err := enc.Encode(madmin.DriveSpeedTestResult{}); err != nil {
+				goto endloop
+			}
+			w.(http.Flusher).Flush()
+		case result, ok := <-ch:
+			if !ok {
+				goto endloop
+			}
+			if err := enc.Encode(result); err != nil {
+				goto endloop
+			}
+			w.(http.Flusher).Flush()
+		}
+	}
+endloop:
+	wg.Wait()
 }
 
 // Admin API errors
@@ -1332,7 +1498,7 @@ func (a adminAPIHandlers) KMSKeyStatusHandler(w http.ResponseWriter, r *http.Req
 	if keyID == "" {
 		keyID = stat.DefaultKey
 	}
-	var response = madmin.KMSKeyStatus{
+	response := madmin.KMSKeyStatus{
 		KeyID: keyID,
 	}
 
@@ -1816,7 +1982,6 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 			anonNetwork[anonEndpoint] = status
 		}
 		return anonNetwork
-
 	}
 
 	anonymizeDrives := func(drives []madmin.Disk) []madmin.Disk {
@@ -1869,6 +2034,8 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 			}
 
 			tls := getTLSInfo()
+			isK8s := IsKubernetes()
+			isDocker := IsDocker()
 			healthInfo.Minio.Info = madmin.MinioInfo{
 				Mode:         infoMessage.Mode,
 				Domain:       infoMessage.Domain,
@@ -1882,6 +2049,8 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 				Backend:      infoMessage.Backend,
 				Servers:      servers,
 				TLS:          &tls,
+				IsKubernetes: &isK8s,
+				IsDocker:     &isDocker,
 			}
 			partialWrite(healthInfo)
 		}
@@ -1912,7 +2081,6 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 			return
 		}
 	}
-
 }
 
 func getTLSInfo() madmin.TLSInfo {
@@ -2038,7 +2206,6 @@ func assignPoolNumbers(servers []madmin.ServerProperties) {
 }
 
 func fetchLambdaInfo() []map[string][]madmin.TargetIDStatus {
-
 	lambdaMap := make(map[string][]madmin.TargetIDStatus)
 
 	for _, tgt := range globalConfigTargetList.Targets() {
@@ -2125,7 +2292,7 @@ func fetchKMSStatus() madmin.KMS {
 func fetchLoggerInfo() ([]madmin.Logger, []madmin.Audit) {
 	var loggerInfo []madmin.Logger
 	var auditloggerInfo []madmin.Audit
-	for _, target := range logger.Targets() {
+	for _, target := range logger.SystemTargets() {
 		if target.Endpoint() != "" {
 			tgt := target.String()
 			err := checkConnection(target.Endpoint(), 15*time.Second)
@@ -2280,7 +2447,7 @@ func (a adminAPIHandlers) InspectDataHandler(w http.ResponseWriter, r *http.Requ
 		}
 		if si.Mode == 0 {
 			// Not, set it to default.
-			si.Mode = 0600
+			si.Mode = 0o600
 		}
 		header, zerr := zip.FileInfoHeader(dummyFileInfo{
 			name:    filename,
@@ -2305,7 +2472,9 @@ func (a adminAPIHandlers) InspectDataHandler(w http.ResponseWriter, r *http.Requ
 		}
 		return nil
 	})
-	logger.LogIf(ctx, err)
+	if !errors.Is(err, errFileNotFound) {
+		logger.LogIf(ctx, err)
+	}
 }
 
 func createHostAnonymizerForFSMode() map[string]string {

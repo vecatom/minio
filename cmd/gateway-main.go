@@ -31,20 +31,19 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/minio/cli"
 	"github.com/minio/madmin-go"
+	"github.com/minio/minio/internal/color"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/certs"
 	"github.com/minio/pkg/env"
 )
 
-var (
-	gatewayCmd = cli.Command{
-		Name:            "gateway",
-		Usage:           "start object storage gateway",
-		Flags:           append(ServerFlags, GlobalFlags...),
-		HideHelpCommand: true,
-	}
-)
+var gatewayCmd = cli.Command{
+	Name:            "gateway",
+	Usage:           "start object storage gateway",
+	Flags:           append(ServerFlags, GlobalFlags...),
+	HideHelpCommand: true,
+}
 
 // GatewayLocker implements custom NewNSLock implementation
 type GatewayLocker struct {
@@ -162,7 +161,7 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 	signal.Notify(globalOSSignalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
 	// This is only to uniquely identify each gateway deployments.
 	globalDeploymentID = env.Get("MINIO_GATEWAY_DEPLOYMENT_ID", mustGetUUID())
-	logger.SetDeploymentID(globalDeploymentID)
+	xhttp.SetDeploymentID(globalDeploymentID)
 
 	if gw == nil {
 		logger.FatalIf(errUnexpected, "Gateway implementation not initialized")
@@ -177,7 +176,7 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 
 	// Initialize globalConsoleSys system
 	globalConsoleSys = NewConsoleLogger(GlobalContext)
-	logger.AddTarget(globalConsoleSys)
+	logger.AddSystemTarget(globalConsoleSys)
 
 	// Handle common command args.
 	handleCommonCmdArgs(ctx)
@@ -253,6 +252,11 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 	// Add API router.
 	registerAPIRouter(router)
 
+	// Enable bucket forwarding handler only if bucket federation is enabled.
+	if globalDNSConfig != nil && globalBucketFederation {
+		globalHandlers = append(globalHandlers, setBucketForwardingHandler)
+	}
+
 	// Use all the middlewares
 	router.Use(globalHandlers...)
 
@@ -293,22 +297,24 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 	newObject = NewGatewayLayerWithLocker(newObject)
 
 	// Calls all New() for all sub-systems.
-	newAllSubsystems()
+	initAllSubsystems()
 
 	// Once endpoints are finalized, initialize the new object api in safe mode.
 	globalObjLayerMutex.Lock()
 	globalObjectAPI = newObject
 	globalObjLayerMutex.Unlock()
 
+	go globalIAMSys.Init(GlobalContext, newObject, globalEtcdClient, globalRefreshIAMInterval)
+
 	if gatewayName == NASBackendGateway {
 		buckets, err := newObject.ListBuckets(GlobalContext)
 		if err != nil {
 			logger.Fatal(err, "Unable to list buckets")
 		}
-		logger.FatalIf(globalNotificationSys.Init(GlobalContext, buckets, newObject), "Unable to initialize notification system")
-	}
+		logger.FatalIf(globalBucketMetadataSys.Init(GlobalContext, buckets, newObject), "Unable to initialize bucket metadata")
 
-	go globalIAMSys.Init(GlobalContext, newObject, globalEtcdClient, globalNotificationSys, globalRefreshIAMInterval)
+		logger.FatalIf(globalNotificationSys.InitBucketTargets(GlobalContext, newObject), "Unable to initialize bucket targets for notification system")
+	}
 
 	if globalCacheConfig.Enabled {
 		// initialize the new disk cache objects.
@@ -369,6 +375,16 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 		}
 		logger.Info("======")
 	}
+
+	// TODO: remove the following line by June 1st.
+	logger.Info(
+		color.RedBold(`
+===================================================================================
+**** WARNING: MinIO Gateway will be removed by June 1st from MinIO repository *****
+
+Please read https://github.com/minio/minio/issues/14331
+===================================================================================
+`))
 
 	<-globalOSSignalCh
 }

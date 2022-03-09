@@ -109,7 +109,7 @@ func storageServerRequestValidate(r *http.Request) error {
 }
 
 // IsValid - To authenticate and verify the time difference.
-func (s *storageRESTServer) IsValid(w http.ResponseWriter, r *http.Request) bool {
+func (s *storageRESTServer) IsAuthValid(w http.ResponseWriter, r *http.Request) bool {
 	if s.storage == nil {
 		s.writeErrorResponse(w, errDiskNotFound)
 		return false
@@ -117,6 +117,15 @@ func (s *storageRESTServer) IsValid(w http.ResponseWriter, r *http.Request) bool
 
 	if err := storageServerRequestValidate(r); err != nil {
 		s.writeErrorResponse(w, err)
+		return false
+	}
+
+	return true
+}
+
+// IsValid - To authenticate and check if the disk-id in the request corresponds to the underlying disk.
+func (s *storageRESTServer) IsValid(w http.ResponseWriter, r *http.Request) bool {
+	if !s.IsAuthValid(w, r) {
 		return false
 	}
 
@@ -155,7 +164,7 @@ func (s *storageRESTServer) HealthHandler(w http.ResponseWriter, r *http.Request
 
 // DiskInfoHandler - returns disk info.
 func (s *storageRESTServer) DiskInfoHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.IsValid(w, r) {
+	if !s.IsAuthValid(w, r) {
 		return
 	}
 	info, err := s.storage.DiskInfo(r.Context())
@@ -746,7 +755,7 @@ func keepHTTPReqResponseAlive(w http.ResponseWriter, r *http.Request) (resp func
 	doneCh := make(chan error)
 	ctx := r.Context()
 	go func() {
-		var canWrite = true
+		canWrite := true
 		write := func(b []byte) {
 			if canWrite {
 				n, err := w.Write(b)
@@ -820,7 +829,7 @@ func keepHTTPReqResponseAlive(w http.ResponseWriter, r *http.Request) (resp func
 func keepHTTPResponseAlive(w http.ResponseWriter) func(error) {
 	doneCh := make(chan error)
 	go func() {
-		var canWrite = true
+		canWrite := true
 		write := func(b []byte) {
 			if canWrite {
 				n, err := w.Write(b)
@@ -940,7 +949,7 @@ func streamHTTPResponse(w http.ResponseWriter) *httpStreamResponse {
 	blockCh := make(chan []byte)
 	h := httpStreamResponse{done: doneCh, block: blockCh}
 	go func() {
-		var canWrite = true
+		canWrite := true
 		write := func(b []byte) {
 			if canWrite {
 				n, err := w.Write(b)

@@ -31,6 +31,9 @@ func toObjectErr(err error, params ...string) error {
 	if err == nil {
 		return nil
 	}
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
 	switch err.Error() {
 	case errVolumeNotFound.Error():
 		apiErr := BucketNotFound{}
@@ -159,10 +162,15 @@ func toObjectErr(err error, params ...string) error {
 			apiErr.Object = decodeDirObject(params[1])
 		}
 		return apiErr
-	case io.ErrUnexpectedEOF.Error(), io.ErrShortWrite.Error():
-		return IncompleteBody{}
-	case context.Canceled.Error(), context.DeadlineExceeded.Error():
-		return IncompleteBody{}
+	case io.ErrUnexpectedEOF.Error(), io.ErrShortWrite.Error(), context.Canceled.Error(), context.DeadlineExceeded.Error():
+		apiErr := IncompleteBody{}
+		if len(params) >= 1 {
+			apiErr.Bucket = params[0]
+		}
+		if len(params) >= 2 {
+			apiErr.Object = decodeDirObject(params[1])
+		}
+		return apiErr
 	}
 	return err
 }
@@ -562,8 +570,7 @@ func (e ObjectTooSmall) Error() string {
 }
 
 // OperationTimedOut - a timeout occurred.
-type OperationTimedOut struct {
-}
+type OperationTimedOut struct{}
 
 func (e OperationTimedOut) Error() string {
 	return "Operation timed out"
@@ -693,4 +700,8 @@ func isErrPreconditionFailed(err error) bool {
 func isErrMethodNotAllowed(err error) bool {
 	var methodNotAllowed MethodNotAllowed
 	return errors.As(err, &methodNotAllowed)
+}
+
+func isErrInvalidRange(err error) bool {
+	return errors.As(err, &errInvalidRange)
 }

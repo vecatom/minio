@@ -14,7 +14,7 @@ clusterDomain: cluster.local
 ##
 image:
   repository: quay.io/minio/minio
-  tag: RELEASE.2021-11-24T23-19-33Z
+  tag: RELEASE.2021-12-29T06-49-06Z
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
@@ -25,22 +25,23 @@ imagePullSecrets: []
 ##
 mcImage:
   repository: quay.io/minio/mc
-  tag: RELEASE.2021-11-16T20-37-36Z
+  tag: RELEASE.2021-12-29T06-52-55Z
   pullPolicy: IfNotPresent
 
-## minio mode, i.e. standalone or distributed or gateway (nas,gcs)
-## Distributed MinIO ref: https://docs.minio.io/docs/distributed-minio-quickstart-guide
-## NAS Gateway MinIO ref: https://docs.min.io/docs/minio-gateway-for-nas.html
-## GCS Gateway MinIO ref: https://docs.min.io/docs/minio-gateway-for-gcs.html
-mode: distributed
-
-## NOTE: currently only "nas,gcs" gateways are supported.
+## minio mode, i.e. standalone or distributed or gateway.
+mode: distributed ## other supported values are "standalone", "gateway"
 
 ## Additional labels to include with deployment or statefulset
 additionalLabels: []
 
 ## Additional annotations to include with deployment or statefulset
 additionalAnnotations: []
+
+## Typically the deployment/statefulset includes checksums of secrets/config,
+## So that when these change on a subsequent helm install, the deployment/statefulset 
+## is restarted. This can result in unnecessary restarts under GitOps tooling such as 
+## flux, so set to "true" to disable this behaviour.
+ignoreChartChecksums: false
 
 ## Additional arguments to pass to minio binary
 extraArgs: []
@@ -250,6 +251,62 @@ resources:
   requests:
     memory: 16Gi
 
+## List of policies to be created after minio install
+##
+## In addition to default policies [readonly|readwrite|writeonly|consoleAdmin|diagnostics]
+## you can define additional policies with custom supported actions and resources
+policies: []
+## writeexamplepolicy policy grants creation or deletion of buckets with name 
+## starting with example. In addition, grants objects write permissions on buckets starting with
+## example.
+# - name: writeexamplepolicy
+#   statements:
+#     - resources: 
+#         - 'arn:aws:s3:::example*/*'
+#       actions:
+#         - "s3:AbortMultipartUpload"
+#         - "s3:GetObject"
+#         - "s3:DeleteObject"
+#         - "s3:PutObject"
+#         - "s3:ListMultipartUploadParts"
+#     - resources: 
+#         - 'arn:aws:s3:::example*'
+#       actions:
+#         - "s3:CreateBucket"
+#         - "s3:DeleteBucket"
+#         - "s3:GetBucketLocation"
+#         - "s3:ListBucket"
+#         - "s3:ListBucketMultipartUploads"
+## readonlyexamplepolicy policy grants access to buckets with name starting with example. 
+## In addition, grants objects read permissions on buckets starting with example.
+# - name: readonlyexamplepolicy
+#   statements:
+#     - resources: 
+#         - 'arn:aws:s3:::example*/*'
+#       actions:
+#         - "s3:GetObject"
+#     - resources: 
+#         - 'arn:aws:s3:::example*'
+#       actions:
+#         - "s3:GetBucketLocation"
+#         - "s3:ListBucket"
+#         - "s3:ListBucketMultipartUploads"
+## Additional Annotations for the Kubernetes Job makePolicyJob
+makePolicyJob:
+  podAnnotations:
+  annotations:
+  securityContext:
+    enabled: false
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+  resources:
+    requests:
+      memory: 128Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
 ## List of users to be created after minio install
 ##
 users:
@@ -261,6 +318,11 @@ users:
   - accessKey: console
     secretKey: console123
     policy: consoleAdmin
+  # Or you can refer to specific secret
+  #- accessKey: externalSecret
+  #  existingSecret: my-secret
+  #  existingSecretKey: password
+  #  policy: readonly
 
 
 ## Additional Annotations for the Kubernetes Job makeUserJob
@@ -313,12 +375,39 @@ makeBucketJob:
   tolerations: []
   affinity: {}
 
+## List of command to run after minio install
+## NOTE: the mc command TARGET is always "myminio"
+customCommands:
+  # - command: "admin policy set myminio consoleAdmin group='cn=ops,cn=groups,dc=example,dc=com'"
+
+## Additional Annotations for the Kubernetes Job customCommandJob
+customCommandJob:
+  podAnnotations:
+  annotations:
+  securityContext:
+    enabled: false
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+  resources:
+    requests:
+      memory: 128Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
 ## Use this field to add environment variables relevant to MinIO server. These fields will be passed on to MinIO container(s)
 ## when Chart is deployed
 environment:
   ## Please refer for comprehensive list https://docs.min.io/minio/baremetal/reference/minio-server/minio-server.html
   ## MINIO_SUBNET_LICENSE: "License key obtained from https://subnet.min.io"
   ## MINIO_BROWSER: "off"
+
+## The name of a secret in the same kubernetes namespace which contain secret values
+## This can be useful for LDAP password, etc
+## The key in the secret must be 'config.env'
+##
+# extraSecret: minio-extraenv
 
 networkPolicy:
   enabled: false
@@ -342,8 +431,18 @@ serviceAccount:
 metrics:
   serviceMonitor:
     enabled: false
-    additionalLabels: {}
     public: true
+    additionalLabels: {}
+    relabelConfigs: {}
     # namespace: monitoring
     # interval: 30s
     # scrapeTimeout: 10s
+
+## ETCD settings: https://github.com/minio/minio/blob/master/docs/sts/etcd.md
+## Define endpoints to enable this section.
+etcd:
+  endpoints: []
+  pathPrefix: ""
+  corednsPathPrefix: ""
+  clientCert: ""
+  clientCertKey: ""

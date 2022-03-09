@@ -37,6 +37,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
+	"github.com/klauspost/compress/gzhttp"
 	miniogo "github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
@@ -411,18 +412,26 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 	if err != nil {
 		var (
 			reader *GetObjectReader
-			proxy  bool
+			proxy  proxyResult
 		)
 		proxytgts := getproxyTargets(ctx, bucket, object, opts)
 		if !proxytgts.Empty() {
 			// proxy to replication target if active-active replication is in place.
-			reader, proxy = proxyGetToReplicationTarget(ctx, bucket, object, rs, r.Header, opts, proxytgts)
-			if reader != nil && proxy {
+			reader, proxy, err = proxyGetToReplicationTarget(ctx, bucket, object, rs, r.Header, opts, proxytgts)
+			if err != nil && !isErrObjectNotFound(ErrorRespToObjectError(err, bucket, object)) &&
+				!isErrVersionNotFound(ErrorRespToObjectError(err, bucket, object)) {
+				logger.LogIf(ctx, fmt.Errorf("Replication proxy failed for %s/%s(%s) - %w", bucket, object, opts.VersionID, err))
+			}
+			if reader != nil && proxy.Proxy && err == nil {
 				gr = reader
 			}
 		}
-		if reader == nil || !proxy {
+		if reader == nil || !proxy.Proxy {
 			if isErrPreconditionFailed(err) {
+				return
+			}
+			if proxy.Err != nil {
+				writeErrorResponse(ctx, w, toAPIError(ctx, proxy.Err), r.URL)
 				return
 			}
 			if globalBucketVersioningSys.Enabled(bucket) && gr != nil {
@@ -568,6 +577,9 @@ func (api objectAPIHandlers) GetObjectHandler(w http.ResponseWriter, r *http.Req
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
+	if !globalAPIConfig.shouldGzipObjects() {
+		w.Header().Set(gzhttp.HeaderNoCompression, "true")
+	}
 
 	if r.Header.Get(xMinIOExtract) == "true" && strings.Contains(object, archivePattern) {
 		api.getObjectInArchiveFileHandler(ctx, objectAPI, bucket, object, w, r)
@@ -627,22 +639,28 @@ func (api objectAPIHandlers) headObjectHandler(ctx context.Context, objectAPI Ob
 		writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(s3Error))
 		return
 	}
+	// Get request range.
+	var rs *HTTPRangeSpec
+	rangeHeader := r.Header.Get(xhttp.Range)
 
 	objInfo, err := getObjectInfo(ctx, bucket, object, opts)
 	if err != nil {
 		var (
-			proxy bool
+			proxy proxyResult
 			oi    ObjectInfo
 		)
 		// proxy HEAD to replication target if active-active replication configured on bucket
 		proxytgts := getproxyTargets(ctx, bucket, object, opts)
 		if !proxytgts.Empty() {
-			oi, proxy = proxyHeadToReplicationTarget(ctx, bucket, object, opts, proxytgts)
-			if proxy {
+			if rangeHeader != "" {
+				rs, _ = parseRequestRangeSpec(rangeHeader)
+			}
+			oi, proxy = proxyHeadToReplicationTarget(ctx, bucket, object, rs, opts, proxytgts)
+			if proxy.Proxy {
 				objInfo = oi
 			}
 		}
-		if !proxy {
+		if !proxy.Proxy {
 			if globalBucketVersioningSys.Enabled(bucket) {
 				switch {
 				case !objInfo.VersionPurgeStatus.Empty():
@@ -699,9 +717,6 @@ func (api objectAPIHandlers) headObjectHandler(ctx context.Context, objectAPI Ob
 		return
 	}
 
-	// Get request range.
-	var rs *HTTPRangeSpec
-	rangeHeader := r.Header.Get(xhttp.Range)
 	if rangeHeader != "" {
 		// Both 'Range' and 'partNumber' cannot be specified at the same time
 		if opts.PartNumber > 0 {
@@ -1013,7 +1028,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	srcOpts.VersionID = vid
 
 	// convert copy src encryption options for GET calls
-	var getOpts = ObjectOptions{VersionID: srcOpts.VersionID, Versioned: srcOpts.Versioned}
+	getOpts := ObjectOptions{VersionID: srcOpts.VersionID, Versioned: srcOpts.Versioned}
 	getSSE := encrypt.SSE(srcOpts.ServerSideEncryption)
 	if getSSE != srcOpts.ServerSideEncryption {
 		getOpts.ServerSideEncryption = getSSE
@@ -1106,7 +1121,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	length := actualSize
 
 	if !cpSrcDstSame {
-		if err := enforceBucketQuota(ctx, dstBucket, actualSize); err != nil {
+		if err := enforceBucketQuotaHard(ctx, dstBucket, actualSize); err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
 		}
@@ -1148,7 +1163,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	pReader := NewPutObjReader(srcInfo.Reader)
 
 	// Handle encryption
-	var encMetadata = make(map[string]string)
+	encMetadata := make(map[string]string)
 	if objectAPI.IsEncryptionSupported() {
 		// Encryption parameters not applicable for this object.
 		if _, ok := crypto.IsEncrypted(srcInfo.UserDefined); !ok && crypto.SSECopy.IsRequested(r.Header) {
@@ -1511,7 +1526,6 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		// Schedule object for immediate transition if eligible.
 		enqueueTransitionImmediate(objInfo)
 	}
-
 }
 
 // PutObjectHandler - PUT Object
@@ -1660,7 +1674,7 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	if err := enforceBucketQuota(ctx, bucket, size); err != nil {
+	if err := enforceBucketQuotaHard(ctx, bucket, size); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -1997,7 +2011,7 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 		return
 	}
 
-	if err := enforceBucketQuota(ctx, bucket, size); err != nil {
+	if err := enforceBucketQuotaHard(ctx, bucket, size); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -2222,7 +2236,7 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 		}
 	}
 
-	var encMetadata = map[string]string{}
+	encMetadata := map[string]string{}
 
 	if objectAPI.IsEncryptionSupported() {
 		if _, ok := crypto.IsRequested(r.Header); ok {
@@ -2398,7 +2412,7 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 	srcOpts.VersionID = vid
 
 	// convert copy src and dst encryption options for GET/PUT calls
-	var getOpts = ObjectOptions{VersionID: srcOpts.VersionID}
+	getOpts := ObjectOptions{VersionID: srcOpts.VersionID}
 	if srcOpts.ServerSideEncryption != nil {
 		getOpts.ServerSideEncryption = encrypt.SSE(srcOpts.ServerSideEncryption)
 	}
@@ -2419,6 +2433,13 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 	var parseRangeErr error
 	if rangeHeader := r.Header.Get(xhttp.AmzCopySourceRange); rangeHeader != "" {
 		rs, parseRangeErr = parseCopyPartRangeSpec(rangeHeader)
+	} else {
+		// This check is to see if client specified a header but the value
+		// is empty for 'x-amz-copy-source-range'
+		_, ok := r.Header[xhttp.AmzCopySourceRange]
+		if ok {
+			parseRangeErr = errInvalidRange
+		}
 	}
 
 	checkCopyPartPrecondFn := func(o ObjectInfo) bool {
@@ -2466,7 +2487,7 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 		return
 	}
 
-	if err := enforceBucketQuota(ctx, dstBucket, actualPartSize); err != nil {
+	if err := enforceBucketQuotaHard(ctx, dstBucket, actualPartSize); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -2755,7 +2776,7 @@ func (api objectAPIHandlers) PutObjectPartHandler(w http.ResponseWriter, r *http
 		}
 	}
 
-	if err := enforceBucketQuota(ctx, bucket, size); err != nil {
+	if err := enforceBucketQuotaHard(ctx, bucket, size); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -3083,7 +3104,6 @@ func sendWhiteSpace(w http.ResponseWriter) <-chan bool {
 				return
 			}
 		}
-
 	}()
 	return doneCh
 }
@@ -3389,7 +3409,12 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 		os.SetTransitionState(goi.TransitionedObject)
 	}
 
-	dsc := checkReplicateDelete(ctx, bucket, ObjectToDelete{ObjectName: object, VersionID: opts.VersionID}, goi, opts, gerr)
+	dsc := checkReplicateDelete(ctx, bucket, ObjectToDelete{
+		ObjectV: ObjectV{
+			ObjectName: object,
+			VersionID:  opts.VersionID,
+		},
+	}, goi, opts, gerr)
 	if dsc.ReplicateAny() {
 		opts.SetDeleteReplicationState(dsc, opts.VersionID)
 	}
@@ -3416,8 +3441,10 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 		}
 		if vID != "" {
 			apiErr = enforceRetentionBypassForDelete(ctx, r, bucket, ObjectToDelete{
-				ObjectName: object,
-				VersionID:  vID,
+				ObjectV: ObjectV{
+					ObjectName: object,
+					VersionID:  vID,
+				},
 			}, goi, gerr)
 			if apiErr != ErrNone && apiErr != ErrNoSuchKey {
 				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(apiErr), r.URL)
@@ -3592,7 +3619,6 @@ func (api objectAPIHandlers) PutObjectLegalHoldHandler(w http.ResponseWriter, r 
 		UserAgent:    r.UserAgent(),
 		Host:         handlers.GetSourceIP(r),
 	})
-
 }
 
 // GetObjectLegalHoldHandler - get legal hold configuration to object,
@@ -3961,7 +3987,6 @@ func (api objectAPIHandlers) PutObjectTaggingHandler(w http.ResponseWriter, r *h
 		UserAgent:    r.UserAgent(),
 		Host:         handlers.GetSourceIP(r),
 	})
-
 }
 
 // DeleteObjectTaggingHandler - DELETE object tagging

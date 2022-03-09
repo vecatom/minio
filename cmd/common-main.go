@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -39,6 +40,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	fcolor "github.com/fatih/color"
 	"github.com/go-openapi/loads"
 	"github.com/inconshreveable/mousetrap"
@@ -48,6 +50,7 @@ import (
 	"github.com/minio/console/restapi"
 	"github.com/minio/console/restapi/operations"
 	"github.com/minio/kes"
+	"github.com/minio/madmin-go"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/minio/minio-go/v7/pkg/set"
@@ -67,7 +70,11 @@ import (
 
 // serverDebugLog will enable debug printing
 var serverDebugLog = env.Get("_MINIO_SERVER_DEBUG", config.EnableOff) == config.EnableOn
-var defaultAWSCredProvider []credentials.Provider
+
+var (
+	shardDiskTimeDelta     time.Duration
+	defaultAWSCredProvider []credentials.Provider
+)
 
 func init() {
 	if runtime.GOOS == "windows" {
@@ -127,6 +134,8 @@ func init() {
 	console.SetColor("Debug", fcolor.New())
 
 	gob.Register(StorageErr(""))
+	gob.Register(madmin.TimeInfo{})
+	gob.Register(map[string]interface{}{})
 
 	defaultAWSCredProvider = []credentials.Provider{
 		&credentials.IAM{
@@ -134,6 +143,12 @@ func init() {
 				Transport: NewGatewayHTTPTransport(),
 			},
 		},
+	}
+
+	var err error
+	shardDiskTimeDelta, err = time.ParseDuration(env.Get("_MINIO_SHARD_DISKTIME_DELTA", "1m"))
+	if err != nil {
+		shardDiskTimeDelta = 1 * time.Minute
 	}
 
 	// All minio-go API operations shall be performed only once,
@@ -197,6 +212,9 @@ func minioConfigToConsoleFeatures() {
 	}
 	if globalSubnetConfig.APIKey != "" {
 		os.Setenv("CONSOLE_SUBNET_API_KEY", globalSubnetConfig.APIKey)
+	}
+	if globalSubnetConfig.Proxy != "" {
+		os.Setenv("CONSOLE_SUBNET_PROXY", globalSubnetConfig.Proxy)
 	}
 }
 
@@ -309,7 +327,7 @@ func checkUpdate(mode string) {
 		return
 	}
 
-	logStartupMessage(prepareUpdateMessage("\nRun `mc admin update`", lrTime.Sub(crTime)))
+	logger.Info(prepareUpdateMessage("Run `mc admin update`", lrTime.Sub(crTime)))
 }
 
 func newConfigDirFromCtx(ctx *cli.Context, option string, getDefaultDir func() string) (*ConfigDir, bool) {
@@ -354,7 +372,6 @@ func newConfigDirFromCtx(ctx *cli.Context, option string, getDefaultDir func() s
 }
 
 func handleCommonCmdArgs(ctx *cli.Context) {
-
 	// Get "json" flag from command line argument and
 	// enable json and quite modes if json flag is turned on.
 	globalCLIContext.JSON = ctx.IsSet("json") || ctx.GlobalIsSet("json")
@@ -449,7 +466,8 @@ func (e envKV) String() string {
 }
 
 func parsEnvEntry(envEntry string) (envKV, error) {
-	if strings.TrimSpace(envEntry) == "" {
+	envEntry = strings.TrimSpace(envEntry)
+	if envEntry == "" {
 		// Skip all empty lines
 		return envKV{
 			Skip: true,
@@ -460,9 +478,21 @@ func parsEnvEntry(envEntry string) (envKV, error) {
 	if len(envTokens) != 2 {
 		return envKV{}, fmt.Errorf("envEntry malformed; %s, expected to be of form 'KEY=value'", envEntry)
 	}
+
+	key := envTokens[0]
+	val := envTokens[1]
+
+	// Remove quotes from the value if found
+	if len(val) >= 2 {
+		quote := val[0]
+		if (quote == '"' || quote == '\'') && val[len(val)-1] == quote {
+			val = val[1 : len(val)-1]
+		}
+	}
+
 	return envKV{
-		Key:   envTokens[0],
-		Value: envTokens[1],
+		Key:   key,
+		Value: val,
 	}, nil
 }
 
@@ -510,7 +540,7 @@ func readFromSecret(sp string) (string, error) {
 		}
 		return "", err
 	}
-	return string(credBuf), nil
+	return string(bytes.TrimSpace(credBuf)), nil
 }
 
 func loadEnvVarsFromFiles() {
@@ -626,6 +656,16 @@ func handleCommonEnvVars() {
 		logger.Fatal(config.ErrInvalidFSOSyncValue(err), "Invalid MINIO_FS_OSYNC value in environment variable")
 	}
 
+	if rootDiskSize := env.Get(config.EnvRootDiskThresholdSize, ""); rootDiskSize != "" {
+		size, err := humanize.ParseBytes(rootDiskSize)
+		if err != nil {
+			logger.Fatal(err, fmt.Sprintf("Invalid %s value in environment variable", config.EnvRootDiskThresholdSize))
+		}
+		globalRootDiskThreshold = size
+	}
+
+	globalIsCICD = env.Get("MINIO_CI_CD", "") != "" || env.Get("CI", "") != ""
+
 	domains := env.Get(config.EnvDomain, "")
 	if len(domains) != 0 {
 		for _, domainName := range strings.Split(domains, config.ValueSeparator) {
@@ -648,11 +688,11 @@ func handleCommonEnvVars() {
 	publicIPs := env.Get(config.EnvPublicIPs, "")
 	if len(publicIPs) != 0 {
 		minioEndpoints := strings.Split(publicIPs, config.ValueSeparator)
-		var domainIPs = set.NewStringSet()
+		domainIPs := set.NewStringSet()
 		for _, endpoint := range minioEndpoints {
 			if net.ParseIP(endpoint) == nil {
 				// Checking if the IP is a DNS entry.
-				addrs, err := net.LookupHost(endpoint)
+				addrs, err := globalDNSCache.LookupHost(GlobalContext, endpoint)
 				if err != nil {
 					logger.FatalIf(err, "Unable to initialize MinIO server with [%s] invalid entry found in MINIO_PUBLIC_IPS", endpoint)
 				}
@@ -722,7 +762,7 @@ func handleCommonEnvVars() {
 				"         Please use %s and %s",
 				config.EnvAccessKey, config.EnvSecretKey,
 				config.EnvRootUser, config.EnvRootPassword)
-			logStartupMessage(color.RedBold(msg))
+			logger.Info(color.RedBold(msg))
 		}
 		globalActiveCred = cred
 	}
@@ -765,7 +805,7 @@ func handleCommonEnvVars() {
 			logger.Fatal(err, fmt.Sprintf("Unable to load X.509 root CAs for KES from %q", env.Get(config.EnvKESServerCA, globalCertsCADir.Get())))
 		}
 
-		var defaultKeyID = env.Get(config.EnvKESKeyName, "")
+		defaultKeyID := env.Get(config.EnvKESKeyName, "")
 		KMS, err := kms.NewWithConfig(kms.Config{
 			Endpoints:    endpoints,
 			DefaultKeyID: defaultKeyID,
@@ -785,13 +825,6 @@ func handleCommonEnvVars() {
 		}
 		GlobalKMS = KMS
 	}
-}
-
-func logStartupMessage(msg string) {
-	if globalConsoleSys != nil {
-		globalConsoleSys.Send(msg, string(logger.All))
-	}
-	logger.StartupMessage(msg)
 }
 
 func getTLSConfig() (x509Certs []*x509.Certificate, manager *certs.Manager, secureConn bool, err error) {
@@ -870,6 +903,9 @@ func getTLSConfig() (x509Certs []*x509.Certificate, manager *certs.Manager, secu
 	}
 	secureConn = true
 
+	// Certs might be symlinks, reload them every 10 seconds.
+	manager.UpdateReloadDuration(10 * time.Second)
+
 	// syscall.SIGHUP to reload the certs.
 	manager.ReloadOnSignal(syscall.SIGHUP)
 
@@ -884,4 +920,33 @@ func contextCanceled(ctx context.Context) bool {
 	default:
 		return false
 	}
+}
+
+// bgContext returns a context that can be used for async operations.
+// Cancellation/timeouts are removed, so parent cancellations/timeout will
+// not propagate from parent.
+// Context values are preserved.
+// This can be used for goroutines that live beyond the parent context.
+func bgContext(parent context.Context) context.Context {
+	return bgCtx{parent: parent}
+}
+
+type bgCtx struct {
+	parent context.Context
+}
+
+func (a bgCtx) Done() <-chan struct{} {
+	return nil
+}
+
+func (a bgCtx) Err() error {
+	return nil
+}
+
+func (a bgCtx) Deadline() (deadline time.Time, ok bool) {
+	return time.Time{}, false
+}
+
+func (a bgCtx) Value(key interface{}) interface{} {
+	return a.parent.Value(key)
 }

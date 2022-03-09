@@ -88,8 +88,26 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 		}
 	case SRError:
 		apiErr = errorCodes.ToAPIErrWithErr(e.Code, e.Cause)
+	case decomError:
+		apiErr = APIError{
+			Code:           "XMinioDecommissionNotAllowed",
+			Description:    e.Err,
+			HTTPStatusCode: http.StatusBadRequest,
+		}
 	default:
 		switch {
+		case errors.Is(err, errDecommissionAlreadyRunning):
+			apiErr = APIError{
+				Code:           "XMinioDecommissionNotAllowed",
+				Description:    err.Error(),
+				HTTPStatusCode: http.StatusBadRequest,
+			}
+		case errors.Is(err, errDecommissionComplete):
+			apiErr = APIError{
+				Code:           "XMinioDecommissionNotAllowed",
+				Description:    err.Error(),
+				HTTPStatusCode: http.StatusBadRequest,
+			}
 		case errors.Is(err, errConfigNotFound):
 			apiErr = APIError{
 				Code:           "XMinioConfigError",
@@ -101,6 +119,18 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 				Code:           "XMinioIAMActionNotAllowed",
 				Description:    err.Error(),
 				HTTPStatusCode: http.StatusForbidden,
+			}
+		case errors.Is(err, errIAMServiceAccount):
+			apiErr = APIError{
+				Code:           "XMinioIAMServiceAccount",
+				Description:    err.Error(),
+				HTTPStatusCode: http.StatusBadRequest,
+			}
+		case errors.Is(err, errIAMServiceAccountUsed):
+			apiErr = APIError{
+				Code:           "XMinioIAMServiceAccountUsed",
+				Description:    err.Error(),
+				HTTPStatusCode: http.StatusBadRequest,
 			}
 		case errors.Is(err, errIAMNotInitialized):
 			apiErr = APIError{
@@ -151,6 +181,12 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 				Code:           "XMinioAdminTierBackendInUse",
 				Description:    err.Error(),
 				HTTPStatusCode: http.StatusConflict,
+			}
+		case errors.Is(err, errTierBackendNotEmpty):
+			apiErr = APIError{
+				Code:           "XMinioAdminTierBackendNotEmpty",
+				Description:    err.Error(),
+				HTTPStatusCode: http.StatusBadRequest,
 			}
 		case errors.Is(err, errTierInsufficientCreds):
 			apiErr = APIError{

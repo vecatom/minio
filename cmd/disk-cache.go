@@ -19,7 +19,6 @@ package cmd
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -137,7 +136,6 @@ func (c *cacheObjects) incHitsToMeta(ctx context.Context, dcache *diskCache, buc
 
 // Backend metadata could have changed through server side copy - reset cache metadata if that is the case
 func (c *cacheObjects) updateMetadataIfChanged(ctx context.Context, dcache *diskCache, bucket, object string, bkObjectInfo, cacheObjInfo ObjectInfo, rs *HTTPRangeSpec) error {
-
 	bkMeta := make(map[string]string, len(bkObjectInfo.UserDefined))
 	cacheMeta := make(map[string]string, len(cacheObjInfo.UserDefined))
 	for k, v := range bkObjectInfo.UserDefined {
@@ -603,7 +601,7 @@ func newCache(config cache.Config) ([]*diskCache, bool, error) {
 			continue
 		}
 		if err := checkAtimeSupport(dir); err != nil {
-			return nil, false, errors.New("Atime support required for disk caching")
+			return nil, false, fmt.Errorf("Atime support required for disk caching, atime check failed with %w", err)
 		}
 
 		cache, err := newDiskCache(ctx, dir, config)
@@ -616,7 +614,7 @@ func newCache(config cache.Config) ([]*diskCache, bool, error) {
 }
 
 func (c *cacheObjects) migrateCacheFromV1toV2(ctx context.Context) {
-	logStartupMessage(color.Blue("Cache migration initiated ...."))
+	logger.Info(color.Blue("Cache migration initiated ...."))
 
 	g := errgroup.WithNErrs(len(c.cache))
 	for index, dc := range c.cache {
@@ -645,7 +643,7 @@ func (c *cacheObjects) migrateCacheFromV1toV2(ctx context.Context) {
 
 	// update migration status
 	c.migrating = false
-	logStartupMessage(color.Blue("Cache migration completed successfully."))
+	logger.Info(color.Blue("Cache migration completed successfully."))
 }
 
 // PutObject - caches the uploaded object for single Put operations
@@ -1154,7 +1152,7 @@ func (c *cacheObjects) CompleteMultipartUpload(ctx context.Context, bucket, obje
 	if err == nil {
 		// fill cache in the background
 		go func() {
-			_, err := dcache.CompleteMultipartUpload(ctx, bucket, object, uploadID, uploadedParts, oi, opts)
+			_, err := dcache.CompleteMultipartUpload(bgContext(ctx), bucket, object, uploadID, uploadedParts, oi, opts)
 			if err != nil {
 				// fill cache in the background
 				bReader, bErr := c.InnerGetObjectNInfoFn(GlobalContext, bucket, object, nil, http.Header{}, readLock, ObjectOptions{})

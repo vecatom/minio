@@ -165,6 +165,9 @@ type transitionState struct {
 	killCh     chan struct{}
 
 	activeTasks int32
+
+	lastDayMu    sync.RWMutex
+	lastDayStats map[string]*lastDayTierStats
 }
 
 func (t *transitionState) queueTransitionTask(oi ObjectInfo) {
@@ -178,9 +181,7 @@ func (t *transitionState) queueTransitionTask(oi ObjectInfo) {
 	}
 }
 
-var (
-	globalTransitionState *transitionState
-)
+var globalTransitionState *transitionState
 
 func newTransitionState(ctx context.Context, objAPI ObjectLayer) *transitionState {
 	return &transitionState{
@@ -188,6 +189,7 @@ func newTransitionState(ctx context.Context, objAPI ObjectLayer) *transitionStat
 		ctx:          ctx,
 		objAPI:       objAPI,
 		killCh:       make(chan struct{}),
+		lastDayStats: make(map[string]*lastDayTierStats),
 	}
 }
 
@@ -215,12 +217,45 @@ func (t *transitionState) worker(ctx context.Context, objectAPI ObjectLayer) {
 				return
 			}
 			atomic.AddInt32(&t.activeTasks, 1)
-			if err := transitionObject(ctx, objectAPI, oi); err != nil {
+			var tier string
+			var err error
+			if tier, err = transitionObject(ctx, objectAPI, oi); err != nil {
 				logger.LogIf(ctx, fmt.Errorf("Transition failed for %s/%s version:%s with %w", oi.Bucket, oi.Name, oi.VersionID, err))
+			} else {
+				ts := tierStats{
+					TotalSize:   uint64(oi.Size),
+					NumVersions: 1,
+				}
+				if oi.IsLatest {
+					ts.NumObjects = 1
+				}
+				t.addLastDayStats(tier, ts)
 			}
 			atomic.AddInt32(&t.activeTasks, -1)
+
 		}
 	}
+}
+
+func (t *transitionState) addLastDayStats(tier string, ts tierStats) {
+	t.lastDayMu.Lock()
+	defer t.lastDayMu.Unlock()
+
+	if _, ok := t.lastDayStats[tier]; !ok {
+		t.lastDayStats[tier] = &lastDayTierStats{}
+	}
+	t.lastDayStats[tier].addStats(ts)
+}
+
+func (t *transitionState) getDailyAllTierStats() dailyAllTierStats {
+	t.lastDayMu.RLock()
+	defer t.lastDayMu.RUnlock()
+
+	res := make(dailyAllTierStats, len(t.lastDayStats))
+	for tier, st := range t.lastDayStats {
+		res[tier] = st.clone()
+	}
+	return res
 }
 
 // UpdateWorkers at the end of this function leaves n goroutines waiting for
@@ -367,15 +402,16 @@ func genTransitionObjName(bucket string) (string, error) {
 // storage specified by the transition ARN, the metadata is left behind on source cluster and original content
 // is moved to the transition tier. Note that in the case of encrypted objects, entire encrypted stream is moved
 // to the transition tier without decrypting or re-encrypting.
-func transitionObject(ctx context.Context, objectAPI ObjectLayer, oi ObjectInfo) error {
+func transitionObject(ctx context.Context, objectAPI ObjectLayer, oi ObjectInfo) (string, error) {
 	lc, err := globalLifecycleSys.Get(oi.Bucket)
 	if err != nil {
-		return err
+		return "", err
 	}
+	tier := lc.TransitionTier(oi.ToLifecycleOpts())
 	opts := ObjectOptions{
 		Transition: TransitionOptions{
 			Status: lifecycle.TransitionPending,
-			Tier:   lc.TransitionTier(oi.ToLifecycleOpts()),
+			Tier:   tier,
 			ETag:   oi.ETag,
 		},
 		VersionID:        oi.VersionID,
@@ -383,7 +419,7 @@ func transitionObject(ctx context.Context, objectAPI ObjectLayer, oi ObjectInfo)
 		VersionSuspended: globalBucketVersioningSys.Suspended(oi.Bucket),
 		MTime:            oi.ModTime,
 	}
-	return objectAPI.TransitionObject(ctx, oi.Bucket, oi.Name, opts)
+	return tier, objectAPI.TransitionObject(ctx, oi.Bucket, oi.Name, opts)
 }
 
 // getTransitionedObjectReader returns a reader from the transitioned tier.
@@ -466,9 +502,7 @@ func (sp *SelectParameters) IsEmpty() bool {
 	return sp == nil
 }
 
-var (
-	selectParamsXMLName = "SelectParameters"
-)
+var selectParamsXMLName = "SelectParameters"
 
 // UnmarshalXML - decodes XML data.
 func (sp *SelectParameters) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
@@ -660,9 +694,9 @@ func completedRestoreObj(expiry time.Time) restoreObjStatus {
 // String returns x-amz-restore compatible representation of r.
 func (r restoreObjStatus) String() string {
 	if r.Ongoing() {
-		return "ongoing-request=true"
+		return `ongoing-request="true"`
 	}
-	return fmt.Sprintf("ongoing-request=false, expiry-date=%s", r.expiry.Format(http.TimeFormat))
+	return fmt.Sprintf(`ongoing-request="false", expiry-date="%s"`, r.expiry.Format(http.TimeFormat))
 }
 
 // Expiry returns expiry of restored object and true if restore-object has completed.
@@ -706,12 +740,11 @@ func parseRestoreObjStatus(restoreHdr string) (restoreObjStatus, error) {
 	}
 
 	switch progressTokens[1] {
-	case "true":
+	case "true", `"true"`: // true without double quotes is deprecated in Feb 2022
 		if len(tokens) == 1 {
 			return ongoingRestoreObj(), nil
 		}
-
-	case "false":
+	case "false", `"false"`: // false without double quotes is deprecated in Feb 2022
 		if len(tokens) != 2 {
 			return restoreObjStatus{}, errRestoreHDRMalformed
 		}
@@ -722,8 +755,7 @@ func parseRestoreObjStatus(restoreHdr string) (restoreObjStatus, error) {
 		if strings.TrimSpace(expiryTokens[0]) != "expiry-date" {
 			return restoreObjStatus{}, errRestoreHDRMalformed
 		}
-
-		expiry, err := time.Parse(http.TimeFormat, expiryTokens[1])
+		expiry, err := time.Parse(http.TimeFormat, strings.Trim(expiryTokens[1], `"`))
 		if err != nil {
 			return restoreObjStatus{}, errRestoreHDRMalformed
 		}

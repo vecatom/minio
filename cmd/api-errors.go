@@ -82,6 +82,7 @@ const (
 	ErrIncompleteBody
 	ErrInternalError
 	ErrInvalidAccessKeyID
+	ErrAccessKeyDisabled
 	ErrInvalidBucketName
 	ErrInvalidDigest
 	ErrInvalidRange
@@ -211,6 +212,7 @@ const (
 	ErrInvalidSSECustomerParameters
 	ErrIncompatibleEncryptionMethod
 	ErrKMSNotConfigured
+	ErrKMSKeyNotFoundException
 
 	ErrNoAccessKey
 	ErrInvalidToken
@@ -514,6 +516,11 @@ var errorCodes = errorCodeMap{
 		Description:    "The Access Key Id you provided does not exist in our records.",
 		HTTPStatusCode: http.StatusForbidden,
 	},
+	ErrAccessKeyDisabled: {
+		Code:           "InvalidAccessKeyId",
+		Description:    "Your account is disabled; please contact your administrator.",
+		HTTPStatusCode: http.StatusForbidden,
+	},
 	ErrInvalidBucketName: {
 		Code:           "InvalidBucketName",
 		Description:    "The specified bucket is not valid.",
@@ -681,7 +688,7 @@ var errorCodes = errorCodeMap{
 	},
 	ErrAllAccessDisabled: {
 		Code:           "AllAccessDisabled",
-		Description:    "All access to this bucket has been disabled.",
+		Description:    "All access to this resource has been disabled.",
 		HTTPStatusCode: http.StatusForbidden,
 	},
 	ErrMalformedPolicy: {
@@ -1120,6 +1127,11 @@ var errorCodes = errorCodeMap{
 		Code:           "NotImplemented",
 		Description:    "Server side encryption specified but KMS is not configured",
 		HTTPStatusCode: http.StatusNotImplemented,
+	},
+	ErrKMSKeyNotFoundException: {
+		Code:           "KMS.NotFoundException",
+		Description:    "Invalid keyId",
+		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrNoAccessKey: {
 		Code:           "AccessDenied",
@@ -1906,6 +1918,9 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrIncompatibleEncryptionMethod
 	case errKMSNotConfigured:
 		apiErr = ErrKMSNotConfigured
+	case errKMSKeyNotFound:
+		apiErr = ErrKMSKeyNotFoundException
+
 	case context.Canceled, context.DeadlineExceeded:
 		apiErr = ErrOperationTimedOut
 	case errDiskNotFound:
@@ -2119,7 +2134,7 @@ func toAPIError(ctx context.Context, err error) APIError {
 		return noError
 	}
 
-	var apiErr = errorCodes.ToAPIErr(toAPIErrorCode(ctx, err))
+	apiErr := errorCodes.ToAPIErr(toAPIErrorCode(ctx, err))
 	e, ok := err.(dns.ErrInvalidBucketName)
 	if ok {
 		code := toAPIErrorCode(ctx, e)
@@ -2232,7 +2247,6 @@ func toAPIError(ctx context.Context, err error) APIError {
 			// since S3 only sends one Error XML response.
 			if len(e.Errors) >= 1 {
 				apiErr.Code = e.Errors[0].Reason
-
 			}
 		case azblob.StorageError:
 			apiErr = APIError{

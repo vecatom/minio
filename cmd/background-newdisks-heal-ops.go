@@ -263,7 +263,7 @@ func initAutoHeal(ctx context.Context, objAPI ObjectLayer) {
 	globalBackgroundHealState.pushHealLocalDisks(getLocalDisksToHeal()...)
 
 	if drivesToHeal := globalBackgroundHealState.healDriveCount(); drivesToHeal > 0 {
-		logger.Info(fmt.Sprintf("Found drives to heal %d, waiting until %s to heal the content...",
+		logger.Info(fmt.Sprintf("Found drives to heal %d, waiting until %s to heal the content - use 'mc admin heal alias/ --verbose' to check the status",
 			drivesToHeal, defaultMonitorNewDiskInterval))
 
 		// Heal any disk format and metadata early, if possible.
@@ -289,23 +289,22 @@ func initAutoHeal(ctx context.Context, objAPI ObjectLayer) {
 }
 
 func getLocalDisksToHeal() (disksToHeal Endpoints) {
-	for _, ep := range globalEndpoints {
-		for _, endpoint := range ep.Endpoints {
-			if !endpoint.IsLocal {
-				continue
-			}
-			// Try to connect to the current endpoint
-			// and reformat if the current disk is not formatted
-			disk, _, err := connectEndpoint(endpoint)
-			if errors.Is(err, errUnformattedDisk) {
-				disksToHeal = append(disksToHeal, endpoint)
-			} else if err == nil && disk != nil && disk.Healing() != nil {
-				disksToHeal = append(disksToHeal, disk.Endpoint())
-			}
+	for _, disk := range globalLocalDrives {
+		_, err := disk.GetDiskID()
+		if errors.Is(err, errUnformattedDisk) {
+			disksToHeal = append(disksToHeal, disk.Endpoint())
+			continue
+		}
+		if disk.Healing() != nil {
+			disksToHeal = append(disksToHeal, disk.Endpoint())
 		}
 	}
+	if len(disksToHeal) == globalEndpoints.NEndpoints() {
+		// When all disks == all command line endpoints
+		// this is a fresh setup, no need to trigger healing.
+		return Endpoints{}
+	}
 	return disksToHeal
-
 }
 
 // monitorLocalDisksAndHeal - ensures that detected new disks are healed
@@ -334,7 +333,7 @@ func monitorLocalDisksAndHeal(ctx context.Context, z *erasureServerPools, bgSeq 
 				// Ensure that reformatting disks is finished
 				bgSeq.queueHealTask(healSource{bucket: nopHeal}, madmin.HealItemMetadata)
 
-				logger.Info(fmt.Sprintf("Found drives to heal %d, proceeding to heal content...",
+				logger.Info(fmt.Sprintf("Found drives to heal %d, proceeding to heal - 'mc admin heal alias/ --verbose' to check the status.",
 					len(healDisks)))
 
 				erasureSetInPoolDisksToHeal = make([]map[int][]StorageAPI, len(z.serverPools))
@@ -405,13 +404,15 @@ func monitorLocalDisksAndHeal(ctx context.Context, z *erasureServerPools, bgSeq 
 					go func(setIndex int, disks []StorageAPI) {
 						defer wg.Done()
 						for _, disk := range disks {
-							logger.Info("Healing disk '%v' on %s pool", disk, humanize.Ordinal(i+1))
+							if serverDebugLog {
+								logger.Info("Healing disk '%v' on %s pool", disk, humanize.Ordinal(i+1))
+							}
 
 							// So someone changed the drives underneath, healing tracker missing.
 							tracker, err := loadHealingTracker(ctx, disk)
 							if err != nil {
-								logger.Info("Healing tracker missing on '%s', disk was swapped again on %s pool",
-									disk, humanize.Ordinal(i+1))
+								logger.LogIf(ctx, fmt.Errorf("Healing tracker missing on '%s', disk was swapped again on %s pool: %w",
+									disk, humanize.Ordinal(i+1), err))
 								tracker = newHealingTracker(disk)
 							}
 
@@ -439,12 +440,14 @@ func monitorLocalDisksAndHeal(ctx context.Context, z *erasureServerPools, bgSeq 
 								continue
 							}
 
-							logger.Info("Healing disk '%s' on %s pool, %s set complete", disk,
-								humanize.Ordinal(i+1), humanize.Ordinal(setIndex+1))
-							logger.Info("Summary:\n")
-							tracker.printTo(os.Stdout)
+							if serverDebugLog {
+								logger.Info("Healing disk '%s' on %s pool, %s set complete", disk,
+									humanize.Ordinal(i+1), humanize.Ordinal(setIndex+1))
+								logger.Info("Summary:\n")
+								tracker.printTo(os.Stdout)
+								logger.Info("\n")
+							}
 							logger.LogIf(ctx, tracker.delete(ctx))
-							logger.Info("\n")
 
 							// Only upon success pop the healed disk.
 							globalBackgroundHealState.popHealLocalDisks(disk.Endpoint())

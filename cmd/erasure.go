@@ -29,7 +29,6 @@ import (
 
 	"github.com/minio/madmin-go"
 	"github.com/minio/minio/internal/bpool"
-	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/dsync"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/sync/errgroup"
@@ -82,6 +81,19 @@ func (er erasureObjects) Shutdown(ctx context.Context) error {
 	// Add any object layer shutdown activities here.
 	closeStorageDisks(er.getDisks())
 	return nil
+}
+
+// defaultWQuorum write quorum based on setDriveCount and defaultParityCount
+func (er erasureObjects) defaultWQuorum() int {
+	dataCount := er.setDriveCount - er.defaultParityCount
+	if dataCount == er.defaultParityCount {
+		return dataCount + 1
+	}
+	return dataCount
+}
+
+func (er erasureObjects) defaultRQuorum() int {
+	return er.setDriveCount - er.defaultParityCount
 }
 
 // byDiskTotal is a collection satisfying sort.Interface.
@@ -201,7 +213,7 @@ func getDisksInfo(disks []StorageAPI, endpoints []Endpoint) (disksInfo []madmin.
 				}
 			}
 			di.Metrics = &madmin.DiskMetrics{
-				APILatencies: make(map[string]string),
+				APILatencies: make(map[string]interface{}),
 				APICalls:     make(map[string]uint64),
 			}
 			for k, v := range info.Metrics.APILatencies {
@@ -340,25 +352,8 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, bf
 	// Collect disks we can use.
 	disks, healing := er.getOnlineDisksWithHealing()
 	if len(disks) == 0 {
-		logger.Info(color.Green("data-scanner:") + " all disks are offline or being healed, skipping scanner")
+		logger.LogIf(ctx, errors.New("data-scanner: all disks are offline or being healed, skipping scanner cycle"))
 		return nil
-	}
-
-	// Collect disks for healing.
-	allDisks := er.getDisks()
-	allDiskIDs := make([]string, 0, len(allDisks))
-	for _, disk := range allDisks {
-		if disk == OfflineDisk {
-			// its possible that disk is OfflineDisk
-			continue
-		}
-		id, _ := disk.GetDiskID()
-		if id == "" {
-			// its possible that disk is unformatted
-			// or just went offline
-			continue
-		}
-		allDiskIDs = append(allDiskIDs, id)
 	}
 
 	// Load bucket totals
@@ -404,7 +399,7 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, bf
 	saverWg.Add(1)
 	go func() {
 		// Add jitter to the update time so multiple sets don't sync up.
-		var updateTime = 30*time.Second + time.Duration(float64(10*time.Second)*rand.Float64())
+		updateTime := 30*time.Second + time.Duration(float64(10*time.Second)*rand.Float64())
 		t := time.NewTicker(updateTime)
 		defer t.Stop()
 		defer saverWg.Done()
@@ -466,7 +461,6 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, bf
 				}
 				cache.Info.BloomFilter = bloom
 				cache.Info.SkipHealing = healing
-				cache.Disks = allDiskIDs
 				cache.Info.NextCycle = wantCycle
 				if cache.Info.Name != bucket.Name {
 					logger.LogIf(ctx, fmt.Errorf("cache name mismatch: %s != %s", cache.Info.Name, bucket.Name))
@@ -504,6 +498,11 @@ func (er erasureObjects) nsScanner(ctx context.Context, buckets []BucketInfo, bf
 					} else {
 						logger.LogIf(ctx, err)
 					}
+					// This ensures that we don't close
+					// bucketResults channel while the
+					// updates-collector goroutine still
+					// holds a reference to this.
+					wg.Wait()
 					continue
 				}
 

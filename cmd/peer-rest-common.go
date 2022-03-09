@@ -18,7 +18,7 @@
 package cmd
 
 const (
-	peerRESTVersion       = "v17" // Add "storage-class" option for SpeedTest
+	peerRESTVersion       = "v21" // Add netperf
 	peerRESTVersionPrefix = SlashSeparator + peerRESTVersion
 	peerRESTPrefix        = minioReservedBucketPath + "/peer"
 	peerRESTPath          = peerRESTPrefix + peerRESTVersionPrefix
@@ -66,7 +66,12 @@ const (
 	peerRESTMethodGetPeerMetrics              = "/peermetrics"
 	peerRESTMethodLoadTransitionTierConfig    = "/loadtransitiontierconfig"
 	peerRESTMethodSpeedtest                   = "/speedtest"
+	peerRESTMethodDriveSpeedTest              = "/drivespeedtest"
 	peerRESTMethodReloadSiteReplicationConfig = "/reloadsitereplicationconfig"
+	peerRESTMethodReloadPoolMeta              = "/reloadpoolmeta"
+	peerRESTMethodGetLastDayTierStats         = "/getlastdaytierstats"
+	peerRESTMethodDevNull                     = "/devnull"
+	peerRESTMethodNetperf                     = "/netperf"
 )
 
 const (

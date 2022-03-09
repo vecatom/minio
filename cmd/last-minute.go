@@ -15,6 +15,8 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+//go:generate msgp -file=$GOFILE -unexported
+
 package cmd
 
 import (
@@ -76,112 +78,110 @@ type AccElem struct {
 	N     int64
 }
 
-// add dur to a as a single element.
+// Add a duration to a single element.
 func (a *AccElem) add(dur time.Duration) {
 	a.Total += int64(dur)
 	a.N++
 }
 
-// merge b into a.
+// Merge b into a.
 func (a *AccElem) merge(b AccElem) {
 	a.N += b.N
 	a.Total += b.Total
 }
 
-// avg converts total to average.
-func (a *AccElem) avg() uint64 {
+// Avg converts total to average.
+func (a AccElem) avg() uint64 {
 	if a.N >= 1 && a.Total > 0 {
 		return uint64(a.Total / a.N)
 	}
 	return 0
 }
 
-// LastMinuteLatencies keeps track of last minute latencies.
-type LastMinuteLatencies struct {
-	Totals  [60][sizeLastElemMarker]AccElem
+// lastMinuteLatency keeps track of last minute latency.
+type lastMinuteLatency struct {
+	Totals  [60]AccElem
 	LastSec int64
 }
 
-// Clone safely returns a copy for a LastMinuteLatencies structure
-func (l *LastMinuteLatencies) Clone() LastMinuteLatencies {
-	n := LastMinuteLatencies{}
-	n.LastSec = l.LastSec
-	for i := range l.Totals {
-		for j := range l.Totals[i] {
-			n.Totals[i][j] = AccElem{
-				Total: l.Totals[i][j].Total,
-				N:     l.Totals[i][j].N,
-			}
+// Merge data of two lastMinuteLatency structure
+func (l lastMinuteLatency) merge(o lastMinuteLatency) (merged lastMinuteLatency) {
+	if l.LastSec > o.LastSec {
+		o.forwardTo(l.LastSec)
+		merged.LastSec = l.LastSec
+	} else {
+		l.forwardTo(o.LastSec)
+		merged.LastSec = o.LastSec
+	}
+
+	for i := range merged.Totals {
+		merged.Totals[i] = AccElem{
+			Total: l.Totals[i].Total + o.Totals[i].Total,
+			N:     l.Totals[i].N + o.Totals[i].N,
 		}
 	}
-	return n
+	return merged
 }
+
+// Add  a new duration data
+func (l *lastMinuteLatency) add(t time.Duration) {
+	sec := time.Now().Unix()
+	l.forwardTo(sec)
+	winIdx := sec % 60
+	l.Totals[winIdx].add(t)
+	l.LastSec = sec
+}
+
+// Merge all recorded latencies of last minute into one
+func (l *lastMinuteLatency) getAvgData() AccElem {
+	var res AccElem
+	sec := time.Now().Unix()
+	l.forwardTo(sec)
+	for _, elem := range l.Totals[:] {
+		res.merge(elem)
+	}
+	return res
+}
+
+// forwardTo time t, clearing any entries in between.
+func (l *lastMinuteLatency) forwardTo(t int64) {
+	if l.LastSec >= t {
+		return
+	}
+	if t-l.LastSec >= 60 {
+		l.Totals = [60]AccElem{}
+		return
+	}
+	for l.LastSec != t {
+		// Clear next element.
+		idx := (l.LastSec + 1) % 60
+		l.Totals[idx] = AccElem{}
+		l.LastSec++
+	}
+}
+
+// LastMinuteLatencies keeps track of last minute latencies.
+type LastMinuteLatencies [sizeLastElemMarker]lastMinuteLatency
 
 // Merge safely merges two LastMinuteLatencies structures into one
 func (l LastMinuteLatencies) Merge(o LastMinuteLatencies) (merged LastMinuteLatencies) {
-	cl := l.Clone()
-	co := o.Clone()
-
-	if cl.LastSec > co.LastSec {
-		co.forwardTo(cl.LastSec)
-		merged.LastSec = cl.LastSec
-	} else {
-		cl.forwardTo(co.LastSec)
-		merged.LastSec = co.LastSec
-	}
-
-	for i := range cl.Totals {
-		for j := range cl.Totals[i] {
-			merged.Totals[i][j] = AccElem{
-				Total: cl.Totals[i][j].Total + co.Totals[i][j].Total,
-				N:     cl.Totals[i][j].N + co.Totals[i][j].N,
-			}
-		}
+	for i := range l {
+		merged[i] = l[i].merge(o[i])
 	}
 	return merged
 }
 
 // Add latency t from object with the specified size.
 func (l *LastMinuteLatencies) Add(size int64, t time.Duration) {
-	tag := sizeToTag(size)
-
-	// Update...
-	sec := time.Now().Unix()
-	l.forwardTo(sec)
-
-	winIdx := sec % 60
-	l.Totals[winIdx][tag].add(t)
-
-	l.LastSec = sec
+	l[sizeToTag(size)].add(t)
 }
 
-// GetAvg will return the average for each bucket from the last time minute.
+// GetAvgData will return the average for each bucket from the last time minute.
 // The number of objects is also included.
-func (l *LastMinuteLatencies) GetAvg() [sizeLastElemMarker]AccElem {
+func (l *LastMinuteLatencies) GetAvgData() [sizeLastElemMarker]AccElem {
 	var res [sizeLastElemMarker]AccElem
-	sec := time.Now().Unix()
-	l.forwardTo(sec)
-	for _, elems := range l.Totals[:] {
-		for j := range elems {
-			res[j].merge(elems[j])
-		}
+	for i, elem := range l[:] {
+		res[i] = elem.getAvgData()
 	}
 	return res
-}
-
-// forwardTo time t, clearing any entries in between.
-func (l *LastMinuteLatencies) forwardTo(t int64) {
-	if l.LastSec >= t {
-		return
-	}
-	if t-l.LastSec >= 60 {
-		l.Totals = [60][sizeLastElemMarker]AccElem{}
-		return
-	}
-	for l.LastSec != t {
-		// Clear next element.
-		idx := (l.LastSec + 1) % 60
-		l.Totals[idx] = [sizeLastElemMarker]AccElem{}
-		l.LastSec++
-	}
 }

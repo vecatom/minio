@@ -49,6 +49,8 @@ type apiConfig struct {
 	staleUploadsExpiry          time.Duration
 	staleUploadsCleanupInterval time.Duration
 	deleteCleanupInterval       time.Duration
+	disableODirect              bool
+	gzipObjects                 bool
 }
 
 const cgroupLimitFile = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
@@ -77,7 +79,6 @@ func availableMemory() (available uint64) {
 		if available != 9223372036854771712 {
 			// This means cgroup memory limit is configured.
 			return
-
 		} // no-limit set proceed to set the limits based on virtual memory.
 
 	} // for all other platforms limits are based on virtual memory.
@@ -151,6 +152,22 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int) {
 	t.staleUploadsExpiry = cfg.StaleUploadsExpiry
 	t.staleUploadsCleanupInterval = cfg.StaleUploadsCleanupInterval
 	t.deleteCleanupInterval = cfg.DeleteCleanupInterval
+	t.disableODirect = cfg.DisableODirect
+	t.gzipObjects = cfg.GzipObjects
+}
+
+func (t *apiConfig) isDisableODirect() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	return t.disableODirect
+}
+
+func (t *apiConfig) shouldGzipObjects() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+
+	return t.gzipObjects
 }
 
 func (t *apiConfig) getListQuorum() int {
@@ -227,6 +244,8 @@ func (t *apiConfig) getRequestsPool() (chan struct{}, time.Duration) {
 // maxClients throttles the S3 API calls
 func maxClients(f http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		globalHTTPStats.incS3RequestsIncoming()
+
 		if val := globalServiceFreeze.Load(); val != nil {
 			if unlock, ok := val.(chan struct{}); ok && unlock != nil {
 				// Wait until unfrozen.

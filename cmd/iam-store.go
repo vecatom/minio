@@ -213,7 +213,7 @@ func (d *PolicyDoc) update(p iampolicy.Policy) {
 // from iampolicy.Policy to PolicyDoc. To avoid a migration, loading supports
 // both the old and the new formats.
 func (d *PolicyDoc) parseJSON(data []byte) error {
-	var json = jsoniter.ConfigCompatibleWithStandardLibrary
+	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	var doc PolicyDoc
 	err := json.Unmarshal(data, &doc)
 	if err != nil {
@@ -378,7 +378,6 @@ func (c *iamCache) policyDBGet(mode UsersSysType, name string, isGroup bool) ([]
 
 // IAMStorageAPI defines an interface for the IAM persistence layer
 type IAMStorageAPI interface {
-
 	// The role of the read-write lock is to prevent go routines from
 	// concurrently reading and writing the IAM storage. The (r)lock()
 	// functions return the iamCache. The cache can be safely written to
@@ -387,32 +386,23 @@ type IAMStorageAPI interface {
 	unlock()
 	rlock() *iamCache
 	runlock()
-
 	migrateBackendFormat(context.Context) error
-
 	getUsersSysType() UsersSysType
-
 	loadPolicyDoc(ctx context.Context, policy string, m map[string]PolicyDoc) error
 	loadPolicyDocs(ctx context.Context, m map[string]PolicyDoc) error
-
 	loadUser(ctx context.Context, user string, userType IAMUserType, m map[string]auth.Credentials) error
 	loadUsers(ctx context.Context, userType IAMUserType, m map[string]auth.Credentials) error
-
 	loadGroup(ctx context.Context, group string, m map[string]GroupInfo) error
 	loadGroups(ctx context.Context, m map[string]GroupInfo) error
-
 	loadMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool, m map[string]MappedPolicy) error
 	loadMappedPolicies(ctx context.Context, userType IAMUserType, isGroup bool, m map[string]MappedPolicy) error
-
 	saveIAMConfig(ctx context.Context, item interface{}, path string, opts ...options) error
 	loadIAMConfig(ctx context.Context, item interface{}, path string) error
 	deleteIAMConfig(ctx context.Context, path string) error
-
 	savePolicyDoc(ctx context.Context, policyName string, p PolicyDoc) error
 	saveMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool, mp MappedPolicy, opts ...options) error
 	saveUserIdentity(ctx context.Context, name string, userType IAMUserType, u UserIdentity, opts ...options) error
 	saveGroupInfo(ctx context.Context, group string, gi GroupInfo) error
-
 	deletePolicyDoc(ctx context.Context, policyName string) error
 	deleteMappedPolicy(ctx context.Context, name string, userType IAMUserType, isGroup bool) error
 	deleteUserIdentity(ctx context.Context, name string, userType IAMUserType) error
@@ -639,7 +629,6 @@ func (store *IAMStoreSys) AddUsersToGroup(ctx context.Context, group string, mem
 	}
 
 	return nil
-
 }
 
 // helper function - does not take any locks. Updates only cache if
@@ -880,7 +869,6 @@ func (store *IAMStoreSys) PolicyDBSet(ctx context.Context, name, policy string, 
 		cache.iamGroupPolicyMap[name] = mp
 	}
 	return nil
-
 }
 
 // PolicyNotificationHandler - loads given policy from storage. If not present,
@@ -1034,7 +1022,6 @@ func (store *IAMStoreSys) GetPolicyDoc(name string) (r PolicyDoc, err error) {
 
 // SetPolicy - creates a policy with name.
 func (store *IAMStoreSys) SetPolicy(ctx context.Context, name string, policy iampolicy.Policy) error {
-
 	if policy.IsEmpty() || name == "" {
 		return errInvalidArgument
 	}
@@ -1058,7 +1045,6 @@ func (store *IAMStoreSys) SetPolicy(ctx context.Context, name string, policy iam
 
 	cache.iamPolicyDocsMap[name] = d
 	return nil
-
 }
 
 // ListPolicies - fetches all policies from storage and updates cache as well.
@@ -1098,11 +1084,12 @@ func filterPolicies(cache *iamCache, policyName string, bucketName string) (stri
 			continue
 		}
 		p, found := cache.iamPolicyDocsMap[policy]
-		if found {
-			if bucketName == "" || p.Policy.MatchResource(bucketName) {
-				policies = append(policies, policy)
-				combinedPolicy = combinedPolicy.Merge(p.Policy)
-			}
+		if !found {
+			continue
+		}
+		if bucketName == "" || p.Policy.MatchResource(bucketName) {
+			policies = append(policies, policy)
+			combinedPolicy = combinedPolicy.Merge(p.Policy)
 		}
 	}
 	return strings.Join(policies, ","), combinedPolicy
@@ -1118,7 +1105,6 @@ func (store *IAMStoreSys) FilterPolicies(policyName string, bucketName string) (
 	defer store.runlock()
 
 	return filterPolicies(cache, policyName, bucketName)
-
 }
 
 // GetBucketUsers - returns users (not STS or service accounts) that have access
@@ -1392,9 +1378,11 @@ func (store *IAMStoreSys) DeleteUser(ctx context.Context, accessKey string, user
 	return err
 }
 
-// SetTempUser - saves temporary credential to storage and cache.
+// SetTempUser - saves temporary (STS) credential to storage and cache. If a
+// policy name is given, it is associated with the parent user specified in the
+// credential.
 func (store *IAMStoreSys) SetTempUser(ctx context.Context, accessKey string, cred auth.Credentials, policyName string) error {
-	if accessKey == "" || !cred.IsTemp() || cred.IsExpired() {
+	if accessKey == "" || !cred.IsTemp() || cred.IsExpired() || cred.ParentUser == "" {
 		return errInvalidArgument
 	}
 
@@ -1411,26 +1399,12 @@ func (store *IAMStoreSys) SetTempUser(ctx context.Context, accessKey string, cre
 			return fmt.Errorf("specified policy %s, not found %w", policyName, errNoSuchPolicy)
 		}
 
-		err := store.saveMappedPolicy(ctx, accessKey, stsUser, false, mp, options{ttl: ttl})
+		err := store.saveMappedPolicy(ctx, cred.ParentUser, stsUser, false, mp, options{ttl: ttl})
 		if err != nil {
 			return err
 		}
 
-		cache.iamUserPolicyMap[accessKey] = mp
-
-		// We are on purpose not persisting the policy map for parent
-		// user, although this is a hack, it is a good enough hack
-		// at this point in time - we need to overhaul our OIDC
-		// usage with service accounts with a more cleaner implementation
-		//
-		// This mapping is necessary to ensure that valid credentials
-		// have necessary ParentUser present - this is mainly for only
-		// webIdentity based STS tokens.
-		if cred.ParentUser != "" && cred.ParentUser != globalActiveCred.AccessKey {
-			if _, ok := cache.iamUserPolicyMap[cred.ParentUser]; !ok {
-				cache.iamUserPolicyMap[cred.ParentUser] = mp
-			}
-		}
+		cache.iamUserPolicyMap[cred.ParentUser] = mp
 	}
 
 	u := newUserIdentity(cred)
@@ -1476,18 +1450,33 @@ func (store *IAMStoreSys) DeleteUsers(ctx context.Context, users []string) error
 
 // GetAllParentUsers - returns all distinct "parent-users" associated with STS or service
 // credentials.
-func (store *IAMStoreSys) GetAllParentUsers() []string {
+func (store *IAMStoreSys) GetAllParentUsers() map[string]string {
 	cache := store.rlock()
 	defer store.runlock()
 
-	res := set.NewStringSet()
+	res := map[string]string{}
 	for _, cred := range cache.iamUsersMap {
 		if cred.IsServiceAccount() || cred.IsTemp() {
-			res.Add(cred.ParentUser)
+			parentUser := cred.ParentUser
+			if cred.SessionToken != "" {
+				claims, err := getClaimsFromToken(cred.SessionToken)
+				if err != nil {
+					continue
+				}
+				if v, ok := claims[subClaim]; ok {
+					subFromToken, ok := v.(string)
+					if ok {
+						parentUser = subFromToken
+					}
+				}
+			}
+			if _, ok := res[parentUser]; !ok {
+				res[parentUser] = cred.ParentUser
+			}
 		}
 	}
 
-	return res.ToSlice()
+	return res
 }
 
 // SetUserStatus - sets current user status.
@@ -1512,7 +1501,8 @@ func (store *IAMStoreSys) SetUserStatus(ctx context.Context, accessKey string, s
 		AccessKey: accessKey,
 		SecretKey: cred.SecretKey,
 		Status: func() string {
-			if status == madmin.AccountEnabled {
+			switch string(status) {
+			case string(madmin.AccountEnabled), string(auth.AccountOn):
 				return auth.AccountOn
 			}
 			return auth.AccountOff
@@ -1538,13 +1528,16 @@ func (store *IAMStoreSys) AddServiceAccount(ctx context.Context, cred auth.Crede
 	// Found newly requested service account, to be an existing account -
 	// reject such operation (updates to the service account are handled in
 	// a different API).
-	if _, found := cache.iamUsersMap[accessKey]; found {
-		return errIAMActionNotAllowed
+	if scred, found := cache.iamUsersMap[accessKey]; found {
+		if scred.ParentUser != parentUser {
+			return errIAMServiceAccountUsed
+		}
+		return errIAMServiceAccount
 	}
 
 	// Parent user must not be a service account.
 	if cr, found := cache.iamUsersMap[parentUser]; found && cr.IsServiceAccount() {
-		return errIAMActionNotAllowed
+		return errIAMServiceAccount
 	}
 
 	u := newUserIdentity(cred)
@@ -1578,6 +1571,10 @@ func (store *IAMStoreSys) UpdateServiceAccount(ctx context.Context, accessKey st
 	switch opts.status {
 	// The caller did not ask to update status account, do nothing
 	case "":
+	case string(madmin.AccountEnabled):
+		cr.Status = auth.AccountOn
+	case string(madmin.AccountDisabled):
+		cr.Status = auth.AccountOff
 	// Update account status
 	case auth.AccountOn, auth.AccountOff:
 		cr.Status = opts.status
@@ -1641,7 +1638,7 @@ func (store *IAMStoreSys) ListServiceAccounts(ctx context.Context, accessKey str
 }
 
 // AddUser - adds/updates long term user account to storage.
-func (store *IAMStoreSys) AddUser(ctx context.Context, accessKey string, uinfo madmin.UserInfo) error {
+func (store *IAMStoreSys) AddUser(ctx context.Context, accessKey string, ureq madmin.AddOrUpdateUserReq) error {
 	cache := store.lock()
 	defer store.unlock()
 
@@ -1654,9 +1651,10 @@ func (store *IAMStoreSys) AddUser(ctx context.Context, accessKey string, uinfo m
 
 	u := newUserIdentity(auth.Credentials{
 		AccessKey: accessKey,
-		SecretKey: uinfo.SecretKey,
+		SecretKey: ureq.SecretKey,
 		Status: func() string {
-			if uinfo.Status == madmin.AccountEnabled {
+			switch string(ureq.Status) {
+			case string(madmin.AccountEnabled), string(auth.AccountOn):
 				return auth.AccountOn
 			}
 			return auth.AccountOff
@@ -1669,25 +1667,7 @@ func (store *IAMStoreSys) AddUser(ctx context.Context, accessKey string, uinfo m
 
 	cache.iamUsersMap[accessKey] = u.Credentials
 
-	// Set policy if specified.
-	if uinfo.PolicyName != "" {
-		policy := uinfo.PolicyName
-		// Handle policy mapping set/update
-		mp := newMappedPolicy(policy)
-		for _, p := range mp.toSlice() {
-			if _, found := cache.iamPolicyDocsMap[policy]; !found {
-				logger.LogIf(GlobalContext, fmt.Errorf("%w: (%s)", errNoSuchPolicy, p))
-				return errNoSuchPolicy
-			}
-		}
-
-		if err := store.saveMappedPolicy(ctx, accessKey, regUser, false, mp); err != nil {
-			return err
-		}
-		cache.iamUserPolicyMap[accessKey] = mp
-	}
 	return nil
-
 }
 
 // UpdateUserSecretKey - sets user secret key to storage.

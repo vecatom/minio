@@ -40,7 +40,9 @@ minio gateway s3 https://s3.amazonaws.com
 ```
 
 ### Run MinIO gateway with cache on Docker Container
+
 ### Stable
+
 Cache drives need to have `strictatime` or `relatime` enabled for disk caching feature. In this example, mount the xfs file system on /mnt/cache with `strictatime` or `relatime` enabled.
 
 ```sh
@@ -48,21 +50,25 @@ truncate -s 4G /tmp/data
 ```
 
 ### Build xfs filesystem on /tmp/data
+
 ```
 mkfs.xfs /tmp/data
 ```
 
 ### Create mount dir
+
 ```
 sudo mkdir /mnt/cache  #
 ```
 
-### Mount xfs on /mnt/cache with atime.
+### Mount xfs on /mnt/cache with atime
+
 ```
 sudo mount -o relatime /tmp/data /mnt/cache
 ```
 
 ### Start using the cached drive with S3 gateway
+
 ```
 podman run --net=host -e MINIO_ROOT_USER={s3-access-key} -e MINIO_ROOT_PASSWORD={s3-secret-key} \
     -e MINIO_CACHE_DRIVES=/cache -e MINIO_CACHE_QUOTA=99 -e MINIO_CACHE_AFTER=0 \
@@ -87,7 +93,7 @@ Disk caching caches objects for **downloaded** objects i.e
 - Cache continues to work for read-only operations such as GET, HEAD when backend is offline.
 - Cache-Control and Expires headers can be used to control how long objects stay in the cache. ETag of cached objects are not validated with backend until expiry time as per the Cache-Control or Expires header is met.
 - All range GET requests are cached by default independently, this may be not desirable in all situations when cache storage is limited and where downloading an entire object at once might be more optimal. To optionally turn this feature off, and allow downloading entire object in the background `export MINIO_CACHE_RANGE=off`.
-- To ensure security guarantees, encrypted objects are normally not cached. However, if you wish to encrypt cached content on disk, you can set MINIO_CACHE_ENCRYPTION_MASTER_KEY environment variable to set a cache KMS
+- To ensure security guarantees, encrypted objects are normally not cached. However, if you wish to encrypt cached content on disk, you can set MINIO_CACHE_ENCRYPTION_SECRET_KEY environment variable to set a cache KMS
 master key to automatically encrypt all cached content.
 
   Note that cache KMS master key is not recommended for use in production deployments. If the MinIO server/gateway machine is ever compromised, the cache KMS master key must also be treated as compromised.
