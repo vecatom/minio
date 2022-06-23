@@ -131,7 +131,7 @@ const (
 	ErrReplicationNeedsVersioningError
 	ErrReplicationBucketNeedsVersioningError
 	ErrReplicationDenyEditError
-	ErrReplicationNoMatchingRuleError
+	ErrReplicationNoExistingObjects
 	ErrObjectRestoreAlreadyInProgress
 	ErrNoSuchKey
 	ErrNoSuchUpload
@@ -280,6 +280,7 @@ const (
 	ErrSiteReplicationBucketConfigError
 	ErrSiteReplicationBucketMetaError
 	ErrSiteReplicationIAMError
+	ErrSiteReplicationConfigMissing
 
 	// Bucket Quota error codes
 	ErrAdminBucketQuotaExceeded
@@ -383,6 +384,7 @@ const (
 	ErrAdminProfilerNotEnabled
 	ErrInvalidDecompressedSize
 	ErrAddUserInvalidArgument
+	ErrAdminResourceInvalidArgument
 	ErrAdminAccountNotEligible
 	ErrAccountNotEligible
 	ErrAdminServiceAccountNotFound
@@ -891,15 +893,15 @@ var errorCodes = errorCodeMap{
 		Description:    "Bandwidth limit for remote target must be atleast 100MBps",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
-	ErrReplicationNoMatchingRuleError: {
-		Code:           "XMinioReplicationNoMatchingRule",
-		Description:    "No matching replication rule found for this object prefix",
+	ErrReplicationNoExistingObjects: {
+		Code:           "XMinioReplicationNoExistingObjects",
+		Description:    "No matching ExistingsObjects rule enabled",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrReplicationDenyEditError: {
 		Code:           "XMinioReplicationDenyEdit",
 		Description:    "Cannot alter local replication config since this server is in a cluster replication setup",
-		HTTPStatusCode: http.StatusConflict,
+		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrBucketRemoteIdenticalToSource: {
 		Code:           "XMinioAdminRemoteIdenticalToSource",
@@ -1165,7 +1167,7 @@ var errorCodes = errorCodeMap{
 	ErrObjectExistsAsDirectory: {
 		Code:           "XMinioObjectExistsAsDirectory",
 		Description:    "Object name already exists as a directory.",
-		HTTPStatusCode: http.StatusConflict,
+		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrInvalidObjectName: {
 		Code:           "XMinioInvalidObjectName",
@@ -1339,7 +1341,11 @@ var errorCodes = errorCodeMap{
 		Description:    "Error while replicating an IAM item",
 		HTTPStatusCode: http.StatusServiceUnavailable,
 	},
-
+	ErrSiteReplicationConfigMissing: {
+		Code:           "XMinioSiteReplicationConfigMissingError",
+		Description:    "Site not found in site replication configuration",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrMaximumExpires: {
 		Code:           "AuthorizationQueryParametersError",
 		Description:    "X-Amz-Expires must be less than a week (in seconds); that is, the given X-Amz-Expires must be less than 604800 seconds",
@@ -1825,6 +1831,11 @@ var errorCodes = errorCodeMap{
 		Description:    "User is not allowed to be same as admin access key",
 		HTTPStatusCode: http.StatusForbidden,
 	},
+	ErrAdminResourceInvalidArgument: {
+		Code:           "XMinioInvalidResource",
+		Description:    "Policy, user or group names are not allowed to begin or end with space characters",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrAdminAccountNotEligible: {
 		Code:           "XMinioInvalidIAMCredentials",
 		Description:    "The administrator key is not eligible for this operation",
@@ -2220,7 +2231,7 @@ func toAPIError(ctx context.Context, err error) APIError {
 			}
 		case crypto.Error:
 			apiErr = APIError{
-				Code:           "XMinIOEncryptionError",
+				Code:           "XMinioEncryptionError",
 				Description:    e.Error(),
 				HTTPStatusCode: http.StatusBadRequest,
 			}

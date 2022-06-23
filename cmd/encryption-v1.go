@@ -19,9 +19,9 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/binary"
 	"encoding/hex"
@@ -35,7 +35,9 @@ import (
 
 	"github.com/minio/kes"
 	"github.com/minio/minio/internal/crypto"
+	"github.com/minio/minio/internal/etag"
 	"github.com/minio/minio/internal/fips"
+	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/kms"
 	"github.com/minio/minio/internal/logger"
@@ -80,6 +82,7 @@ func (o *MultipartInfo) KMSKeyID() string { return kmsKeyIDFromMetadata(o.UserDe
 // metadata, if any. It returns an empty ID if no key ID is
 // present.
 func kmsKeyIDFromMetadata(metadata map[string]string) string {
+	const ARNPrefix = "arn:aws:kms:"
 	if len(metadata) == 0 {
 		return ""
 	}
@@ -87,10 +90,115 @@ func kmsKeyIDFromMetadata(metadata map[string]string) string {
 	if !ok {
 		return ""
 	}
-	if strings.HasPrefix(kmsID, "arn:aws:kms:") {
+	if strings.HasPrefix(kmsID, ARNPrefix) {
 		return kmsID
 	}
-	return "arn:aws:kms:" + kmsID
+	return ARNPrefix + kmsID
+}
+
+// DecryptETags decryptes the ETag of all ObjectInfos using the KMS.
+//
+// It adjusts the size of all encrypted objects since encrypted
+// objects are slightly larger due to encryption overhead.
+// Further, it decrypts all single-part SSE-S3 encrypted objects
+// and formats ETags of SSE-C / SSE-KMS encrypted objects to
+// be AWS S3 compliant.
+//
+// DecryptETags uses a KMS bulk decryption API, if available, which
+// is more efficient than decrypting ETags sequentually.
+func DecryptETags(ctx context.Context, KMS kms.KMS, objects []ObjectInfo) error {
+	const BatchSize = 250 // We process the objects in batches - 250 is a reasonable default.
+	var (
+		metadata = make([]map[string]string, 0, BatchSize)
+		buckets  = make([]string, 0, BatchSize)
+		names    = make([]string, 0, BatchSize)
+	)
+	for len(objects) > 0 {
+		N := BatchSize
+		if len(objects) < BatchSize {
+			N = len(objects)
+		}
+		batch := objects[:N]
+
+		// We have to decrypt only ETags of SSE-S3 single-part
+		// objects.
+		// Therefore, we remember which objects (there index)
+		// in the current batch are single-part SSE-S3 objects.
+		metadata = metadata[:0:N]
+		buckets = buckets[:0:N]
+		names = names[:0:N]
+		SSES3SinglePartObjects := make(map[int]bool)
+		for i, object := range batch {
+			if kind, ok := crypto.IsEncrypted(object.UserDefined); ok && kind == crypto.S3 && !crypto.IsMultiPart(object.UserDefined) {
+				SSES3SinglePartObjects[i] = true
+
+				metadata = append(metadata, object.UserDefined)
+				buckets = append(buckets, object.Bucket)
+				names = append(names, object.Name)
+			}
+		}
+
+		// If there are no SSE-S3 single-part objects
+		// we can skip the decryption process. However,
+		// we still have to adjust the size and ETag
+		// of SSE-C and SSE-KMS objects.
+		if len(SSES3SinglePartObjects) == 0 {
+			for i := range batch {
+				size, err := batch[i].GetActualSize()
+				if err != nil {
+					return err
+				}
+				batch[i].Size = size
+
+				if _, ok := crypto.IsEncrypted(batch[i].UserDefined); ok {
+					ETag, err := etag.Parse(batch[i].ETag)
+					if err != nil {
+						return err
+					}
+					batch[i].ETag = ETag.Format().String()
+				}
+			}
+			objects = objects[N:]
+			continue
+		}
+
+		// There is at least one SSE-S3 single-part object.
+		// For all SSE-S3 single-part objects we have to
+		// fetch their decryption keys. We do this using
+		// a Bulk-Decryption API call, if available.
+		keys, err := crypto.S3.UnsealObjectKeys(ctx, KMS, metadata, buckets, names)
+		if err != nil {
+			return err
+		}
+
+		// Now, we have to decrypt the ETags of SSE-S3 single-part
+		// objects and adjust the size and ETags of all encrypted
+		// objects.
+		for i := range batch {
+			size, err := batch[i].GetActualSize()
+			if err != nil {
+				return err
+			}
+			batch[i].Size = size
+
+			if _, ok := crypto.IsEncrypted(batch[i].UserDefined); ok {
+				ETag, err := etag.Parse(batch[i].ETag)
+				if err != nil {
+					return err
+				}
+				if SSES3SinglePartObjects[i] && ETag.IsEncrypted() {
+					ETag, err = etag.Decrypt(keys[0][:], ETag)
+					if err != nil {
+						return err
+					}
+					keys = keys[1:]
+				}
+				batch[i].ETag = ETag.Format().String()
+			}
+		}
+		objects = objects[N:]
+	}
+	return nil
 }
 
 // isMultipart returns true if the current object is
@@ -298,7 +406,7 @@ func newEncryptReader(content io.Reader, kind crypto.Type, keyID string, key []b
 		return nil, crypto.ObjectKey{}, err
 	}
 
-	reader, err := sio.EncryptReader(content, sio.Config{Key: objectEncryptionKey[:], MinVersion: sio.Version20, CipherSuites: fips.CipherSuitesDARE()})
+	reader, err := sio.EncryptReader(content, sio.Config{Key: objectEncryptionKey[:], MinVersion: sio.Version20, CipherSuites: fips.DARECiphers()})
 	if err != nil {
 		return nil, crypto.ObjectKey{}, crypto.ErrInvalidCustomerKey
 	}
@@ -445,7 +553,7 @@ func newDecryptReaderWithObjectKey(client io.Reader, objectEncryptionKey []byte,
 	reader, err := sio.DecryptReader(client, sio.Config{
 		Key:            objectEncryptionKey,
 		SequenceNumber: seqNumber,
-		CipherSuites:   fips.CipherSuitesDARE(),
+		CipherSuites:   fips.DARECiphers(),
 	})
 	if err != nil {
 		return nil, crypto.ErrInvalidCustomerKey

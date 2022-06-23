@@ -28,6 +28,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -70,6 +71,20 @@ var ServerFlags = []cli.Flag{
 		Value:  xhttp.DefaultShutdownTimeout,
 		Usage:  "shutdown timeout to gracefully shutdown server",
 		EnvVar: "MINIO_SHUTDOWN_TIMEOUT",
+		Hidden: true,
+	},
+	cli.DurationFlag{
+		Name:   "idle-timeout",
+		Value:  xhttp.DefaultIdleTimeout,
+		Usage:  "idle timeout is the maximum amount of time to wait for the next request when keep-alives are enabled",
+		EnvVar: "MINIO_IDLE_TIMEOUT",
+		Hidden: true,
+	},
+	cli.DurationFlag{
+		Name:   "read-header-timeout",
+		Value:  xhttp.DefaultReadHeaderTimeout,
+		Usage:  "read header timeout is the amount of time allowed to read request headers",
+		EnvVar: "MINIO_READ_HEADER_TIMEOUT",
 		Hidden: true,
 	},
 }
@@ -122,6 +137,13 @@ func serverCmdArgs(ctx *cli.Context) []string {
 	if err != nil {
 		logger.FatalIf(err, "Unable to validate passed arguments in %s:%s",
 			config.EnvArgs, os.Getenv(config.EnvArgs))
+	}
+	if v == "" {
+		v, _, _, err = env.LookupEnv(config.EnvVolumes)
+		if err != nil {
+			logger.FatalIf(err, "Unable to validate passed arguments in %s:%s",
+				config.EnvVolumes, os.Getenv(config.EnvVolumes))
+		}
 	}
 	if v == "" {
 		// Fall back to older environment value MINIO_ENDPOINTS
@@ -184,17 +206,18 @@ func serverHandleCmdArgs(ctx *cli.Context) {
 	// allow transport to be HTTP/1.1 for proxying.
 	globalProxyTransport = newCustomHTTPProxyTransport(&tls.Config{
 		RootCAs:            globalRootCAs,
-		CipherSuites:       fips.CipherSuitesTLS(),
-		CurvePreferences:   fips.EllipticCurvesTLS(),
+		CipherSuites:       fips.TLSCiphers(),
+		CurvePreferences:   fips.TLSCurveIDs(),
 		ClientSessionCache: tls.NewLRUClientSessionCache(tlsClientSessionCacheSize),
 	}, rest.DefaultTimeout)()
 	globalProxyEndpoints = GetProxyEndpoints(globalEndpoints)
 	globalInternodeTransport = newInternodeHTTPTransport(&tls.Config{
 		RootCAs:            globalRootCAs,
-		CipherSuites:       fips.CipherSuitesTLS(),
-		CurvePreferences:   fips.EllipticCurvesTLS(),
+		CipherSuites:       fips.TLSCiphers(),
+		CurvePreferences:   fips.TLSCurveIDs(),
 		ClientSessionCache: tls.NewLRUClientSessionCache(tlsClientSessionCacheSize),
 	}, rest.DefaultTimeout)()
+	globalRemoteTargetTransport = NewRemoteTargetHTTPTransport()()
 
 	// On macOS, if a process already listens on LOCALIPADDR:PORT, net.Listen() falls back
 	// to IPv6 address ie minio will start listening on IPv6 address whereas another
@@ -207,6 +230,7 @@ func serverHandleCmdArgs(ctx *cli.Context) {
 	if globalIsDistErasure {
 		globalIsErasure = true
 	}
+	globalIsErasureSD = (setupType == ErasureSDSetupType)
 }
 
 func serverHandleEnvVars() {
@@ -217,13 +241,11 @@ func serverHandleEnvVars() {
 var globalHealStateLK sync.RWMutex
 
 func initAllSubsystems() {
-	if globalIsErasure {
-		globalHealStateLK.Lock()
-		// New global heal state
-		globalAllHealState = newHealState(true)
-		globalBackgroundHealState = newHealState(false)
-		globalHealStateLK.Unlock()
-	}
+	globalHealStateLK.Lock()
+	// New global heal state
+	globalAllHealState = newHealState(true)
+	globalBackgroundHealState = newHealState(false)
+	globalHealStateLK.Unlock()
 
 	// Create new notification system and initialize notification peer targets
 	globalNotificationSys = NewNotificationSys(globalEndpoints)
@@ -263,8 +285,6 @@ func initAllSubsystems() {
 	// Create new bucket versioning subsystem
 	if globalBucketVersioningSys == nil {
 		globalBucketVersioningSys = NewBucketVersioningSys()
-	} else {
-		globalBucketVersioningSys.Reset()
 	}
 
 	// Create new bucket replication subsytem
@@ -299,6 +319,8 @@ func configRetriableErrors(err error) bool {
 }
 
 func initServer(ctx context.Context, newObject ObjectLayer) error {
+	t1 := time.Now()
+
 	// Once the config is fully loaded, initialize the new object layer.
 	setObjectLayer(newObject)
 
@@ -351,7 +373,7 @@ func initServer(ctx context.Context, newObject ObjectLayer) error {
 				// All successful return.
 				if globalIsDistErasure {
 					// These messages only meant primarily for distributed setup, so only log during distributed setup.
-					logger.Info("All MinIO sub-systems initialized successfully")
+					logger.Info("All MinIO sub-systems initialized successfully in %s", time.Since(t1))
 				}
 				return nil
 			}
@@ -408,11 +430,14 @@ func serverMain(ctx *cli.Context) {
 	erasureSelfTest()
 	compressSelfTest()
 
+	// Handle all server environment vars.
+	serverHandleEnvVars()
+
 	// Handle all server command args.
 	serverHandleCmdArgs(ctx)
 
-	// Handle all server environment vars.
-	serverHandleEnvVars()
+	// Initialize KMS configuration
+	handleKMSConfig()
 
 	// Set node name, only set for distributed setup.
 	globalConsoleSys.SetNodeName(globalLocalNodeName)
@@ -453,6 +478,12 @@ func serverMain(ctx *cli.Context) {
 		logger.Info(color.RedBold("WARNING: Detected Linux kernel version older than 4.0.0 release, there are some known potential performance problems with this kernel version. MinIO recommends a minimum of 4.x.x linux kernel version for best performance"))
 	}
 
+	maxProcs := runtime.GOMAXPROCS(0)
+	cpuProcs := runtime.NumCPU()
+	if maxProcs < cpuProcs {
+		logger.Info(color.RedBold("WARNING: Detected GOMAXPROCS(%d) < NumCPU(%d), please make sure to provide all PROCS to MinIO for optimal performance", maxProcs, cpuProcs))
+	}
+
 	// Configure server.
 	handler, err := configureServerHandler(globalEndpoints)
 	if err != nil {
@@ -477,6 +508,8 @@ func serverMain(ctx *cli.Context) {
 		UseHandler(setCriticalErrorHandler(corsHandler(handler))).
 		UseTLSConfig(newTLSConfig(getCert)).
 		UseShutdownTimeout(ctx.Duration("shutdown-timeout")).
+		UseIdleTimeout(ctx.Duration("idle-timeout")).
+		UseReadHeaderTimeout(ctx.Duration("read-header-timeout")).
 		UseBaseContext(GlobalContext).
 		UseCustomLogger(log.New(ioutil.Discard, "", 0)) // Turn-off random logging by Go stdlib
 
@@ -502,11 +535,8 @@ func serverMain(ctx *cli.Context) {
 	xhttp.SetMinIOVersion(Version)
 
 	// Enable background operations for erasure coding
-	if globalIsErasure {
-		initAutoHeal(GlobalContext, newObject)
-		initHealMRF(GlobalContext, newObject)
-	}
-
+	initAutoHeal(GlobalContext, newObject)
+	initHealMRF(GlobalContext, newObject)
 	initBackgroundExpiry(GlobalContext, newObject)
 
 	if globalActiveCred.Equal(auth.DefaultCredentials) {
@@ -554,24 +584,19 @@ func serverMain(ctx *cli.Context) {
 	// Background all other operations such as initializing bucket metadata etc.
 	go func() {
 		// Initialize transition tier configuration manager
-		if globalIsErasure {
-			initBackgroundReplication(GlobalContext, newObject)
-			initBackgroundTransition(GlobalContext, newObject)
+		initBackgroundReplication(GlobalContext, newObject)
+		initBackgroundTransition(GlobalContext, newObject)
 
-			go func() {
-				if err := globalTierConfigMgr.Init(GlobalContext, newObject); err != nil {
-					logger.LogIf(GlobalContext, err)
-				}
+		go func() {
+			if err := globalTierConfigMgr.Init(GlobalContext, newObject); err != nil {
+				logger.LogIf(GlobalContext, err)
+			}
 
-				globalTierJournal, err = initTierDeletionJournal(GlobalContext)
-				if err != nil {
-					logger.FatalIf(err, "Unable to initialize remote tier pending deletes journal")
-				}
-			}()
-		}
-
-		// Initialize site replication manager.
-		globalSiteReplicationSys.Init(GlobalContext, newObject)
+			globalTierJournal, err = initTierDeletionJournal(GlobalContext)
+			if err != nil {
+				logger.FatalIf(err, "Unable to initialize remote tier pending deletes journal")
+			}
+		}()
 
 		// Initialize quota manager.
 		globalBucketQuotaSys.Init(newObject)
@@ -594,6 +619,9 @@ func serverMain(ctx *cli.Context) {
 
 		// Initialize bucket metadata sub-system.
 		globalBucketMetadataSys.Init(GlobalContext, buckets, newObject)
+
+		// Initialize site replication manager.
+		globalSiteReplicationSys.Init(GlobalContext, newObject)
 
 		// Initialize bucket notification targets.
 		globalNotificationSys.InitBucketTargets(GlobalContext, newObject)
@@ -639,7 +667,13 @@ func newObjectLayer(ctx context.Context, endpointServerPools EndpointServerPools
 	// For FS only, directly use the disk.
 	if endpointServerPools.NEndpoints() == 1 {
 		// Initialize new FS object layer.
-		return NewFSObjectLayer(endpointServerPools[0].Endpoints[0].Path)
+		newObject, err = NewFSObjectLayer(endpointServerPools[0].Endpoints[0].Path)
+		if err == nil {
+			return newObject, nil
+		}
+		if err != nil && err != errFreshDisk {
+			return newObject, err
+		}
 	}
 
 	return newErasureServerPools(ctx, endpointServerPools)

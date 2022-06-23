@@ -38,7 +38,7 @@ type apiConfig struct {
 	requestsDeadline time.Duration
 	requestsPool     chan struct{}
 	clusterDeadline  time.Duration
-	listQuorum       int
+	listQuorum       string
 	corsAllowOrigins []string
 	// total drives per erasure set across pools.
 	totalDriveCount          int
@@ -116,10 +116,7 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int) {
 		//    + 2 * 10MiB (default erasure block size v1) + 2 * 1MiB (default erasure block size v2)
 		blockSize := xioutil.BlockSizeLarge + xioutil.BlockSizeSmall
 		apiRequestsMaxPerNode = int(maxMem / uint64(maxSetDrives*blockSize+int(blockSizeV1*2+blockSizeV2*2)))
-
-		if globalIsErasure {
-			logger.Info("Automatically configured API requests per node based on available memory on the system: %d", apiRequestsMaxPerNode)
-		}
+		logger.Info("Automatically configured API requests per node based on available memory on the system: %d", apiRequestsMaxPerNode)
 	} else {
 		apiRequestsMaxPerNode = cfg.RequestsMax
 		if len(globalEndpoints.Hostnames()) > 0 {
@@ -127,7 +124,7 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int) {
 		}
 	}
 
-	if cap(t.requestsPool) < apiRequestsMaxPerNode {
+	if cap(t.requestsPool) != apiRequestsMaxPerNode {
 		// Only replace if needed.
 		// Existing requests will use the previous limit,
 		// but new requests will use the new limit.
@@ -136,7 +133,7 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int) {
 		t.requestsPool = make(chan struct{}, apiRequestsMaxPerNode)
 	}
 	t.requestsDeadline = cfg.RequestsDeadline
-	t.listQuorum = cfg.GetListQuorum()
+	t.listQuorum = cfg.ListQuorum
 	if globalReplicationPool != nil &&
 		cfg.ReplicationWorkers != t.replicationWorkers {
 		globalReplicationPool.ResizeFailedWorkers(cfg.ReplicationFailedWorkers)
@@ -170,7 +167,7 @@ func (t *apiConfig) shouldGzipObjects() bool {
 	return t.gzipObjects
 }
 
-func (t *apiConfig) getListQuorum() int {
+func (t *apiConfig) getListQuorum() string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
@@ -246,10 +243,17 @@ func maxClients(f http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		globalHTTPStats.incS3RequestsIncoming()
 
-		if val := globalServiceFreeze.Load(); val != nil {
-			if unlock, ok := val.(chan struct{}); ok && unlock != nil {
-				// Wait until unfrozen.
-				<-unlock
+		if r.Header.Get(globalObjectPerfUserMetadata) == "" {
+			if val := globalServiceFreeze.Load(); val != nil {
+				if unlock, ok := val.(chan struct{}); ok && unlock != nil {
+					// Wait until unfrozen.
+					select {
+					case <-unlock:
+					case <-r.Context().Done():
+						// if client canceled we don't need to wait here forever.
+						return
+					}
+				}
 			}
 		}
 

@@ -20,12 +20,12 @@ package cmd
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +33,7 @@ import (
 	"github.com/minio/madmin-go"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/config/identity/openid"
+	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	iampolicy "github.com/minio/pkg/iam/policy"
@@ -54,11 +55,12 @@ const (
 	stsLDAPPassword           = "LDAPPassword"
 
 	// STS API action constants
-	clientGrants      = "AssumeRoleWithClientGrants"
-	webIdentity       = "AssumeRoleWithWebIdentity"
-	ldapIdentity      = "AssumeRoleWithLDAPIdentity"
-	clientCertificate = "AssumeRoleWithCertificate"
-	assumeRole        = "AssumeRole"
+	clientGrants        = "AssumeRoleWithClientGrants"
+	webIdentity         = "AssumeRoleWithWebIdentity"
+	ldapIdentity        = "AssumeRoleWithLDAPIdentity"
+	clientCertificate   = "AssumeRoleWithCertificate"
+	customTokenIdentity = "AssumeRoleWithCustomToken"
+	assumeRole          = "AssumeRole"
 
 	stsRequestBodyLimit = 10 * (1 << 20) // 10 MiB
 
@@ -66,7 +68,6 @@ const (
 	expClaim = "exp"
 	subClaim = "sub"
 	audClaim = "aud"
-	azpClaim = "azp"
 	issClaim = "iss"
 
 	// JWT claim to check the parent user
@@ -128,6 +129,11 @@ func registerSTSRouter(router *mux.Router) {
 	// AssumeRoleWithCertificate
 	stsRouter.Methods(http.MethodPost).HandlerFunc(httpTraceAll(sts.AssumeRoleWithCertificate)).
 		Queries(stsAction, clientCertificate).
+		Queries(stsVersion, stsAPIVersion)
+
+	// AssumeRoleWithCustomToken
+	stsRouter.Methods(http.MethodPost).HandlerFunc(httpTraceAll(sts.AssumeRoleWithCustomToken)).
+		Queries(stsAction, customTokenIdentity).
 		Queries(stsVersion, stsAPIVersion)
 }
 
@@ -285,8 +291,7 @@ func (sts *stsAPIHandlers) AssumeRole(w http.ResponseWriter, r *http.Request) {
 				ParentUser:   cred.ParentUser,
 			},
 		}); err != nil {
-			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-			return
+			logger.LogIf(ctx, err)
 		}
 	}
 
@@ -328,17 +333,6 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 	ctx = newContext(r, w, action)
 	defer logger.AuditLog(ctx, w, r, nil)
 
-	if globalOpenIDValidators == nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSNotInitialized, errServerNotInitialized)
-		return
-	}
-
-	v, err := globalOpenIDValidators.Get("jwt")
-	if err != nil {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
-		return
-	}
-
 	token := r.Form.Get(stsToken)
 	if token == "" {
 		token = r.Form.Get(stsWebIdentityToken)
@@ -346,7 +340,21 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 
 	accessToken := r.Form.Get(stsWebIdentityAccessToken)
 
-	m, err := v.Validate(token, accessToken, r.Form.Get(stsDurationSeconds))
+	roleArn := openid.DummyRoleARN
+	if globalIAMSys.HasRolePolicy() {
+		var err error
+		roleArnStr := r.Form.Get(stsRoleArn)
+		roleArn, _, err = globalIAMSys.GetRolePolicy(roleArnStr)
+		if err != nil {
+			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue,
+				fmt.Errorf("Error processing %s parameter: %v", stsRoleArn, err))
+			return
+		}
+
+	}
+
+	// Validate JWT; check clientID in claims matches the one associated with the roleArn
+	m, err := globalOpenIDConfig.Validate(roleArn, token, accessToken, r.Form.Get(stsDurationSeconds))
 	if err != nil {
 		switch err {
 		case openid.ErrTokenExpired:
@@ -365,54 +373,11 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// REQUIRED. Audience(s) that this ID Token is intended for.
-	// It MUST contain the OAuth 2.0 client_id of the Relying Party
-	// as an audience value. It MAY also contain identifiers for
-	// other audiences. In the general case, the aud value is an
-	// array of case sensitive strings. In the common special case
-	// when there is one audience, the aud value MAY be a single
-	// case sensitive
-	audValues, ok := iampolicy.GetValuesFromClaims(m, audClaim)
-	if !ok {
-		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue,
-			errors.New("STS JWT Token has `aud` claim invalid, `aud` must match configured OpenID Client ID"))
-		return
-	}
-	if !audValues.Contains(globalOpenIDConfig.ClientID) {
-		// if audience claims is missing, look for "azp" claims.
-		// OPTIONAL. Authorized party - the party to which the ID
-		// Token was issued. If present, it MUST contain the OAuth
-		// 2.0 Client ID of this party. This Claim is only needed
-		// when the ID Token has a single audience value and that
-		// audience is different than the authorized party. It MAY
-		// be included even when the authorized party is the same
-		// as the sole audience. The azp value is a case sensitive
-		// string containing a StringOrURI value
-		azpValues, ok := iampolicy.GetValuesFromClaims(m, azpClaim)
-		if !ok {
-			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue,
-				errors.New("STS JWT Token has `aud` claim invalid, `aud` must match configured OpenID Client ID"))
-			return
-		}
-		if !azpValues.Contains(globalOpenIDConfig.ClientID) {
-			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue,
-				errors.New("STS JWT Token has `azp` claim invalid, `azp` must match configured OpenID Client ID"))
-			return
-		}
-	}
-
 	var policyName string
 	if globalIAMSys.HasRolePolicy() {
-		roleArn := r.Form.Get(stsRoleArn)
-		_, err := globalIAMSys.GetRolePolicy(roleArn)
-		if err != nil {
-			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue,
-				fmt.Errorf("Error processing %s parameter: %v", stsRoleArn, err))
-			return
-		}
 		// If roleArn is used, we set it as a claim, and use the
 		// associated policy when credentials are used.
-		m[roleArnClaim] = roleArn
+		m[roleArnClaim] = roleArn.String()
 	} else {
 		// If no role policy is configured, then we use claims from the
 		// JWT. This is a MinIO STS API specific value, this value
@@ -424,7 +389,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 			policyName = globalIAMSys.CurrentPolicies(policies)
 		}
 
-		if globalPolicyOPA == nil {
+		if newGlobalAuthZPluginFn() == nil {
 			if !ok {
 				writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue,
 					fmt.Errorf("%s claim missing from the JWT token, credentials will not be generated", iamPolicyClaimNameOpenID()))
@@ -520,8 +485,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithSSO(w http.ResponseWriter, r *http.Requ
 			ParentPolicyMapping: policyName,
 		},
 	}); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
+		logger.LogIf(ctx, err)
 	}
 
 	var encodedSuccessResponse []byte
@@ -634,7 +598,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 
 	// Check if this user or their groups have a policy applied.
 	ldapPolicies, _ := globalIAMSys.PolicyDBGet(ldapUserDN, false, groupDistNames...)
-	if len(ldapPolicies) == 0 && globalPolicyOPA == nil {
+	if len(ldapPolicies) == 0 && newGlobalAuthZPluginFn() == nil {
 		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue,
 			fmt.Errorf("expecting a policy to be set for user `%s` or one of their groups: `%s` - rejecting this request",
 				ldapUserDN, strings.Join(groupDistNames, "`,`")))
@@ -690,8 +654,7 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 			ParentUser:   cred.ParentUser,
 		},
 	}); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
+		logger.LogIf(ctx, err)
 	}
 
 	ldapIdentityResponse := &AssumeRoleWithLDAPResponse{
@@ -851,12 +814,133 @@ func (sts *stsAPIHandlers) AssumeRoleWithCertificate(w http.ResponseWriter, r *h
 			ParentPolicyMapping: policyName,
 		},
 	}); err != nil {
-		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
-		return
+		logger.LogIf(ctx, err)
 	}
 
 	response := new(AssumeRoleWithCertificateResponse)
 	response.Result.Credentials = tmpCredentials
+	response.Metadata.RequestID = w.Header().Get(xhttp.AmzRequestID)
+	writeSuccessResponseXML(w, encodeResponse(response))
+}
+
+// AssumeRoleWithCustomToken implements user authentication with custom tokens.
+// These tokens are opaque to MinIO and are verified by a configured (external)
+// Identity Management Plugin.
+//
+// API endpoint: https://minio:9000?Action=AssumeRoleWithCustomToken&Token=xxx
+func (sts *stsAPIHandlers) AssumeRoleWithCustomToken(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "AssumeRoleWithCustomToken")
+
+	if globalAuthNPlugin == nil {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSNotInitialized, errors.New("STS API 'AssumeRoleWithCustomToken' is disabled"))
+		return
+	}
+
+	action := r.Form.Get(stsAction)
+	if action != customTokenIdentity {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, fmt.Errorf("Unsupported action %s", action))
+		return
+	}
+
+	defer logger.AuditLog(ctx, w, r, nil)
+
+	token := r.Form.Get(stsToken)
+	if token == "" {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, fmt.Errorf("Invalid empty `Token` parameter provided"))
+		return
+	}
+
+	durationParam := r.Form.Get(stsDurationSeconds)
+	var requestedDuration int
+	if durationParam != "" {
+		var err error
+		requestedDuration, err = strconv.Atoi(durationParam)
+		if err != nil {
+			writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, fmt.Errorf("Invalid requested duration: %s", durationParam))
+			return
+		}
+	}
+
+	roleArnStr := r.Form.Get(stsRoleArn)
+	roleArn, _, err := globalIAMSys.GetRolePolicy(roleArnStr)
+	if err != nil {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue,
+			fmt.Errorf("Error processing parameter %s: %v", stsRoleArn, err))
+		return
+	}
+
+	res, err := globalAuthNPlugin.Authenticate(roleArn, token)
+	if err != nil {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSInvalidParameterValue, err)
+		return
+	}
+
+	// If authentication failed, return the error message to the user.
+	if res.Failure != nil {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSUpstreamError, errors.New(res.Failure.Reason))
+		return
+	}
+
+	// It is required that parent user be set.
+	if res.Success.User == "" {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSUpstreamError, errors.New("A valid user was not returned by the authenticator."))
+		return
+	}
+
+	// Expiry is set as minimum of requested value and value allowed by auth
+	// plugin.
+	expiry := res.Success.MaxValiditySeconds
+	if durationParam != "" && requestedDuration < expiry {
+		expiry = requestedDuration
+	}
+
+	parentUser := "custom:" + res.Success.User
+
+	// metadata map
+	m := map[string]interface{}{
+		expClaim:     UTCNow().Add(time.Duration(expiry) * time.Second).Unix(),
+		parentClaim:  parentUser,
+		subClaim:     parentUser,
+		roleArnClaim: roleArn.String(),
+	}
+	// Add all other claims from the plugin **without** replacing any
+	// existing claims.
+	for k, v := range res.Success.Claims {
+		if _, ok := m[k]; !ok {
+			m[k] = v
+		}
+	}
+
+	tmpCredentials, err := auth.GetNewCredentialsWithMetadata(m, globalActiveCred.SecretKey)
+	if err != nil {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSInternalError, err)
+		return
+	}
+
+	tmpCredentials.ParentUser = parentUser
+	err = globalIAMSys.SetTempUser(ctx, tmpCredentials.AccessKey, tmpCredentials, "")
+	if err != nil {
+		writeSTSErrorResponse(ctx, w, true, ErrSTSInternalError, err)
+		return
+	}
+
+	// Call hook for site replication.
+	if err := globalSiteReplicationSys.IAMChangeHook(ctx, madmin.SRIAMItem{
+		Type: madmin.SRIAMItemSTSAcc,
+		STSCredential: &madmin.SRSTSCredential{
+			AccessKey:    tmpCredentials.AccessKey,
+			SecretKey:    tmpCredentials.SecretKey,
+			SessionToken: tmpCredentials.SessionToken,
+			ParentUser:   tmpCredentials.ParentUser,
+		},
+	}); err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+
+	response := new(AssumeRoleWithCustomTokenResponse)
+	response.Result.Credentials = tmpCredentials
+	response.Result.AssumedUser = parentUser
 	response.Metadata.RequestID = w.Header().Get(xhttp.AmzRequestID)
 	writeSuccessResponseXML(w, encodeResponse(response))
 }

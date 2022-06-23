@@ -19,7 +19,6 @@ package cmd
 
 import (
 	"context"
-	"net/http"
 	"sync"
 	"time"
 
@@ -120,9 +119,6 @@ func (sys *BucketTargetSys) SetTarget(ctx context.Context, bucket string, tgt *m
 		return BucketRemoteConnectionErr{Bucket: tgt.TargetBucket, Err: err}
 	}
 	if tgt.Type == madmin.ReplicationService {
-		if !globalIsErasure {
-			return NotImplemented{Message: "Replication is not implemented in " + getMinioMode()}
-		}
 		if !globalBucketVersioningSys.Enabled(bucket) {
 			return BucketReplicationSourceNotVersioned{Bucket: bucket}
 		}
@@ -184,9 +180,6 @@ func (sys *BucketTargetSys) RemoveTarget(ctx context.Context, bucket, arnStr str
 	if globalIsGateway {
 		return nil
 	}
-	if !globalIsErasure {
-		return NotImplemented{Message: "Replication is not implemented in " + getMinioMode()}
-	}
 
 	if arnStr == "" {
 		return BucketRemoteArnInvalid{Bucket: bucket}
@@ -201,7 +194,7 @@ func (sys *BucketTargetSys) RemoveTarget(ctx context.Context, bucket, arnStr str
 		// reject removal of remote target if replication configuration is present
 		rcfg, err := getReplicationConfig(ctx, bucket)
 		if err == nil {
-			for _, tgtArn := range rcfg.FilterTargetArns(replication.ObjectOpts{}) {
+			for _, tgtArn := range rcfg.FilterTargetArns(replication.ObjectOpts{OpType: replication.AllReplicationType}) {
 				if err == nil && (tgtArn == arnStr || rcfg.RoleArn == arnStr) {
 					sys.RLock()
 					_, ok := sys.arnRemotesMap[arnStr]
@@ -331,25 +324,16 @@ func (sys *BucketTargetSys) set(bucket BucketInfo, meta BucketMetadata) {
 	sys.targetsMap[bucket.Name] = cfg.Targets
 }
 
-// getRemoteTargetInstanceTransport contains a singleton roundtripper.
-var (
-	getRemoteTargetInstanceTransport     http.RoundTripper
-	getRemoteTargetInstanceTransportOnce sync.Once
-)
-
 // Returns a minio-go Client configured to access remote host described in replication target config.
 func (sys *BucketTargetSys) getRemoteTargetClient(tcfg *madmin.BucketTarget) (*TargetClient, error) {
 	config := tcfg.Credentials
 	creds := credentials.NewStaticV4(config.AccessKey, config.SecretKey, "")
-	getRemoteTargetInstanceTransportOnce.Do(func() {
-		getRemoteTargetInstanceTransport = NewRemoteTargetHTTPTransport()
-	})
 
 	api, err := minio.New(tcfg.Endpoint, &miniogo.Options{
 		Creds:     creds,
 		Secure:    tcfg.Secure,
 		Region:    tcfg.Region,
-		Transport: getRemoteTargetInstanceTransport,
+		Transport: globalRemoteTargetTransport,
 	})
 	if err != nil {
 		return nil, err

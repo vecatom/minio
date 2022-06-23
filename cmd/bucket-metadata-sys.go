@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/minio/madmin-go"
 	"github.com/minio/minio-go/v7/pkg/tags"
@@ -111,31 +112,29 @@ func (sys *BucketMetadataSys) Update(ctx context.Context, bucket string, configF
 	switch configFile {
 	case bucketPolicyConfig:
 		meta.PolicyConfigJSON = configData
+		meta.PolicyConfigUpdatedAt = UTCNow()
 	case bucketNotificationConfig:
 		meta.NotificationConfigXML = configData
 	case bucketLifecycleConfig:
 		meta.LifecycleConfigXML = configData
 	case bucketSSEConfig:
 		meta.EncryptionConfigXML = configData
+		meta.EncryptionConfigUpdatedAt = UTCNow()
 	case bucketTaggingConfig:
 		meta.TaggingConfigXML = configData
+		meta.TaggingConfigUpdatedAt = UTCNow()
 	case bucketQuotaConfigFile:
 		meta.QuotaConfigJSON = configData
+		meta.QuotaConfigUpdatedAt = UTCNow()
 	case objectLockConfig:
-		if !globalIsErasure && !globalIsDistErasure {
-			return NotImplemented{}
-		}
 		meta.ObjectLockConfigXML = configData
+		meta.ObjectLockConfigUpdatedAt = UTCNow()
 	case bucketVersioningConfig:
-		if !globalIsErasure && !globalIsDistErasure {
-			return NotImplemented{}
-		}
 		meta.VersioningConfigXML = configData
+		meta.VersioningConfigUpdatedAt = UTCNow()
 	case bucketReplicationConfig:
-		if !globalIsErasure && !globalIsDistErasure {
-			return NotImplemented{}
-		}
 		meta.ReplicationConfigXML = configData
+		meta.ReplicationConfigUpdatedAt = UTCNow()
 	case bucketTargetsFile:
 		meta.BucketTargetsConfigJSON, meta.BucketTargetsConfigMetaJSON, err = encryptBucketMetadata(meta.Name, configData, kms.Context{
 			bucket:            meta.Name,
@@ -186,44 +185,47 @@ func (sys *BucketMetadataSys) Get(bucket string) (BucketMetadata, error) {
 
 // GetVersioningConfig returns configured versioning config
 // The returned object may not be modified.
-func (sys *BucketMetadataSys) GetVersioningConfig(bucket string) (*versioning.Versioning, error) {
+func (sys *BucketMetadataSys) GetVersioningConfig(bucket string) (*versioning.Versioning, time.Time, error) {
 	meta, err := sys.GetConfig(GlobalContext, bucket)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, errConfigNotFound) {
+			return &versioning.Versioning{XMLNS: "http://s3.amazonaws.com/doc/2006-03-01/"}, meta.Created, nil
+		}
+		return &versioning.Versioning{XMLNS: "http://s3.amazonaws.com/doc/2006-03-01/"}, time.Time{}, err
 	}
-	return meta.versioningConfig, nil
+	return meta.versioningConfig, meta.VersioningConfigUpdatedAt, nil
 }
 
 // GetTaggingConfig returns configured tagging config
 // The returned object may not be modified.
-func (sys *BucketMetadataSys) GetTaggingConfig(bucket string) (*tags.Tags, error) {
+func (sys *BucketMetadataSys) GetTaggingConfig(bucket string) (*tags.Tags, time.Time, error) {
 	meta, err := sys.GetConfig(GlobalContext, bucket)
 	if err != nil {
 		if errors.Is(err, errConfigNotFound) {
-			return nil, BucketTaggingNotFound{Bucket: bucket}
+			return nil, time.Time{}, BucketTaggingNotFound{Bucket: bucket}
 		}
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	if meta.taggingConfig == nil {
-		return nil, BucketTaggingNotFound{Bucket: bucket}
+		return nil, time.Time{}, BucketTaggingNotFound{Bucket: bucket}
 	}
-	return meta.taggingConfig, nil
+	return meta.taggingConfig, meta.TaggingConfigUpdatedAt, nil
 }
 
 // GetObjectLockConfig returns configured object lock config
 // The returned object may not be modified.
-func (sys *BucketMetadataSys) GetObjectLockConfig(bucket string) (*objectlock.Config, error) {
+func (sys *BucketMetadataSys) GetObjectLockConfig(bucket string) (*objectlock.Config, time.Time, error) {
 	meta, err := sys.GetConfig(GlobalContext, bucket)
 	if err != nil {
 		if errors.Is(err, errConfigNotFound) {
-			return nil, BucketObjectLockConfigNotFound{Bucket: bucket}
+			return nil, time.Time{}, BucketObjectLockConfigNotFound{Bucket: bucket}
 		}
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	if meta.objectLockConfig == nil {
-		return nil, BucketObjectLockConfigNotFound{Bucket: bucket}
+		return nil, time.Time{}, BucketObjectLockConfigNotFound{Bucket: bucket}
 	}
-	return meta.objectLockConfig, nil
+	return meta.objectLockConfig, meta.ObjectLockConfigUpdatedAt, nil
 }
 
 // GetLifecycleConfig returns configured lifecycle config
@@ -283,69 +285,82 @@ func (sys *BucketMetadataSys) GetNotificationConfig(bucket string) (*event.Confi
 
 // GetSSEConfig returns configured SSE config
 // The returned object may not be modified.
-func (sys *BucketMetadataSys) GetSSEConfig(bucket string) (*bucketsse.BucketSSEConfig, error) {
+func (sys *BucketMetadataSys) GetSSEConfig(bucket string) (*bucketsse.BucketSSEConfig, time.Time, error) {
 	meta, err := sys.GetConfig(GlobalContext, bucket)
 	if err != nil {
 		if errors.Is(err, errConfigNotFound) {
-			return nil, BucketSSEConfigNotFound{Bucket: bucket}
+			return nil, time.Time{}, BucketSSEConfigNotFound{Bucket: bucket}
 		}
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	if meta.sseConfig == nil {
-		return nil, BucketSSEConfigNotFound{Bucket: bucket}
+		return nil, time.Time{}, BucketSSEConfigNotFound{Bucket: bucket}
 	}
-	return meta.sseConfig, nil
+	return meta.sseConfig, meta.EncryptionConfigUpdatedAt, nil
+}
+
+// CreatedAt returns the time of creation of bucket
+func (sys *BucketMetadataSys) CreatedAt(bucket string) (time.Time, error) {
+	meta, err := sys.GetConfig(GlobalContext, bucket)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return meta.Created.UTC(), nil
 }
 
 // GetPolicyConfig returns configured bucket policy
 // The returned object may not be modified.
-func (sys *BucketMetadataSys) GetPolicyConfig(bucket string) (*policy.Policy, error) {
+func (sys *BucketMetadataSys) GetPolicyConfig(bucket string) (*policy.Policy, time.Time, error) {
 	if globalIsGateway {
 		objAPI := newObjectLayerFn()
 		if objAPI == nil {
-			return nil, errServerNotInitialized
+			return nil, time.Time{}, errServerNotInitialized
 		}
-		return objAPI.GetBucketPolicy(GlobalContext, bucket)
+		p, err := objAPI.GetBucketPolicy(GlobalContext, bucket)
+		return p, UTCNow(), err
 	}
 
 	meta, err := sys.GetConfig(GlobalContext, bucket)
 	if err != nil {
 		if errors.Is(err, errConfigNotFound) {
-			return nil, BucketPolicyNotFound{Bucket: bucket}
+			return nil, time.Time{}, BucketPolicyNotFound{Bucket: bucket}
 		}
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	if meta.policyConfig == nil {
-		return nil, BucketPolicyNotFound{Bucket: bucket}
+		return nil, time.Time{}, BucketPolicyNotFound{Bucket: bucket}
 	}
-	return meta.policyConfig, nil
+	return meta.policyConfig, meta.PolicyConfigUpdatedAt, nil
 }
 
 // GetQuotaConfig returns configured bucket quota
 // The returned object may not be modified.
-func (sys *BucketMetadataSys) GetQuotaConfig(ctx context.Context, bucket string) (*madmin.BucketQuota, error) {
+func (sys *BucketMetadataSys) GetQuotaConfig(ctx context.Context, bucket string) (*madmin.BucketQuota, time.Time, error) {
 	meta, err := sys.GetConfig(ctx, bucket)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, errConfigNotFound) {
+			return nil, time.Time{}, BucketQuotaConfigNotFound{Bucket: bucket}
+		}
+		return nil, time.Time{}, err
 	}
-	return meta.quotaConfig, nil
+	return meta.quotaConfig, meta.QuotaConfigUpdatedAt, nil
 }
 
 // GetReplicationConfig returns configured bucket replication config
 // The returned object may not be modified.
-func (sys *BucketMetadataSys) GetReplicationConfig(ctx context.Context, bucket string) (*replication.Config, error) {
+func (sys *BucketMetadataSys) GetReplicationConfig(ctx context.Context, bucket string) (*replication.Config, time.Time, error) {
 	meta, err := sys.GetConfig(ctx, bucket)
 	if err != nil {
 		if errors.Is(err, errConfigNotFound) {
-			return nil, BucketReplicationConfigNotFound{Bucket: bucket}
+			return nil, time.Time{}, BucketReplicationConfigNotFound{Bucket: bucket}
 		}
-		return nil, err
+		return nil, time.Time{}, err
 	}
 
 	if meta.replicationConfig == nil {
-		return nil, BucketReplicationConfigNotFound{Bucket: bucket}
+		return nil, time.Time{}, BucketReplicationConfigNotFound{Bucket: bucket}
 	}
-	return meta.replicationConfig, nil
+	return meta.replicationConfig, meta.ReplicationConfigUpdatedAt, nil
 }
 
 // GetBucketTargetsConfig returns configured bucket targets for this bucket
@@ -353,26 +368,15 @@ func (sys *BucketMetadataSys) GetReplicationConfig(ctx context.Context, bucket s
 func (sys *BucketMetadataSys) GetBucketTargetsConfig(bucket string) (*madmin.BucketTargets, error) {
 	meta, err := sys.GetConfig(GlobalContext, bucket)
 	if err != nil {
+		if errors.Is(err, errConfigNotFound) {
+			return nil, BucketRemoteTargetNotFound{Bucket: bucket}
+		}
 		return nil, err
 	}
 	if meta.bucketTargetConfig == nil {
 		return nil, BucketRemoteTargetNotFound{Bucket: bucket}
 	}
 	return meta.bucketTargetConfig, nil
-}
-
-// GetBucketTarget returns the target for the bucket and arn.
-func (sys *BucketMetadataSys) GetBucketTarget(bucket string, arn string) (madmin.BucketTarget, error) {
-	targets, err := sys.GetBucketTargetsConfig(bucket)
-	if err != nil {
-		return madmin.BucketTarget{}, err
-	}
-	for _, t := range targets.Targets {
-		if t.Arn == arn {
-			return t, nil
-		}
-	}
-	return madmin.BucketTarget{}, errConfigNotFound
 }
 
 // GetConfig returns a specific configuration from the bucket metadata.

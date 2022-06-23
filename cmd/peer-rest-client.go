@@ -24,15 +24,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
-	"github.com/dustin/go-humanize"
 	"github.com/minio/madmin-go"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/http"
@@ -103,271 +99,6 @@ func (client *peerRESTClient) GetLocks() (lockMap map[string][]lockRequesterInfo
 // ServerInfo - fetch server information for a remote node.
 func (client *peerRESTClient) ServerInfo() (info madmin.ServerProperties, err error) {
 	respBody, err := client.call(peerRESTMethodServerInfo, nil, nil, -1)
-	if err != nil {
-		return
-	}
-	defer http.DrainBody(respBody)
-	err = gob.NewDecoder(respBody).Decode(&info)
-	return info, err
-}
-
-type networkOverloadedErr struct{}
-
-var networkOverloaded networkOverloadedErr
-
-func (n networkOverloadedErr) Error() string {
-	return "network overloaded"
-}
-
-type nullReader struct{}
-
-func (r *nullReader) Read(b []byte) (int, error) {
-	return len(b), nil
-}
-
-func (client *peerRESTClient) doNetTest(ctx context.Context, dataSize int64, threadCount uint) (info madmin.PeerNetPerfInfo, err error) {
-	var mu sync.Mutex // mutex used to protect these slices in go-routines
-	latencies := []float64{}
-	throughputs := []float64{}
-
-	buflimiter := make(chan struct{}, threadCount)
-	errChan := make(chan error, threadCount)
-
-	var totalTransferred int64
-
-	// ensure enough samples to obtain normal distribution
-	maxSamples := int(10 * threadCount)
-	if maxSamples > 50 {
-		maxSamples = 50
-	}
-
-	innerCtx, cancel := context.WithCancel(ctx)
-
-	slowSamples := int32(0)
-	maxSlowSamples := int32(maxSamples/20) + 1 // 5% of total
-	slowSample := func() {
-		if slowSamples > maxSlowSamples {
-			return
-		}
-		if atomic.AddInt32(&slowSamples, 1) > maxSlowSamples {
-			errChan <- networkOverloaded
-			cancel()
-		}
-	}
-
-	var wg sync.WaitGroup
-	finish := func() {
-		<-buflimiter
-		wg.Done()
-	}
-
-	for i := 0; i < maxSamples; i++ {
-		if slowSamples > maxSlowSamples {
-			break
-		}
-
-		select {
-		case <-ctx.Done():
-			cancel()
-			return info, ctx.Err()
-		case err = <-errChan:
-		case buflimiter <- struct{}{}:
-			if slowSamples > maxSlowSamples {
-				break
-			}
-			wg.Add(1)
-
-			if innerCtx.Err() != nil {
-				finish()
-				continue
-			}
-
-			go func(i int) {
-				start := time.Now()
-				before := atomic.LoadInt64(&totalTransferred)
-
-				ctx, cancel := context.WithTimeout(innerCtx, 3*time.Second)
-				defer cancel()
-
-				progress := io.LimitReader(&nullReader{}, dataSize)
-
-				// Turn off healthCheckFn for health tests to cater for higher load on the peers.
-				clnt := newPeerRESTClient(client.host)
-				clnt.restClient.HealthCheckFn = nil
-
-				respBody, err := clnt.callWithContext(ctx, peerRESTMethodNetInfo, nil, progress, dataSize)
-				if err != nil {
-					if errors.Is(err, context.DeadlineExceeded) {
-						slowSample()
-						finish()
-						return
-					}
-
-					errChan <- err
-					finish()
-					return
-				}
-				http.DrainBody(respBody)
-
-				finish()
-				atomic.AddInt64(&totalTransferred, dataSize)
-				after := atomic.LoadInt64(&totalTransferred)
-				end := time.Now()
-
-				latency := end.Sub(start).Seconds()
-
-				if latency > maxLatencyForSizeThreads(dataSize, threadCount) {
-					slowSample()
-				}
-
-				/* Throughput = (total data transferred across all threads / time taken) */
-				throughput := float64((after - before)) / latency
-
-				// Protect updating latencies and throughputs slices from
-				// multiple go-routines.
-				mu.Lock()
-				latencies = append(latencies, latency)
-				throughputs = append(throughputs, throughput)
-				mu.Unlock()
-			}(i)
-		}
-	}
-	wg.Wait()
-
-	if slowSamples > maxSlowSamples {
-		return info, networkOverloaded
-	}
-	if err != nil {
-		return info, err
-	}
-
-	latency, throughput, err := xnet.ComputePerfStats(latencies, throughputs)
-	return madmin.PeerNetPerfInfo{
-		Latency: madmin.Latency{
-			Avg:          round(latency.Avg, 3),
-			Max:          round(latency.Max, 3),
-			Min:          round(latency.Min, 3),
-			Percentile50: round(latency.Percentile50, 3),
-			Percentile90: round(latency.Percentile90, 3),
-			Percentile99: round(latency.Percentile99, 3),
-		},
-		Throughput: madmin.Throughput{
-			Avg:          uint64(round(throughput.Avg, 0)),
-			Max:          uint64(round(throughput.Max, 0)),
-			Min:          uint64(round(throughput.Min, 0)),
-			Percentile50: uint64(round(throughput.Percentile50, 0)),
-			Percentile90: uint64(round(throughput.Percentile90, 0)),
-			Percentile99: uint64(round(throughput.Percentile99, 0)),
-		},
-	}, nil
-}
-
-func maxLatencyForSizeThreads(size int64, threadCount uint) float64 {
-	Gbit100 := 12.5 * float64(humanize.GiByte)
-	Gbit40 := 5.00 * float64(humanize.GiByte)
-	Gbit25 := 3.25 * float64(humanize.GiByte)
-	Gbit10 := 1.25 * float64(humanize.GiByte)
-	// Gbit1 := 0.25 * float64(humanize.GiByte)
-
-	// Given the current defaults, each combination of size/thread
-	// is supposed to fully saturate the intended pipe when all threads are active
-	// i.e. if the test is performed in a perfectly controlled environment, i.e. without
-	// CPU scheduling latencies and/or network jitters, then all threads working
-	// simultaneously should result in each of them completing in 1s
-	//
-	// In reality, I've assumed a normal distribution of latency with expected mean of 1s and min of 0s
-	// Then, 95% of threads should complete within 2 seconds (2 std. deviations from the mean). The 2s comes
-	// from fitting the normal curve such that the mean is 1.
-	//
-	// i.e. we expect that no more than 5% of threads to take longer than 2s to push the data.
-	//
-	// throughput  |  max latency
-	//   100 Gbit  |  2s
-	//    40 Gbit  |  2s
-	//    25 Gbit  |  2s
-	//    10 Gbit  |  2s
-	//     1 Gbit  |  inf
-
-	throughput := float64(size * int64(threadCount))
-	if throughput >= Gbit100 {
-		return 2.0
-	} else if throughput >= Gbit40 {
-		return 2.0
-	} else if throughput >= Gbit25 {
-		return 2.0
-	} else if throughput >= Gbit10 {
-		return 2.0
-	}
-	return math.MaxFloat64
-}
-
-// GetNetPerfInfo - fetch network information for a remote node.
-func (client *peerRESTClient) GetNetPerfInfo(ctx context.Context) (info madmin.PeerNetPerfInfo, err error) {
-	// 100 Gbit ->  256 MiB  *  50 threads
-	// 40 Gbit  ->  256 MiB  *  20 threads
-	// 25 Gbit  ->  128 MiB  *  25 threads
-	// 10 Gbit  ->  128 MiB  *  10 threads
-	// 1 Gbit   ->  64  MiB  *  2  threads
-
-	type step struct {
-		size    int64
-		threads uint
-	}
-	steps := []step{
-		{ // 100 Gbit
-			size:    256 * humanize.MiByte,
-			threads: 50,
-		},
-		{ // 40 Gbit
-			size:    256 * humanize.MiByte,
-			threads: 20,
-		},
-		{ // 25 Gbit
-			size:    128 * humanize.MiByte,
-			threads: 25,
-		},
-		{ // 10 Gbit
-			size:    128 * humanize.MiByte,
-			threads: 10,
-		},
-		{ // 1 Gbit
-			size:    64 * humanize.MiByte,
-			threads: 2,
-		},
-	}
-
-	for i := range steps {
-		size := steps[i].size
-		threads := steps[i].threads
-
-		if info, err = client.doNetTest(ctx, size, threads); err != nil {
-			if err == networkOverloaded {
-				continue
-			}
-		}
-		return info, err
-	}
-	return info, err
-}
-
-// DispatchNetInfo - dispatch other nodes to run Net info.
-func (client *peerRESTClient) DispatchNetInfo(ctx context.Context) (info madmin.NetPerfInfo, err error) {
-	respBody, err := client.callWithContext(ctx, peerRESTMethodDispatchNetInfo, nil, nil, -1)
-	if err != nil {
-		return
-	}
-	defer http.DrainBody(respBody)
-	waitReader, err := waitForHTTPResponse(respBody)
-	if err != nil {
-		return
-	}
-	err = gob.NewDecoder(waitReader).Decode(&info)
-	return
-}
-
-// GetDrivePerfInfos - fetch all disk's serial/parallal performance information for a remote node.
-func (client *peerRESTClient) GetDrivePerfInfos(ctx context.Context) (info madmin.DrivePerfInfos, err error) {
-	respBody, err := client.callWithContext(ctx, peerRESTMethodDriveInfo, nil, nil, -1)
 	if err != nil {
 		return
 	}
@@ -508,6 +239,19 @@ func (client *peerRESTClient) GetBucketStats(bucket string) (BucketStats, error)
 	var bs BucketStats
 	defer http.DrainBody(respBody)
 	return bs, msgp.Decode(respBody, &bs)
+}
+
+// GetAllBucketStats - load replication stats for all buckets
+func (client *peerRESTClient) GetAllBucketStats() (BucketStatsMap, error) {
+	values := make(url.Values)
+	respBody, err := client.call(peerRESTMethodGetAllBucketStats, values, nil, -1)
+	if err != nil {
+		return nil, err
+	}
+
+	bsMap := BucketStatsMap{}
+	defer http.DrainBody(respBody)
+	return bsMap, msgp.Decode(respBody, &bsMap)
 }
 
 // LoadBucketMetadata - load bucket metadata
@@ -688,9 +432,10 @@ func (client *peerRESTClient) ServerUpdate(ctx context.Context, u *url.URL, sha2
 }
 
 // SignalService - sends signal to peer nodes.
-func (client *peerRESTClient) SignalService(sig serviceSignal) error {
+func (client *peerRESTClient) SignalService(sig serviceSignal, subSys string) error {
 	values := make(url.Values)
 	values.Set(peerRESTSignal, strconv.Itoa(int(sig)))
+	values.Set(peerRESTSubSys, subSys)
 	respBody, err := client.call(peerRESTMethodSignalService, values, nil, -1)
 	if err != nil {
 		return err
@@ -903,43 +648,54 @@ func (client *peerRESTClient) Trace(traceCh chan interface{}, doneCh <-chan stru
 	}()
 }
 
+func (client *peerRESTClient) doConsoleLog(logCh chan interface{}, doneCh <-chan struct{}) {
+	// To cancel the REST request in case doneCh gets closed.
+	ctx, cancel := context.WithCancel(GlobalContext)
+
+	cancelCh := make(chan struct{})
+	defer close(cancelCh)
+	go func() {
+		select {
+		case <-doneCh:
+		case <-cancelCh:
+			// There was an error in the REST request.
+		}
+		cancel()
+	}()
+
+	respBody, err := client.callWithContext(ctx, peerRESTMethodLog, nil, nil, -1)
+	defer http.DrainBody(respBody)
+	if err != nil {
+		return
+	}
+
+	dec := gob.NewDecoder(respBody)
+	for {
+		var lg madmin.LogInfo
+		if err = dec.Decode(&lg); err != nil {
+			break
+		}
+		if lg.DeploymentID != "" {
+			select {
+			case logCh <- lg:
+			default:
+				// Do not block on slow receivers.
+			}
+		}
+	}
+}
+
 // ConsoleLog - sends request to peer nodes to get console logs
 func (client *peerRESTClient) ConsoleLog(logCh chan interface{}, doneCh <-chan struct{}) {
 	go func() {
 		for {
-			// get cancellation context to properly unsubscribe peers
-			ctx, cancel := context.WithCancel(GlobalContext)
-			respBody, err := client.callWithContext(ctx, peerRESTMethodLog, nil, nil, -1)
-			if err != nil {
-				// Retry the failed request.
-				time.Sleep(5 * time.Second)
-			} else {
-				dec := gob.NewDecoder(respBody)
-
-				go func() {
-					<-doneCh
-					cancel()
-				}()
-
-				for {
-					var log madmin.LogInfo
-					if err = dec.Decode(&log); err != nil {
-						break
-					}
-					select {
-					case logCh <- log:
-					default:
-					}
-				}
-			}
-
+			client.doConsoleLog(logCh, doneCh)
 			select {
 			case <-doneCh:
-				cancel()
-				http.DrainBody(respBody)
 				return
 			default:
-				// There was error in the REST request, retry.
+				// There was error in the REST request, retry after sometime as probably the peer is down.
+				time.Sleep(5 * time.Second)
 			}
 		}
 	}()
@@ -1039,7 +795,8 @@ func (client *peerRESTClient) GetPeerMetrics(ctx context.Context) (<-chan Metric
 }
 
 func (client *peerRESTClient) Speedtest(ctx context.Context, size,
-	concurrent int, duration time.Duration, storageClass string) (SpeedtestResult, error) {
+	concurrent int, duration time.Duration, storageClass string,
+) (SpeedtestResult, error) {
 	values := make(url.Values)
 	values.Set(peerRESTSize, strconv.Itoa(size))
 	values.Set(peerRESTConcurrent, strconv.Itoa(concurrent))
@@ -1105,7 +862,7 @@ func (client *peerRESTClient) ReloadSiteReplicationConfig(ctx context.Context) e
 	return nil
 }
 
-func (client *peerRESTClient) GetLastDayTierStats(ctx context.Context) (dailyAllTierStats, error) {
+func (client *peerRESTClient) GetLastDayTierStats(ctx context.Context) (DailyAllTierStats, error) {
 	var result map[string]lastDayTierStats
 	respBody, err := client.callWithContext(context.Background(), peerRESTMethodGetLastDayTierStats, nil, nil, -1)
 	if err != nil {
@@ -1115,9 +872,9 @@ func (client *peerRESTClient) GetLastDayTierStats(ctx context.Context) (dailyAll
 
 	err = gob.NewDecoder(respBody).Decode(&result)
 	if err != nil {
-		return dailyAllTierStats{}, err
+		return DailyAllTierStats{}, err
 	}
-	return dailyAllTierStats(result), nil
+	return DailyAllTierStats(result), nil
 }
 
 // DevNull - Used by netperf to pump data to peer

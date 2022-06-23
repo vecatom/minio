@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -37,12 +38,14 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/minio/madmin-go"
 	"github.com/minio/minio/internal/bucket/lifecycle"
+	"github.com/minio/minio/internal/bucket/object/lock"
 	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/config/heal"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/console"
+	uatomic "go.uber.org/atomic"
 )
 
 const (
@@ -64,9 +67,7 @@ var (
 	dataScannerLeaderLockTimeout = newDynamicTimeout(30*time.Second, 10*time.Second)
 	// Sleeper values are updated when config is loaded.
 	scannerSleeper = newDynamicSleeper(10, 10*time.Second)
-	scannerCycle   = &safeDuration{
-		t: dataScannerStartDelay,
-	}
+	scannerCycle   = uatomic.NewDuration(dataScannerStartDelay)
 )
 
 // initDataScanner will start the scanner in the background.
@@ -76,7 +77,7 @@ func initDataScanner(ctx context.Context, objAPI ObjectLayer) {
 		// Run the data scanner in a loop
 		for {
 			runDataScanner(ctx, objAPI)
-			duration := time.Duration(r.Float64() * float64(scannerCycle.Get()))
+			duration := time.Duration(r.Float64() * float64(scannerCycle.Load()))
 			if duration < time.Second {
 				// Make sure to sleep atleast a second to avoid high CPU ticks.
 				duration = time.Second
@@ -86,21 +87,61 @@ func initDataScanner(ctx context.Context, objAPI ObjectLayer) {
 	}()
 }
 
-type safeDuration struct {
-	sync.Mutex
-	t time.Duration
+func getCycleScanMode(currentCycle, bitrotStartCycle uint64, bitrotStartTime time.Time) madmin.HealScanMode {
+	bitrotCycle := globalHealConfig.BitrotScanCycle()
+	switch bitrotCycle {
+	case -1:
+		return madmin.HealNormalScan
+	case 0:
+		return madmin.HealDeepScan
+	}
+
+	if currentCycle-bitrotStartCycle < healObjectSelectProb {
+		return madmin.HealDeepScan
+	}
+
+	if time.Since(bitrotStartTime) > bitrotCycle {
+		return madmin.HealDeepScan
+	}
+
+	return madmin.HealNormalScan
 }
 
-func (s *safeDuration) Update(t time.Duration) {
-	s.Lock()
-	defer s.Unlock()
-	s.t = t
+type backgroundHealInfo struct {
+	BitrotStartTime  time.Time           `json:"bitrotStartTime"`
+	BitrotStartCycle uint64              `json:"bitrotStartCycle"`
+	CurrentScanMode  madmin.HealScanMode `json:"currentScanMode"`
 }
 
-func (s *safeDuration) Get() time.Duration {
-	s.Lock()
-	defer s.Unlock()
-	return s.t
+func readBackgroundHealInfo(ctx context.Context, objAPI ObjectLayer) backgroundHealInfo {
+	// Get last healing information
+	buf, err := readConfig(ctx, objAPI, backgroundHealInfoPath)
+	if err != nil {
+		if !errors.Is(err, errConfigNotFound) {
+			logger.LogIf(ctx, err)
+		}
+		return backgroundHealInfo{}
+	}
+	var info backgroundHealInfo
+	err = json.Unmarshal(buf, &info)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return backgroundHealInfo{}
+	}
+	return info
+}
+
+func saveBackgroundHealInfo(ctx context.Context, objAPI ObjectLayer, info backgroundHealInfo) {
+	b, err := json.Marshal(info)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return
+	}
+	// Get last healing information
+	err = saveConfig(ctx, objAPI, backgroundHealInfoPath, b)
+	if err != nil {
+		logger.LogIf(ctx, err)
+	}
 }
 
 // runDataScanner will start a data scanner.
@@ -130,7 +171,7 @@ func runDataScanner(pctx context.Context, objAPI ObjectLayer) {
 		}
 	}
 
-	scannerTimer := time.NewTimer(scannerCycle.Get())
+	scannerTimer := time.NewTimer(scannerCycle.Load())
 	defer scannerTimer.Stop()
 
 	for {
@@ -138,11 +179,20 @@ func runDataScanner(pctx context.Context, objAPI ObjectLayer) {
 		case <-ctx.Done():
 			return
 		case <-scannerTimer.C:
-			// Reset the timer for next cycle.
-			scannerTimer.Reset(scannerCycle.Get())
-
 			if intDataUpdateTracker.debug {
 				console.Debugln("starting scanner cycle")
+			}
+
+			bgHealInfo := readBackgroundHealInfo(ctx, objAPI)
+			scanMode := getCycleScanMode(nextBloomCycle, bgHealInfo.BitrotStartCycle, bgHealInfo.BitrotStartTime)
+			if bgHealInfo.CurrentScanMode != scanMode {
+				newHealInfo := bgHealInfo
+				newHealInfo.CurrentScanMode = scanMode
+				if scanMode == madmin.HealDeepScan {
+					newHealInfo.BitrotStartTime = time.Now().UTC()
+					newHealInfo.BitrotStartCycle = nextBloomCycle
+				}
+				saveBackgroundHealInfo(ctx, objAPI, newHealInfo)
 			}
 
 			// Wait before starting next cycle and wait on startup.
@@ -150,7 +200,7 @@ func runDataScanner(pctx context.Context, objAPI ObjectLayer) {
 			go storeDataUsageInBackend(ctx, objAPI, results)
 			bf, err := globalNotificationSys.updateBloomFilter(ctx, nextBloomCycle)
 			logger.LogIf(ctx, err)
-			err = objAPI.NSScanner(ctx, bf, results, uint32(nextBloomCycle))
+			err = objAPI.NSScanner(ctx, bf, results, uint32(nextBloomCycle), scanMode)
 			logger.LogIf(ctx, err)
 			if err == nil {
 				// Store new cycle...
@@ -161,6 +211,9 @@ func runDataScanner(pctx context.Context, objAPI ObjectLayer) {
 					logger.LogIf(ctx, err)
 				}
 			}
+
+			// Reset the timer for next cycle.
+			scannerTimer.Reset(scannerCycle.Load())
 		}
 	}
 }
@@ -182,6 +235,7 @@ type folderScanner struct {
 	dataUsageScannerDebug bool
 	healFolderInclude     uint32 // Include a clean folder one in n cycles.
 	healObjectSelect      uint32 // Do a heal check on an object once every n cycles. Must divide into healFolderInclude
+	scanMode              madmin.HealScanMode
 
 	disks       []StorageAPI
 	disksQuorum int
@@ -250,7 +304,7 @@ var globalScannerStats scannerStats
 // The returned cache will always be valid, but may not be updated from the existing.
 // Before each operation sleepDuration is called which can be used to temporarily halt the scanner.
 // If the supplied context is canceled the function will return at the first chance.
-func scanDataFolder(ctx context.Context, poolIdx, setIdx int, basePath string, cache dataUsageCache, getSize getSizeFn) (dataUsageCache, error) {
+func scanDataFolder(ctx context.Context, poolIdx, setIdx int, basePath string, cache dataUsageCache, getSize getSizeFn, scanMode madmin.HealScanMode) (dataUsageCache, error) {
 	t := UTCNow()
 
 	logPrefix := color.Green("data-usage: ")
@@ -279,6 +333,7 @@ func scanDataFolder(ctx context.Context, poolIdx, setIdx int, basePath string, c
 		dataUsageScannerDebug: intDataUpdateTracker.debug,
 		healFolderInclude:     0,
 		healObjectSelect:      0,
+		scanMode:              scanMode,
 		updates:               cache.Info.updates,
 	}
 
@@ -482,12 +537,15 @@ func (f *folderScanner) scanFolder(ctx context.Context, folder cachedFolder, int
 				debug:       f.dataUsageScannerDebug,
 				lifeCycle:   activeLifeCycle,
 				replication: replicationCfg,
-				heal:        thisHash.modAlt(f.oldCache.Info.NextCycle/folder.objectHealProbDiv, f.healObjectSelect/folder.objectHealProbDiv) && globalIsErasure,
 			}
+
+			item.heal.enabled = thisHash.modAlt(f.oldCache.Info.NextCycle/folder.objectHealProbDiv, f.healObjectSelect/folder.objectHealProbDiv) && globalIsErasure
+			item.heal.bitrot = f.scanMode == madmin.HealDeepScan
+
 			// if the drive belongs to an erasure set
 			// that is already being healed, skip the
 			// healing attempt on this drive.
-			item.heal = item.heal && f.healObjectSelect > 0
+			item.heal.enabled = item.heal.enabled && f.healObjectSelect > 0
 
 			sz, err := f.getSize(item)
 			if err != nil {
@@ -821,8 +879,11 @@ type scannerItem struct {
 	replication replicationConfig
 	lifeCycle   *lifecycle.Lifecycle
 	Typ         fs.FileMode
-	heal        bool // Has the object been selected for heal check?
-	debug       bool
+	heal        struct {
+		enabled bool
+		bitrot  bool
+	} // Has the object been selected for heal check?
+	debug bool
 }
 
 type sizeSummary struct {
@@ -874,9 +935,13 @@ func (i *scannerItem) applyHealing(ctx context.Context, o ObjectLayer, oi Object
 			console.Debugf(applyActionsLogPrefix+" heal checking: %v/%v\n", i.bucket, i.objectPath())
 		}
 	}
+	scanMode := madmin.HealNormalScan
+	if i.heal.bitrot {
+		scanMode = madmin.HealDeepScan
+	}
 	healOpts := madmin.HealOpts{
 		Remove:   healDeleteDangling,
-		ScanMode: globalHealConfig.ScanMode(),
+		ScanMode: scanMode,
 	}
 	res, err := o.HealObject(ctx, i.bucket, i.objectPath(), oi.VersionID, healOpts)
 	if err != nil && !errors.Is(err, NotImplemented{}) {
@@ -901,20 +966,8 @@ func (i *scannerItem) applyLifecycle(ctx context.Context, o ObjectLayer, oi Obje
 
 	atomic.AddUint64(&globalScannerStats.ilmChecks, 1)
 	versionID := oi.VersionID
-	action := i.lifeCycle.ComputeAction(
-		lifecycle.ObjectOpts{
-			Name:             i.objectPath(),
-			UserTags:         oi.UserTags,
-			ModTime:          oi.ModTime,
-			VersionID:        oi.VersionID,
-			DeleteMarker:     oi.DeleteMarker,
-			IsLatest:         oi.IsLatest,
-			NumVersions:      oi.NumVersions,
-			SuccessorModTime: oi.SuccessorModTime,
-			RestoreOngoing:   oi.RestoreOngoing,
-			RestoreExpires:   oi.RestoreExpires,
-			TransitionStatus: oi.TransitionedObject.Status,
-		})
+	rCfg, _ := globalBucketObjectLockSys.Get(i.bucket)
+	action := evalActionFromLifecycle(ctx, *i.lifeCycle, rCfg, oi, false)
 	if i.debug {
 		if versionID != "" {
 			console.Debugf(applyActionsLogPrefix+" lifecycle: %q (version-id=%s), Initial scan: %v\n", i.objectPath(), versionID, action)
@@ -986,9 +1039,13 @@ func (i *scannerItem) applyNewerNoncurrentVersionLimit(ctx context.Context, _ Ob
 	fivs = fivs[:lim+1]
 
 	rcfg, _ := globalBucketObjectLockSys.Get(i.bucket)
+	vcfg, _ := globalBucketVersioningSys.Get(i.bucket)
+
+	versioned := vcfg != nil && vcfg.Versioned(i.objectPath())
+
 	toDel := make([]ObjectToDelete, 0, len(overflowVersions))
 	for _, fi := range overflowVersions {
-		obj := fi.ToObjectInfo(i.bucket, i.objectPath())
+		obj := fi.ToObjectInfo(i.bucket, i.objectPath(), versioned)
 		// skip versions with object locking enabled
 		if rcfg.LockEnabled && enforceRetentionForDeletion(ctx, obj) {
 			if i.debug {
@@ -1040,7 +1097,7 @@ func (i *scannerItem) applyActions(ctx context.Context, o ObjectLayer, oi Object
 	// from the current deployment, which means we don't have to call healing
 	// routine even if we are asked to do via heal flag.
 	if !applied {
-		if i.heal {
+		if i.heal.enabled {
 			size = i.applyHealing(ctx, o, oi)
 		}
 		// replicate only if lifecycle rules are not applied.
@@ -1049,7 +1106,7 @@ func (i *scannerItem) applyActions(ctx context.Context, o ObjectLayer, oi Object
 	return size
 }
 
-func evalActionFromLifecycle(ctx context.Context, lc lifecycle.Lifecycle, obj ObjectInfo, debug bool) (action lifecycle.Action) {
+func evalActionFromLifecycle(ctx context.Context, lc lifecycle.Lifecycle, lr lock.Retention, obj ObjectInfo, debug bool) (action lifecycle.Action) {
 	action = lc.ComputeAction(obj.ToLifecycleOpts())
 	if debug {
 		console.Debugf(applyActionsLogPrefix+" lifecycle: Secondary scan: %v\n", action)
@@ -1065,18 +1122,15 @@ func evalActionFromLifecycle(ctx context.Context, lc lifecycle.Lifecycle, obj Ob
 		if obj.VersionID == "" {
 			return lifecycle.NoneAction
 		}
-		if rcfg, _ := globalBucketObjectLockSys.Get(obj.Bucket); rcfg.LockEnabled {
-			locked := enforceRetentionForDeletion(ctx, obj)
-			if locked {
-				if debug {
-					if obj.VersionID != "" {
-						console.Debugf(applyActionsLogPrefix+" lifecycle: %s v(%s) is locked, not deleting\n", obj.Name, obj.VersionID)
-					} else {
-						console.Debugf(applyActionsLogPrefix+" lifecycle: %s is locked, not deleting\n", obj.Name)
-					}
+		if lr.LockEnabled && enforceRetentionForDeletion(ctx, obj) {
+			if debug {
+				if obj.VersionID != "" {
+					console.Debugf(applyActionsLogPrefix+" lifecycle: %s v(%s) is locked, not deleting\n", obj.Name, obj.VersionID)
+				} else {
+					console.Debugf(applyActionsLogPrefix+" lifecycle: %s is locked, not deleting\n", obj.Name)
 				}
-				return lifecycle.NoneAction
 			}
+			return lifecycle.NoneAction
 		}
 	}
 
@@ -1116,7 +1170,8 @@ func applyExpiryOnNonTransitionedObjects(ctx context.Context, objLayer ObjectLay
 		opts.VersionID = obj.VersionID
 	}
 	if opts.VersionID == "" {
-		opts.Versioned = globalBucketVersioningSys.Enabled(obj.Bucket)
+		opts.Versioned = globalBucketVersioningSys.PrefixEnabled(obj.Bucket, obj.Name)
+		opts.VersionSuspended = globalBucketVersioningSys.PrefixSuspended(obj.Bucket, obj.Name)
 	}
 
 	obj, err := objLayer.DeleteObject(ctx, obj.Bucket, obj.Name, opts)
@@ -1175,6 +1230,9 @@ func (i *scannerItem) objectPath() string {
 // healReplication will heal a scanned item that has failed replication.
 func (i *scannerItem) healReplication(ctx context.Context, o ObjectLayer, oi ObjectInfo, sizeS *sizeSummary) {
 	roi := getHealReplicateObjectInfo(oi, i.replication)
+	if !roi.Dsc.ReplicateAny() {
+		return
+	}
 
 	if oi.DeleteMarker || !oi.VersionPurgeStatus.Empty() {
 		// heal delete marker replication failure or versioned delete replication failure
@@ -1195,32 +1253,31 @@ func (i *scannerItem) healReplication(ctx context.Context, o ObjectLayer, oi Obj
 		roi.OpType = replication.ExistingObjectReplicationType
 	}
 
-	if roi.TargetStatuses != nil {
-		if sizeS.replTargetStats == nil {
-			sizeS.replTargetStats = make(map[string]replTargetSizeSummary)
+	if sizeS.replTargetStats == nil && len(roi.TargetStatuses) > 0 {
+		sizeS.replTargetStats = make(map[string]replTargetSizeSummary)
+	}
+
+	for arn, tgtStatus := range roi.TargetStatuses {
+		tgtSizeS, ok := sizeS.replTargetStats[arn]
+		if !ok {
+			tgtSizeS = replTargetSizeSummary{}
 		}
-		for arn, tgtStatus := range roi.TargetStatuses {
-			tgtSizeS, ok := sizeS.replTargetStats[arn]
-			if !ok {
-				tgtSizeS = replTargetSizeSummary{}
-			}
-			switch tgtStatus {
-			case replication.Pending:
-				tgtSizeS.pendingCount++
-				tgtSizeS.pendingSize += oi.Size
-				sizeS.pendingCount++
-				sizeS.pendingSize += oi.Size
-			case replication.Failed:
-				tgtSizeS.failedSize += oi.Size
-				tgtSizeS.failedCount++
-				sizeS.failedSize += oi.Size
-				sizeS.failedCount++
-			case replication.Completed, "COMPLETE":
-				tgtSizeS.replicatedSize += oi.Size
-				sizeS.replicatedSize += oi.Size
-			}
-			sizeS.replTargetStats[arn] = tgtSizeS
+		switch tgtStatus {
+		case replication.Pending:
+			tgtSizeS.pendingCount++
+			tgtSizeS.pendingSize += oi.Size
+			sizeS.pendingCount++
+			sizeS.pendingSize += oi.Size
+		case replication.Failed:
+			tgtSizeS.failedSize += oi.Size
+			tgtSizeS.failedCount++
+			sizeS.failedSize += oi.Size
+			sizeS.failedCount++
+		case replication.Completed, replication.CompletedLegacy:
+			tgtSizeS.replicatedSize += oi.Size
+			sizeS.replicatedSize += oi.Size
 		}
+		sizeS.replTargetStats[arn] = tgtSizeS
 	}
 
 	switch oi.ReplicationStatus {

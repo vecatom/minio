@@ -33,6 +33,7 @@ import (
 	"github.com/minio/madmin-go"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/internal/bucket/lifecycle"
+	"github.com/minio/minio/internal/bucket/object/lock"
 	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/event"
 	"github.com/minio/minio/internal/hash"
@@ -62,6 +63,8 @@ func countOnlineDisks(onlineDisks []StorageAPI) (online int) {
 // if source object and destination object are same we only
 // update metadata.
 func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, dstBucket, dstObject string, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (oi ObjectInfo, err error) {
+	auditObjectErasureSet(ctx, dstObject, &er)
+
 	// This call shouldn't be used for anything other than metadata updates or adding self referential versions.
 	if !srcInfo.metadataOnly {
 		return oi, NotImplemented{}
@@ -80,12 +83,26 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 	}
 	// Read metadata associated with the object from all disks.
 	storageDisks := er.getDisks()
-	metaArr, errs := readAllFileInfo(ctx, storageDisks, srcBucket, srcObject, srcOpts.VersionID, true)
 
-	// get Quorum for this object
+	var metaArr []FileInfo
+	var errs []error
+
+	// Read metadata associated with the object from all disks.
+	if srcOpts.VersionID != "" {
+		metaArr, errs = readAllFileInfo(ctx, storageDisks, srcBucket, srcObject, srcOpts.VersionID, true)
+	} else {
+		metaArr, errs = readAllXL(ctx, storageDisks, srcBucket, srcObject, true)
+	}
+
 	readQuorum, writeQuorum, err := objectQuorumFromMeta(ctx, metaArr, errs, er.defaultParityCount)
 	if err != nil {
-		return oi, toObjectErr(err, srcBucket, srcObject)
+		if errors.Is(err, errErasureReadQuorum) && !strings.HasPrefix(srcBucket, minioMetaBucket) {
+			_, derr := er.deleteIfDangling(ctx, srcBucket, srcObject, metaArr, errs, nil, srcOpts)
+			if derr != nil {
+				err = derr
+			}
+		}
+		return ObjectInfo{}, toObjectErr(err, srcBucket, srcObject)
 	}
 
 	// List all online disks.
@@ -100,7 +117,7 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 		if srcOpts.VersionID == "" {
 			return oi, toObjectErr(errFileNotFound, srcBucket, srcObject)
 		}
-		return fi.ToObjectInfo(srcBucket, srcObject), toObjectErr(errMethodNotAllowed, srcBucket, srcObject)
+		return fi.ToObjectInfo(srcBucket, srcObject, srcOpts.Versioned || srcOpts.VersionSuspended), toObjectErr(errMethodNotAllowed, srcBucket, srcObject)
 	}
 
 	filterOnlineDisksInplace(fi, metaArr, onlineDisks)
@@ -111,9 +128,11 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 		// preserve destination versionId if specified.
 		if versionID == "" {
 			versionID = mustGetUUID()
+			fi.IsLatest = true // we are creating a new version so this is latest.
 		}
 		modTime = UTCNow()
 	}
+
 	fi.VersionID = versionID // set any new versionID we might have created
 	fi.ModTime = modTime     // set modTime for the new versionID
 	if !dstOpts.MTime.IsZero() {
@@ -123,12 +142,34 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 	fi.Metadata = srcInfo.UserDefined
 	srcInfo.UserDefined["etag"] = srcInfo.ETag
 
+	inlineData := fi.InlineData()
+	freeVersionID := fi.TierFreeVersionID()
+	freeVersionMarker := fi.TierFreeVersion()
+
 	// Update `xl.meta` content on each disks.
 	for index := range metaArr {
 		if metaArr[index].IsValid() {
 			metaArr[index].ModTime = modTime
 			metaArr[index].VersionID = versionID
+			if !metaArr[index].InlineData() {
+				// If the data is not inlined, we may end up incorrectly
+				// inlining the data here, that leads to an inconsistent
+				// situation where some objects are were not inlined
+				// were now inlined, make sure to `nil` the Data such
+				// that xl.meta is written as expected.
+				metaArr[index].Data = nil
+			}
 			metaArr[index].Metadata = srcInfo.UserDefined
+			// Preserve existing values
+			if inlineData {
+				metaArr[index].SetInlineData()
+			}
+			if freeVersionID != "" {
+				metaArr[index].SetTierFreeVersionID(freeVersionID)
+			}
+			if freeVersionMarker {
+				metaArr[index].SetTierFreeVersion()
+			}
 		}
 	}
 
@@ -137,14 +178,14 @@ func (er erasureObjects) CopyObject(ctx context.Context, srcBucket, srcObject, d
 		return oi, toObjectErr(err, srcBucket, srcObject)
 	}
 
-	// we are adding a new version to this object under the namespace lock, so this is the latest version.
-	fi.IsLatest = true
-	return fi.ToObjectInfo(srcBucket, srcObject), nil
+	return fi.ToObjectInfo(srcBucket, srcObject, srcOpts.Versioned || srcOpts.VersionSuspended), nil
 }
 
 // GetObjectNInfo - returns object info and an object
 // Read(Closer). When err != nil, the returned reader is always nil.
 func (er erasureObjects) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (gr *GetObjectReader, err error) {
+	auditObjectErasureSet(ctx, object, &er)
+
 	var unlockOnDefer bool
 	nsUnlocker := func() {}
 	defer func() {
@@ -204,7 +245,7 @@ func (er erasureObjects) GetObjectNInfo(ctx context.Context, bucket, object stri
 		}
 	}
 
-	objInfo := fi.ToObjectInfo(bucket, object)
+	objInfo := fi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
 	if objInfo.DeleteMarker {
 		if opts.VersionID == "" {
 			return &GetObjectReader{
@@ -381,6 +422,8 @@ func (er erasureObjects) getObjectWithFileInfo(ctx context.Context, bucket, obje
 
 // GetObjectInfo - reads object metadata and replies back ObjectInfo.
 func (er erasureObjects) GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (info ObjectInfo, err error) {
+	auditObjectErasureSet(ctx, object, &er)
+
 	if !opts.NoLock {
 		// Lock the object before reading.
 		lk := er.NewNSLock(bucket, object)
@@ -418,11 +461,118 @@ func (er erasureObjects) deleteIfDangling(ctx context.Context, bucket, object st
 	return m, err
 }
 
+func readAllXL(ctx context.Context, disks []StorageAPI, bucket, object string, readData bool) ([]FileInfo, []error) {
+	metadataArray := make([]*xlMetaV2, len(disks))
+	metaFileInfos := make([]FileInfo, len(metadataArray))
+	metadataShallowVersions := make([][]xlMetaV2ShallowVersion, len(disks))
+
+	g := errgroup.WithNErrs(len(disks))
+	// Read `xl.meta` in parallel across disks.
+	for index := range disks {
+		index := index
+		g.Go(func() (err error) {
+			if disks[index] == nil {
+				return errDiskNotFound
+			}
+			rf, err := disks[index].ReadXL(ctx, bucket, object, readData)
+			if err != nil {
+				return err
+			}
+
+			var xl xlMetaV2
+			if err = xl.LoadOrConvert(rf.Buf); err != nil {
+				return err
+			}
+			metadataArray[index] = &xl
+			metaFileInfos[index] = FileInfo{
+				DiskMTime: rf.DiskMTime,
+			}
+			return nil
+		}, index)
+	}
+
+	errs := g.Wait()
+	for index, err := range errs {
+		if err == nil {
+			continue
+		}
+		if !IsErr(err, []error{
+			errFileNotFound,
+			errVolumeNotFound,
+			errFileVersionNotFound,
+			errDiskNotFound,
+		}...) {
+			logger.LogOnceIf(ctx, fmt.Errorf("Drive %s, path (%s/%s) returned an error (%w)",
+				disks[index], bucket, object, err),
+				disks[index].String())
+		}
+	}
+
+	for index := range metadataArray {
+		if metadataArray[index] != nil {
+			metadataShallowVersions[index] = metadataArray[index].versions
+		}
+	}
+
+	readQuorum := (len(disks) + 1) / 2
+	meta := &xlMetaV2{versions: mergeXLV2Versions(readQuorum, false, 1, metadataShallowVersions...)}
+	lfi, err := meta.ToFileInfo(bucket, object, "")
+	if err != nil {
+		for i := range errs {
+			if errs[i] == nil {
+				errs[i] = err
+			}
+		}
+		return metaFileInfos, errs
+	}
+	if !lfi.IsValid() {
+		for i := range errs {
+			if errs[i] == nil {
+				errs[i] = errCorruptedFormat
+			}
+		}
+		return metaFileInfos, errs
+	}
+
+	for index := range metadataArray {
+		if metadataArray[index] == nil {
+			continue
+		}
+
+		// make sure to preserve this for diskmtime based healing bugfix.
+		diskMTime := metaFileInfos[index].DiskMTime
+		metaFileInfos[index], errs[index] = metadataArray[index].ToFileInfo(bucket, object, "")
+		if errs[index] != nil {
+			continue
+		}
+
+		if metaFileInfos[index].IsValid() && metaFileInfos[index].ModTime.Equal(lfi.ModTime) {
+			versionID := metaFileInfos[index].VersionID
+			if versionID == "" {
+				versionID = nullVersionID
+			}
+			if readData {
+				metaFileInfos[index].Data = metadataArray[index].data.find(versionID)
+			}
+			metaFileInfos[index].DiskMTime = diskMTime
+		}
+	}
+
+	// Return all the metadata.
+	return metaFileInfos, errs
+}
+
 func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object string, opts ObjectOptions, readData bool) (fi FileInfo, metaArr []FileInfo, onlineDisks []StorageAPI, err error) {
 	disks := er.getDisks()
 
+	var errs []error
+
 	// Read metadata associated with the object from all disks.
-	metaArr, errs := readAllFileInfo(ctx, disks, bucket, object, opts.VersionID, readData)
+	if opts.VersionID != "" {
+		metaArr, errs = readAllFileInfo(ctx, disks, bucket, object, opts.VersionID, readData)
+	} else {
+		metaArr, errs = readAllXL(ctx, disks, bucket, object, readData)
+	}
 
 	readQuorum, _, err := objectQuorumFromMeta(ctx, metaArr, errs, er.defaultParityCount)
 	if err != nil {
@@ -471,6 +621,8 @@ func (er erasureObjects) getObjectFileInfo(ctx context.Context, bucket, object s
 		if metaArr[i].IsValid() && metaArr[i].ModTime.Equal(fi.ModTime) {
 			continue
 		}
+		metaArr[i] = FileInfo{}
+		onlineDisks[i] = nil
 		missingBlocks++
 	}
 
@@ -492,7 +644,7 @@ func (er erasureObjects) getObjectInfo(ctx context.Context, bucket, object strin
 	if err != nil {
 		return objInfo, toObjectErr(err, bucket, object)
 	}
-	objInfo = fi.ToObjectInfo(bucket, object)
+	objInfo = fi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
 	if fi.Deleted {
 		if opts.VersionID == "" || opts.DeleteMarker {
 			return objInfo, toObjectErr(errFileNotFound, bucket, object)
@@ -516,7 +668,7 @@ func (er erasureObjects) getObjectInfoAndQuorum(ctx context.Context, bucket, obj
 		wquorum++
 	}
 
-	objInfo = fi.ToObjectInfo(bucket, object)
+	objInfo = fi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
 	if !fi.VersionPurgeStatus().Empty() && opts.VersionID != "" {
 		// Make sure to return object info to provide extra information.
 		return objInfo, wquorum, toObjectErr(errMethodNotAllowed, bucket, object)
@@ -708,7 +860,7 @@ func (er erasureObjects) putMetacacheObject(ctx context.Context, key string, r *
 		return ObjectInfo{}, toObjectErr(err, minioMetaBucket, key)
 	}
 
-	return fi.ToObjectInfo(minioMetaBucket, key), nil
+	return fi.ToObjectInfo(minioMetaBucket, key, opts.Versioned || opts.VersionSuspended), nil
 }
 
 // PutObject - creates an object upon reading from the input stream
@@ -721,19 +873,18 @@ func (er erasureObjects) PutObject(ctx context.Context, bucket string, object st
 
 // putObject wrapper for erasureObjects PutObject
 func (er erasureObjects) putObject(ctx context.Context, bucket string, object string, r *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error) {
+	auditObjectErasureSet(ctx, object, &er)
+
 	data := r.Reader
 
-	// No metadata is set, allocate a new one.
-	if opts.UserDefined == nil {
-		opts.UserDefined = make(map[string]string)
-	}
+	userDefined := cloneMSS(opts.UserDefined)
 
 	storageDisks := er.getDisks()
 
 	parityDrives := len(storageDisks) / 2
 	if !opts.MaxParity {
 		// Get parity and data drive count based on storage class metadata
-		parityDrives = globalStorageClass.GetParityForSC(opts.UserDefined[xhttp.AmzStorageClass])
+		parityDrives = globalStorageClass.GetParityForSC(userDefined[xhttp.AmzStorageClass])
 		if parityDrives <= 0 {
 			parityDrives = er.defaultParityCount
 		}
@@ -771,7 +922,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 			parityDrives = len(storageDisks) / 2
 		}
 		if parityOrig != parityDrives {
-			opts.UserDefined[minIOErasureUpgraded] = strconv.Itoa(parityOrig) + "->" + strconv.Itoa(parityDrives)
+			userDefined[minIOErasureUpgraded] = strconv.Itoa(parityOrig) + "->" + strconv.Itoa(parityDrives)
 		}
 	}
 	dataDrives := len(storageDisks) - parityDrives
@@ -947,13 +1098,13 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 			Hash:       bitrotWriterSum(w),
 		})
 	}
-	if opts.UserDefined["etag"] == "" {
-		opts.UserDefined["etag"] = r.MD5CurrentHexString()
+	if userDefined["etag"] == "" {
+		userDefined["etag"] = r.MD5CurrentHexString()
 	}
 
 	// Guess content-type from the extension if possible.
-	if opts.UserDefined["content-type"] == "" {
-		opts.UserDefined["content-type"] = mimedb.TypeByExtension(path.Ext(object))
+	if userDefined["content-type"] == "" {
+		userDefined["content-type"] = mimedb.TypeByExtension(path.Ext(object))
 	}
 
 	modTime := opts.MTime
@@ -964,7 +1115,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	// Fill all the necessary metadata.
 	// Update `xl.meta` content on each disks.
 	for index := range partsMetadata {
-		partsMetadata[index].Metadata = opts.UserDefined
+		partsMetadata[index].Metadata = userDefined
 		partsMetadata[index].Size = n
 		partsMetadata[index].ModTime = modTime
 	}
@@ -1014,7 +1165,7 @@ func (er erasureObjects) putObject(ctx context.Context, bucket string, object st
 	// we are adding a new version to this object under the namespace lock, so this is the latest version.
 	fi.IsLatest = true
 
-	return fi.ToObjectInfo(bucket, object), nil
+	return fi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended), nil
 }
 
 func (er erasureObjects) deleteObjectVersion(ctx context.Context, bucket, object string, writeQuorum int, fi FileInfo, forceDelMarker bool) error {
@@ -1037,6 +1188,10 @@ func (er erasureObjects) deleteObjectVersion(ctx context.Context, bucket, object
 // into smaller bulks if some object names are found to be duplicated in the delete list, splitting
 // into smaller bulks will avoid holding twice the write lock of the duplicated object names.
 func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objects []ObjectToDelete, opts ObjectOptions) ([]DeletedObject, []error) {
+	for _, obj := range objects {
+		auditObjectErasureSet(ctx, obj.ObjectV.ObjectName, &er)
+	}
+
 	errs := make([]error, len(objects))
 	dobjects := make([]DeletedObject, len(objects))
 	writeQuorums := make([]int, len(objects))
@@ -1067,7 +1222,13 @@ func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objec
 		// VersionID is not set means delete is not specific about
 		// any version, look for if the bucket is versioned or not.
 		if objects[i].VersionID == "" {
-			if opts.Versioned || opts.VersionSuspended {
+			// MinIO extension to bucket version configuration
+			suspended := opts.VersionSuspended
+			versioned := opts.Versioned
+			if opts.PrefixEnabledFn != nil {
+				versioned = opts.PrefixEnabledFn(objects[i].ObjectName)
+			}
+			if versioned || suspended {
 				// Bucket is versioned and no version was explicitly
 				// mentioned for deletes, create a delete marker instead.
 				vr.ModTime = UTCNow()
@@ -1075,7 +1236,7 @@ func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objec
 				// Versioning suspended means that we add a `null` version
 				// delete marker, if not add a new version for this delete
 				// marker.
-				if opts.Versioned {
+				if versioned {
 					vr.VersionID = mustGetUUID()
 				}
 			}
@@ -1196,12 +1357,17 @@ func (er erasureObjects) DeleteObjects(ctx context.Context, bucket string, objec
 func (er erasureObjects) deletePrefix(ctx context.Context, bucket, prefix string) error {
 	disks := er.getDisks()
 	g := errgroup.WithNErrs(len(disks))
+	dirPrefix := encodeDirObject(prefix)
 	for index := range disks {
 		index := index
 		g.Go(func() error {
 			if disks[index] == nil {
 				return nil
 			}
+			// Deletes
+			// - The prefix and its children
+			// - The prefix__XLDIR__
+			defer disks[index].Delete(ctx, bucket, dirPrefix, true)
 			return disks[index].Delete(ctx, bucket, prefix, true)
 		}, index)
 	}
@@ -1217,14 +1383,18 @@ func (er erasureObjects) deletePrefix(ctx context.Context, bucket, prefix string
 // any error as it is not necessary for the handler to reply back a
 // response to the client request.
 func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error) {
+	auditObjectErasureSet(ctx, object, &er)
+
 	if opts.DeletePrefix {
 		return ObjectInfo{}, toObjectErr(er.deletePrefix(ctx, bucket, object), bucket, object)
 	}
 
 	var lc *lifecycle.Lifecycle
+	var rcfg lock.Retention
 	if opts.Expiration.Expire {
 		// Check if the current bucket has a configured lifecycle policy
 		lc, _ = globalLifecycleSys.Get(bucket)
+		rcfg, _ = globalBucketObjectLockSys.Get(bucket)
 	}
 
 	// expiration attempted on a bucket with no lifecycle
@@ -1269,7 +1439,7 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 	}
 
 	if opts.Expiration.Expire {
-		action := evalActionFromLifecycle(ctx, *lc, goi, false)
+		action := evalActionFromLifecycle(ctx, *lc, rcfg, goi, false)
 		var isErr bool
 		switch action {
 		case lifecycle.NoneAction:
@@ -1316,10 +1486,21 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 		if opts.VersionPurgeStatus() == Complete {
 			markDelete = false
 		}
-		// determine if the version represents an object delete
-		// deleteMarker = true
-		if versionFound && !goi.DeleteMarker { // implies a versioned delete of object
-			deleteMarker = false
+
+		// Version is found but we do not wish to create more delete markers
+		// now, since VersionPurgeStatus() is already set, we can let the
+		// lower layers decide this. This fixes a regression that was introduced
+		// in PR #14555 where !VersionPurgeStatus.Empty() is automatically
+		// considered as Delete marker true to avoid listing such objects by
+		// regular ListObjects() calls. However for delete replication this
+		// ends up being a problem because "upon" a successful delete this
+		// ends up creating a new delete marker that is spurious and unnecessary.
+		if versionFound {
+			if !goi.VersionPurgeStatus.Empty() {
+				deleteMarker = false
+			} else if !goi.DeleteMarker { // implies a versioned delete of object
+				deleteMarker = false
+			}
 		}
 	}
 
@@ -1358,7 +1539,7 @@ func (er erasureObjects) DeleteObject(ctx context.Context, bucket, object string
 			if err = er.deleteObjectVersion(ctx, bucket, object, writeQuorum, fi, opts.DeleteMarker); err != nil {
 				return objInfo, toObjectErr(err, bucket, object)
 			}
-			return fi.ToObjectInfo(bucket, object), nil
+			return fi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended), nil
 		}
 	}
 
@@ -1422,11 +1603,24 @@ func (er erasureObjects) PutObjectMetadata(ctx context.Context, bucket, object s
 
 	disks := er.getDisks()
 
+	var metaArr []FileInfo
+	var errs []error
+
 	// Read metadata associated with the object from all disks.
-	metaArr, errs := readAllFileInfo(ctx, disks, bucket, object, opts.VersionID, false)
+	if opts.VersionID != "" {
+		metaArr, errs = readAllFileInfo(ctx, disks, bucket, object, opts.VersionID, false)
+	} else {
+		metaArr, errs = readAllXL(ctx, disks, bucket, object, false)
+	}
 
 	readQuorum, _, err := objectQuorumFromMeta(ctx, metaArr, errs, er.defaultParityCount)
 	if err != nil {
+		if errors.Is(err, errErasureReadQuorum) && !strings.HasPrefix(bucket, minioMetaBucket) {
+			_, derr := er.deleteIfDangling(ctx, bucket, object, metaArr, errs, nil, opts)
+			if derr != nil {
+				err = derr
+			}
+		}
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
@@ -1450,7 +1644,7 @@ func (er erasureObjects) PutObjectMetadata(ctx context.Context, bucket, object s
 		opts.VersionID = fi.VersionID
 	}
 
-	objInfo := fi.ToObjectInfo(bucket, object)
+	objInfo := fi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
 	if opts.EvalMetadataFn != nil {
 		if err := opts.EvalMetadataFn(objInfo); err != nil {
 			return ObjectInfo{}, err
@@ -1466,7 +1660,7 @@ func (er erasureObjects) PutObjectMetadata(ctx context.Context, bucket, object s
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
-	return fi.ToObjectInfo(bucket, object), nil
+	return fi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended), nil
 }
 
 // PutObjectTags - replace or add tags to an existing object
@@ -1482,11 +1676,24 @@ func (er erasureObjects) PutObjectTags(ctx context.Context, bucket, object strin
 
 	disks := er.getDisks()
 
+	var metaArr []FileInfo
+	var errs []error
+
 	// Read metadata associated with the object from all disks.
-	metaArr, errs := readAllFileInfo(ctx, disks, bucket, object, opts.VersionID, false)
+	if opts.VersionID != "" {
+		metaArr, errs = readAllFileInfo(ctx, disks, bucket, object, opts.VersionID, false)
+	} else {
+		metaArr, errs = readAllXL(ctx, disks, bucket, object, false)
+	}
 
 	readQuorum, _, err := objectQuorumFromMeta(ctx, metaArr, errs, er.defaultParityCount)
 	if err != nil {
+		if errors.Is(err, errErasureReadQuorum) && !strings.HasPrefix(bucket, minioMetaBucket) {
+			_, derr := er.deleteIfDangling(ctx, bucket, object, metaArr, errs, nil, opts)
+			if derr != nil {
+				err = derr
+			}
+		}
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
@@ -1517,7 +1724,7 @@ func (er erasureObjects) PutObjectTags(ctx context.Context, bucket, object strin
 		return ObjectInfo{}, toObjectErr(err, bucket, object)
 	}
 
-	return fi.ToObjectInfo(bucket, object), nil
+	return fi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended), nil
 }
 
 // updateObjectMeta will update the metadata of a file.
@@ -1655,7 +1862,7 @@ func (er erasureObjects) TransitionObject(ctx context.Context, bucket, object st
 		break
 	}
 
-	objInfo := fi.ToObjectInfo(bucket, object)
+	objInfo := fi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
 	sendEvent(eventArgs{
 		EventName:  eventName,
 		BucketName: bucket,
@@ -1710,7 +1917,7 @@ func (er erasureObjects) restoreTransitionedObject(ctx context.Context, bucket s
 		return setRestoreHeaderFn(oi, toObjectErr(err, bucket, object))
 	}
 
-	oi = actualfi.ToObjectInfo(bucket, object)
+	oi = actualfi.ToObjectInfo(bucket, object, opts.Versioned || opts.VersionSuspended)
 	ropts := putRestoreOpts(bucket, object, opts.Transition.RestoreRequest, oi)
 	if len(oi.Parts) == 1 {
 		var rs *HTTPRangeSpec

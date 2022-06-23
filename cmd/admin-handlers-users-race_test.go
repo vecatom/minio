@@ -26,6 +26,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -41,11 +42,15 @@ func runAllIAMConcurrencyTests(suite *TestSuiteIAM, c *check) {
 }
 
 func TestIAMInternalIDPConcurrencyServerSuite(t *testing.T) {
+	if runtime.GOOS == globalWindowsOSName {
+		t.Skip("windows is clunky")
+	}
+
 	baseTestCases := []TestSuiteCommon{
-		// Init and run test on FS backend with signature v4.
-		{serverType: "FS", signer: signerV4},
-		// Init and run test on FS backend, with tls enabled.
-		{serverType: "FS", signer: signerV4, secure: true},
+		// Init and run test on ErasureSD backend with signature v4.
+		{serverType: "ErasureSD", signer: signerV4},
+		// Init and run test on ErasureSD backend, with tls enabled.
+		{serverType: "ErasureSD", signer: signerV4, secure: true},
 		// Init and run test on Erasure backend.
 		{serverType: "Erasure", signer: signerV4},
 		// Init and run test on ErasureSet backend.
@@ -73,7 +78,7 @@ func TestIAMInternalIDPConcurrencyServerSuite(t *testing.T) {
 }
 
 func (s *TestSuiteIAM) TestDeleteUserRace(c *check) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	bucket := getRandomBucketName()

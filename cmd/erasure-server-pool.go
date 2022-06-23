@@ -27,12 +27,14 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/minio/madmin-go"
 	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio-go/v7/pkg/tags"
+	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/config/storageclass"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/sync/errgroup"
@@ -59,6 +61,22 @@ func (z *erasureServerPools) SinglePool() bool {
 
 // Initialize new pool of erasure sets.
 func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServerPools) (ObjectLayer, error) {
+	if endpointServerPools.NEndpoints() == 1 {
+		ep := endpointServerPools[0]
+		storageDisks, format, err := waitForFormatErasure(true, ep.Endpoints, 1, ep.SetCount, ep.DrivesPerSet, "", "")
+		if err != nil {
+			return nil, err
+		}
+
+		objLayer, err := newErasureSingle(ctx, storageDisks[0], format)
+		if err != nil {
+			return nil, err
+		}
+
+		globalLocalDrives = storageDisks
+		return objLayer, nil
+	}
+
 	var (
 		deploymentID       string
 		distributionAlgo   string
@@ -128,7 +146,9 @@ func newErasureServerPools(ctx context.Context, endpointServerPools EndpointServ
 			if !configRetriableErrors(err) {
 				logger.Fatal(err, "Unable to initialize backend")
 			}
-			time.Sleep(time.Duration(r.Float64() * float64(5*time.Second)))
+			retry := time.Duration(r.Float64() * float64(5*time.Second))
+			logger.LogIf(ctx, fmt.Errorf("Unable to initialize backend: %w, retrying in %s", err, retry))
+			time.Sleep(retry)
 			continue
 		}
 		break
@@ -229,8 +249,9 @@ func (z *erasureServerPools) SetDriveCounts() []int {
 type serverPoolsAvailableSpace []poolAvailableSpace
 
 type poolAvailableSpace struct {
-	Index     int
-	Available uint64
+	Index      int
+	Available  uint64
+	MaxUsedPct int // Used disk percentage of most filled disk, rounded down.
 }
 
 // TotalAvailable - total available space
@@ -242,10 +263,41 @@ func (p serverPoolsAvailableSpace) TotalAvailable() uint64 {
 	return total
 }
 
+// FilterMaxUsed will filter out any pools that has used percent bigger than max,
+// unless all have that, in which case all are preserved.
+func (p serverPoolsAvailableSpace) FilterMaxUsed(max int) {
+	// We aren't modifying p, only entries in it, so we don't need to receive a pointer.
+	if len(p) <= 1 {
+		// Nothing to do.
+		return
+	}
+	var ok bool
+	for _, z := range p {
+		if z.MaxUsedPct < max {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		// All above limit.
+		// Do not modify
+		return
+	}
+
+	// Remove entries that are above.
+	for i, z := range p {
+		if z.MaxUsedPct < max {
+			continue
+		}
+		p[i].Available = 0
+	}
+}
+
 // getAvailablePoolIdx will return an index that can hold size bytes.
 // -1 is returned if no serverPools have available space for the size given.
 func (z *erasureServerPools) getAvailablePoolIdx(ctx context.Context, bucket, object string, size int64) int {
 	serverPools := z.getServerPoolsAvailableSpace(ctx, bucket, object, size)
+	serverPools.FilterMaxUsed(100 - (100 * diskReserveFraction))
 	total := serverPools.TotalAvailable()
 	if total == 0 {
 		return -1
@@ -266,11 +318,13 @@ func (z *erasureServerPools) getAvailablePoolIdx(ctx context.Context, bucket, ob
 
 // getServerPoolsAvailableSpace will return the available space of each pool after storing the content.
 // If there is not enough space the pool will return 0 bytes available.
+// The size of each will be multiplied by the number of sets.
 // Negative sizes are seen as 0 bytes.
 func (z *erasureServerPools) getServerPoolsAvailableSpace(ctx context.Context, bucket, object string, size int64) serverPoolsAvailableSpace {
 	serverPools := make(serverPoolsAvailableSpace, len(z.serverPools))
 
 	storageInfos := make([][]*DiskInfo, len(z.serverPools))
+	nSets := make([]int, len(z.serverPools))
 	g := errgroup.WithNErrs(len(z.serverPools))
 	for index := range z.serverPools {
 		index := index
@@ -278,9 +332,11 @@ func (z *erasureServerPools) getServerPoolsAvailableSpace(ctx context.Context, b
 		if z.IsSuspended(index) {
 			continue
 		}
+		pool := z.serverPools[index]
+		nSets[index] = pool.setCount
 		g.Go(func() error {
 			// Get the set where it would be placed.
-			storageInfos[index] = getDiskInfos(ctx, z.serverPools[index].getHashedSet(object).getDisks())
+			storageInfos[index] = getDiskInfos(ctx, pool.getHashedSet(object).getDisks()...)
 			return nil
 		}, index)
 	}
@@ -294,15 +350,30 @@ func (z *erasureServerPools) getServerPoolsAvailableSpace(ctx context.Context, b
 			serverPools[i] = poolAvailableSpace{Index: i}
 			continue
 		}
+		var maxUsedPct int
 		for _, disk := range zinfo {
-			if disk == nil {
+			if disk == nil || disk.Total == 0 {
 				continue
 			}
 			available += disk.Total - disk.Used
+
+			// set maxUsedPct to the value from the disk with the least space percentage.
+			if pctUsed := int(disk.Used * 100 / disk.Total); pctUsed > maxUsedPct {
+				maxUsedPct = pctUsed
+			}
 		}
+
+		// Since we are comparing pools that may have a different number of sets
+		// we multiply by the number of sets in the pool.
+		// This will compensate for differences in set sizes
+		// when choosing destination pool.
+		// Different set sizes are already compensated by less disks.
+		available *= uint64(nSets[i])
+
 		serverPools[i] = poolAvailableSpace{
-			Index:     i,
-			Available: available,
+			Index:      i,
+			Available:  available,
+			MaxUsedPct: maxUsedPct,
 		}
 	}
 	return serverPools
@@ -528,7 +599,7 @@ func (z *erasureServerPools) StorageInfo(ctx context.Context) (StorageInfo, []er
 	return storageInfo, errs
 }
 
-func (z *erasureServerPools) NSScanner(ctx context.Context, bf *bloomFilter, updates chan<- DataUsageInfo, wantCycle uint32) error {
+func (z *erasureServerPools) NSScanner(ctx context.Context, bf *bloomFilter, updates chan<- DataUsageInfo, wantCycle uint32, healScanMode madmin.HealScanMode) error {
 	// Updates must be closed before we return.
 	defer close(updates)
 
@@ -573,7 +644,7 @@ func (z *erasureServerPools) NSScanner(ctx context.Context, bf *bloomFilter, upd
 					}
 				}()
 				// Start scanner. Blocks until done.
-				err := erObj.nsScanner(ctx, allBuckets, bf, wantCycle, updates)
+				err := erObj.nsScanner(ctx, allBuckets, bf, wantCycle, updates, healScanMode)
 				if err != nil {
 					logger.LogIf(ctx, err)
 					mu.Lock()
@@ -770,7 +841,16 @@ func (z *erasureServerPools) GetObjectNInfo(ctx context.Context, bucket, object 
 	}
 
 	lockType = noLock // do not take locks at lower levels for GetObjectNInfo()
-	return z.serverPools[zIdx].GetObjectNInfo(ctx, bucket, object, rs, h, lockType, opts)
+	gr, err = z.serverPools[zIdx].GetObjectNInfo(ctx, bucket, object, rs, h, lockType, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	if unlockOnDefer {
+		unlockOnDefer = false
+		return gr.WithCleanupFuncs(nsUnlocker), nil
+	}
+	return gr, nil
 }
 
 // getLatestObjectInfoWithIdx returns the objectInfo of the latest object from multiple pools (this function
@@ -815,6 +895,11 @@ func (z *erasureServerPools) getLatestObjectInfoWithIdx(ctx context.Context, buc
 		if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
 			// some errors such as MethodNotAllowed for delete marker
 			// should be returned upwards.
+			return res.oi, res.zIdx, err
+		}
+		// When its a delete marker and versionID is empty
+		// we should simply return the error right away.
+		if res.oi.DeleteMarker && opts.VersionID == "" {
 			return res.oi, res.zIdx, err
 		}
 	}
@@ -864,7 +949,7 @@ func (z *erasureServerPools) PutObject(ctx context.Context, bucket string, objec
 	object = encodeDirObject(object)
 
 	if z.SinglePool() {
-		if !isMinioMetaBucketName(bucket) && !hasSpaceFor(getDiskInfos(ctx, z.serverPools[0].getHashedSet(object).getDisks()), data.Size()) {
+		if !isMinioMetaBucketName(bucket) && !hasSpaceFor(getDiskInfos(ctx, z.serverPools[0].getHashedSet(object).getDisks()...), data.Size()) {
 			return ObjectInfo{}, toObjectErr(errDiskFull)
 		}
 		return z.serverPools[0].PutObject(ctx, bucket, object, data, opts)
@@ -1150,6 +1235,12 @@ func maxKeysPlusOne(maxKeys int, addOne bool) int {
 func (z *erasureServerPools) ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (ListObjectsInfo, error) {
 	var loi ListObjectsInfo
 
+	// Automatically remove the object/version is an expiry lifecycle rule can be applied
+	lc, _ := globalLifecycleSys.Get(bucket)
+
+	// Check if bucket is object locked.
+	rcfg, _ := globalBucketObjectLockSys.Get(bucket)
+
 	if len(prefix) > 0 && maxKeys == 1 && delimiter == "" && marker == "" {
 		// Optimization for certain applications like
 		// - Cohesity
@@ -1160,6 +1251,15 @@ func (z *erasureServerPools) ListObjects(ctx context.Context, bucket, prefix, ma
 		// to avoid the need for ListObjects().
 		objInfo, err := z.GetObjectInfo(ctx, bucket, prefix, ObjectOptions{NoLock: true})
 		if err == nil {
+			if lc != nil {
+				action := evalActionFromLifecycle(ctx, *lc, rcfg, objInfo, false)
+				switch action {
+				case lifecycle.DeleteVersionAction, lifecycle.DeleteAction:
+					fallthrough
+				case lifecycle.DeleteRestoredAction, lifecycle.DeleteRestoredVersionAction:
+					return loi, nil
+				}
+			}
 			loi.Objects = append(loi.Objects, objInfo)
 			return loi, nil
 		}
@@ -1173,7 +1273,10 @@ func (z *erasureServerPools) ListObjects(ctx context.Context, bucket, prefix, ma
 		Marker:      marker,
 		InclDeleted: false,
 		AskDisks:    globalAPIConfig.getListQuorum(),
+		Lifecycle:   lc,
+		Retention:   rcfg,
 	}
+
 	merged, err := z.listPath(ctx, &opts)
 	if err != nil && err != io.EOF {
 		if !isErrBucketNotFound(err) {
@@ -1238,7 +1341,7 @@ func (z *erasureServerPools) NewMultipartUpload(ctx context.Context, bucket, obj
 	}
 
 	if z.SinglePool() {
-		if !isMinioMetaBucketName(bucket) && !hasSpaceFor(getDiskInfos(ctx, z.serverPools[0].getHashedSet(object).getDisks()), -1) {
+		if !isMinioMetaBucketName(bucket) && !hasSpaceFor(getDiskInfos(ctx, z.serverPools[0].getHashedSet(object).getDisks()...), -1) {
 			return "", toObjectErr(errDiskFull)
 		}
 		return z.serverPools[0].NewMultipartUpload(ctx, bucket, object, opts)
@@ -1648,6 +1751,8 @@ func (z *erasureServerPools) Walk(ctx context.Context, bucket, prefix string, re
 		return err
 	}
 
+	vcfg, _ := globalBucketVersioningSys.Get(bucket)
+
 	ctx, cancel := context.WithCancel(ctx)
 	go func() {
 		defer cancel()
@@ -1680,12 +1785,15 @@ func (z *erasureServerPools) Walk(ctx context.Context, bucket, prefix string, re
 						if opts.WalkAscending {
 							for i := len(fivs.Versions) - 1; i >= 0; i-- {
 								version := fivs.Versions[i]
-								results <- version.ToObjectInfo(bucket, version.Name)
+								versioned := vcfg != nil && vcfg.Versioned(version.Name)
+
+								results <- version.ToObjectInfo(bucket, version.Name, versioned)
 							}
 							return
 						}
 						for _, version := range fivs.Versions {
-							results <- version.ToObjectInfo(bucket, version.Name)
+							versioned := vcfg != nil && vcfg.Versioned(version.Name)
+							results <- version.ToObjectInfo(bucket, version.Name, versioned)
 						}
 					}
 
@@ -1697,14 +1805,16 @@ func (z *erasureServerPools) Walk(ctx context.Context, bucket, prefix string, re
 					}
 
 					path := baseDirFromPrefix(prefix)
-					if path == "" {
-						path = prefix
+					filterPrefix := strings.Trim(strings.TrimPrefix(prefix, path), slashSeparator)
+					if path == prefix {
+						filterPrefix = ""
 					}
 
 					lopts := listPathRawOptions{
 						disks:          disks,
 						bucket:         bucket,
 						path:           path,
+						filterPrefix:   filterPrefix,
 						recursive:      true,
 						forwardTo:      "",
 						minDisks:       1,
@@ -1757,14 +1867,16 @@ func listAndHeal(ctx context.Context, bucket, prefix string, set *erasureObjects
 	}
 
 	path := baseDirFromPrefix(prefix)
-	if path == "" {
-		path = prefix
+	filterPrefix := strings.Trim(strings.TrimPrefix(prefix, path), slashSeparator)
+	if path == prefix {
+		filterPrefix = ""
 	}
 
 	lopts := listPathRawOptions{
 		disks:          disks,
 		bucket:         bucket,
 		path:           path,
+		filterPrefix:   filterPrefix,
 		recursive:      true,
 		forwardTo:      "",
 		minDisks:       1,
@@ -1827,7 +1939,8 @@ func (z *erasureServerPools) HealObjects(ctx context.Context, bucket, prefix str
 		}
 
 		for _, version := range fivs.Versions {
-			if err := healObjectFn(bucket, version.Name, version.VersionID); err != nil {
+			err := healObjectFn(bucket, version.Name, version.VersionID)
+			if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
 				return err
 			}
 		}
@@ -1888,18 +2001,21 @@ func (z *erasureServerPools) HealObject(ctx context.Context, bucket, object, ver
 	}
 	wg.Wait()
 
-	for _, err := range errs {
-		if err != nil {
-			return madmin.HealResultItem{}, err
+	// Return the first nil error
+	for idx, err := range errs {
+		if err == nil {
+			return results[idx], nil
 		}
 	}
 
-	for _, result := range results {
-		if result.Object != "" {
-			return result, nil
+	// No pool returned a nil error, return the first non 'not found' error
+	for idx, err := range errs {
+		if !isErrObjectNotFound(err) && !isErrVersionNotFound(err) {
+			return results[idx], err
 		}
 	}
 
+	// At this stage, all errors are 'not found'
 	if versionID != "" {
 		return madmin.HealResultItem{}, VersionNotFound{
 			Bucket:    bucket,
@@ -1970,11 +2086,14 @@ func (z *erasureServerPools) ReadHealth(ctx context.Context) bool {
 	}
 
 	b := z.BackendInfo()
-	readQuorum := b.StandardSCData[0]
+	poolReadQuorums := make([]int, len(b.StandardSCData))
+	for i, data := range b.StandardSCData {
+		poolReadQuorums[i] = data
+	}
 
 	for poolIdx := range erasureSetUpCount {
 		for setIdx := range erasureSetUpCount[poolIdx] {
-			if erasureSetUpCount[poolIdx][setIdx] < readQuorum {
+			if erasureSetUpCount[poolIdx][setIdx] < poolReadQuorums[poolIdx] {
 				return false
 			}
 		}
@@ -2011,9 +2130,12 @@ func (z *erasureServerPools) Health(ctx context.Context, opts HealthOptions) Hea
 	reqInfo := (&logger.ReqInfo{}).AppendTags("maintenance", strconv.FormatBool(opts.Maintenance))
 
 	b := z.BackendInfo()
-	writeQuorum := b.StandardSCData[0]
-	if writeQuorum == b.StandardSCParity {
-		writeQuorum++
+	poolWriteQuorums := make([]int, len(b.StandardSCData))
+	for i, data := range b.StandardSCData {
+		poolWriteQuorums[i] = data
+		if data == b.StandardSCParity {
+			poolWriteQuorums[i] = data + 1
+		}
 	}
 
 	var aggHealStateResult madmin.BgHealState
@@ -2037,18 +2159,28 @@ func (z *erasureServerPools) Health(ctx context.Context, opts HealthOptions) Hea
 
 	for poolIdx := range erasureSetUpCount {
 		for setIdx := range erasureSetUpCount[poolIdx] {
-			if erasureSetUpCount[poolIdx][setIdx] < writeQuorum {
+			if erasureSetUpCount[poolIdx][setIdx] < poolWriteQuorums[poolIdx] {
 				logger.LogIf(logger.SetReqInfo(ctx, reqInfo),
 					fmt.Errorf("Write quorum may be lost on pool: %d, set: %d, expected write quorum: %d",
-						poolIdx, setIdx, writeQuorum))
+						poolIdx, setIdx, poolWriteQuorums[poolIdx]))
 				return HealthResult{
 					Healthy:       false,
 					HealingDrives: len(aggHealStateResult.HealDisks),
 					PoolID:        poolIdx,
 					SetID:         setIdx,
-					WriteQuorum:   writeQuorum,
+					WriteQuorum:   poolWriteQuorums[poolIdx],
 				}
 			}
+		}
+	}
+
+	var maximumWriteQuorum int
+	for _, writeQuorum := range poolWriteQuorums {
+		if maximumWriteQuorum == 0 {
+			maximumWriteQuorum = writeQuorum
+		}
+		if writeQuorum > maximumWriteQuorum {
+			maximumWriteQuorum = writeQuorum
 		}
 	}
 
@@ -2057,14 +2189,14 @@ func (z *erasureServerPools) Health(ctx context.Context, opts HealthOptions) Hea
 	if !opts.Maintenance {
 		return HealthResult{
 			Healthy:     true,
-			WriteQuorum: writeQuorum,
+			WriteQuorum: maximumWriteQuorum,
 		}
 	}
 
 	return HealthResult{
 		Healthy:       len(aggHealStateResult.HealDisks) == 0,
 		HealingDrives: len(aggHealStateResult.HealDisks),
-		WriteQuorum:   writeQuorum,
+		WriteQuorum:   maximumWriteQuorum,
 	}
 }
 

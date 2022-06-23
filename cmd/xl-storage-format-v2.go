@@ -793,34 +793,32 @@ func decodeVersions(buf []byte, versions int, fn func(idx int, hdr, meta []byte)
 }
 
 // isIndexedMetaV2 returns non-nil result if metadata is indexed.
-// If data doesn't validate nil is also returned.
-func isIndexedMetaV2(buf []byte) (meta xlMetaBuf, data xlMetaInlineData) {
+// Returns 3x nil if not XLV2 or not indexed.
+// If indexed and unable to parse an error will be returned.
+func isIndexedMetaV2(buf []byte) (meta xlMetaBuf, data xlMetaInlineData, err error) {
 	buf, major, minor, err := checkXL2V1(buf)
-	if err != nil {
-		return nil, nil
-	}
-	if major != 1 || minor < 3 {
-		return nil, nil
+	if err != nil || major != 1 || minor < 3 {
+		return nil, nil, nil
 	}
 	meta, buf, err = msgp.ReadBytesZC(buf)
 	if err != nil {
-		return nil, nil
+		return nil, nil, err
 	}
 	if crc, nbuf, err := msgp.ReadUint32Bytes(buf); err == nil {
 		// Read metadata CRC
 		buf = nbuf
 		if got := uint32(xxhash.Sum64(meta)); got != crc {
-			return nil, nil
+			return nil, nil, fmt.Errorf("xlMetaV2.Load version(%d), CRC mismatch, want 0x%x, got 0x%x", minor, crc, got)
 		}
 	} else {
-		return nil, nil
+		return nil, nil, err
 	}
 	data = buf
 	if data.validate() != nil {
 		data.repair()
 	}
 
-	return meta, data
+	return meta, data, nil
 }
 
 type xlMetaV2ShallowVersion struct {
@@ -865,7 +863,9 @@ func (x *xlMetaV2) LoadOrConvert(buf []byte) error {
 // Load all versions of the stored data.
 // Note that references to the incoming buffer will be kept.
 func (x *xlMetaV2) Load(buf []byte) error {
-	if meta, data := isIndexedMetaV2(buf); meta != nil {
+	if meta, data, err := isIndexedMetaV2(buf); err != nil {
+		return err
+	} else if meta != nil {
 		return x.loadIndexed(meta, data)
 	}
 	// Convert older format.
@@ -1691,7 +1691,7 @@ func (x xlMetaV2) ListVersions(volume, path string) ([]FileInfo, error) {
 // Quorum must be the minimum number of matching metadata files.
 // Quorum should be > 1 and <= len(versions).
 // If strict is set to false, entries that match type
-func mergeXLV2Versions(quorum int, strict bool, versions ...[]xlMetaV2ShallowVersion) (merged []xlMetaV2ShallowVersion) {
+func mergeXLV2Versions(quorum int, strict bool, requestedVersions int, versions ...[]xlMetaV2ShallowVersion) (merged []xlMetaV2ShallowVersion) {
 	if quorum <= 0 {
 		quorum = 1
 	}
@@ -1707,6 +1707,8 @@ func mergeXLV2Versions(quorum int, strict bool, versions ...[]xlMetaV2ShallowVer
 	}
 	// Shallow copy input
 	versions = append(make([][]xlMetaV2ShallowVersion, 0, len(versions)), versions...)
+
+	var nVersions int // captures all non-free versions
 
 	// Our result
 	merged = make([]xlMetaV2ShallowVersion, 0, len(versions[0]))
@@ -1744,6 +1746,12 @@ func mergeXLV2Versions(quorum int, strict bool, versions ...[]xlMetaV2ShallowVer
 			latest = tops[0]
 			latestCount = len(tops)
 			merged = append(merged, latest)
+
+			// Calculate latest 'n' non-free versions.
+			if !latest.header.FreeVersion() {
+				nVersions++
+			}
+
 		} else {
 			// Find latest.
 			for i, ver := range tops {
@@ -1807,6 +1815,11 @@ func mergeXLV2Versions(quorum int, strict bool, versions ...[]xlMetaV2ShallowVer
 			}
 			if latestCount >= quorum {
 				merged = append(merged, latest)
+
+				// Calculate latest 'n' non-free versions.
+				if !latest.header.FreeVersion() {
+					nVersions++
+				}
 			}
 		}
 
@@ -1840,7 +1853,13 @@ func mergeXLV2Versions(quorum int, strict bool, versions ...[]xlMetaV2ShallowVer
 				break
 			}
 		}
+
+		if requestedVersions > 0 && requestedVersions == nVersions {
+			merged = append(merged, versions[0]...)
+			break
+		}
 	}
+
 	// Sanity check. Enable if duplicates show up.
 	if false {
 		found := make(map[[16]byte]struct{})

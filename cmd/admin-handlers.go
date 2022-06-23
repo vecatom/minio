@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2022 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -18,6 +18,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	crand "crypto/rand"
 	"crypto/subtle"
@@ -26,6 +27,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"io/ioutil"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -36,7 +38,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/dustin/go-humanize"
@@ -55,7 +56,8 @@ import (
 )
 
 const (
-	maxEConfigJSONSize = 262272
+	maxEConfigJSONSize        = 262272
+	kubernetesVersionEndpoint = "https://kubernetes.default.svc/version"
 )
 
 // Only valid query params for mgmt admin APIs.
@@ -272,6 +274,8 @@ type ServerConnStats struct {
 	Throughput       uint64 `json:"throughput,omitempty"`
 	S3InputBytes     uint64 `json:"transferredS3"`
 	S3OutputBytes    uint64 `json:"receivedS3"`
+	AdminInputBytes  uint64 `json:"transferredAdmin"`
+	AdminOutputBytes uint64 `json:"receivedAdmin"`
 }
 
 // ServerHTTPAPIStats holds total number of HTTP operations from/to the server,
@@ -288,6 +292,8 @@ type ServerHTTPStats struct {
 	CurrentS3Requests      ServerHTTPAPIStats `json:"currentS3Requests"`
 	TotalS3Requests        ServerHTTPAPIStats `json:"totalS3Requests"`
 	TotalS3Errors          ServerHTTPAPIStats `json:"totalS3Errors"`
+	TotalS35xxErrors       ServerHTTPAPIStats `json:"totalS35xxErrors"`
+	TotalS34xxErrors       ServerHTTPAPIStats `json:"totalS34xxErrors"`
 	TotalS3Canceled        ServerHTTPAPIStats `json:"totalS3Canceled"`
 	TotalS3RejectedAuth    uint64             `json:"totalS3RejectedAuth"`
 	TotalS3RejectedTime    uint64             `json:"totalS3RejectedTime"`
@@ -499,7 +505,7 @@ func (a adminAPIHandlers) TopLocksHandler(w http.ResponseWriter, r *http.Request
 }
 
 // StartProfilingResult contains the status of the starting
-// profiling action in a given server
+// profiling action in a given server - deprecated API
 type StartProfilingResult struct {
 	NodeName string `json:"nodeName"`
 	Success  bool   `json:"success"`
@@ -593,6 +599,83 @@ func (a adminAPIHandlers) StartProfilingHandler(w http.ResponseWriter, r *http.R
 	writeSuccessResponseJSON(w, startProfilingResultInBytes)
 }
 
+// ProfileHandler - POST /minio/admin/v3/profile/?profilerType={profilerType}
+// ----------
+// Enable server profiling
+func (a adminAPIHandlers) ProfileHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "Profile")
+
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	// Validate request signature.
+	_, adminAPIErr := checkAdminRequestAuth(ctx, r, iampolicy.ProfilingAdminAction, "")
+	if adminAPIErr != ErrNone {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(adminAPIErr), r.URL)
+		return
+	}
+
+	if globalNotificationSys == nil {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
+		return
+	}
+	profileStr := r.Form.Get("profilerType")
+	profiles := strings.Split(profileStr, ",")
+	duration := time.Minute
+	if dstr := r.Form.Get("duration"); dstr != "" {
+		var err error
+		duration, err = time.ParseDuration(dstr)
+		if err != nil {
+			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrServerNotInitialized), r.URL)
+			return
+		}
+	}
+	// read request body
+	io.CopyN(ioutil.Discard, r.Body, 1)
+
+	globalProfilerMu.Lock()
+
+	if globalProfiler == nil {
+		globalProfiler = make(map[string]minioProfiler, 10)
+	}
+
+	// Stop profiler of all types if already running
+	for k, v := range globalProfiler {
+		v.Stop()
+		delete(globalProfiler, k)
+	}
+
+	// Start profiling on remote servers.
+	for _, profiler := range profiles {
+		globalNotificationSys.StartProfiling(profiler)
+
+		// Start profiling locally as well.
+		prof, err := startProfiler(profiler)
+		if err == nil {
+			globalProfiler[profiler] = prof
+		}
+	}
+	globalProfilerMu.Unlock()
+
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			for k, v := range globalProfiler {
+				v.Stop()
+				delete(globalProfiler, k)
+			}
+			return
+		case <-timer.C:
+			if !globalNotificationSys.DownloadProfilingData(ctx, w) {
+				writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminProfilerNotEnabled), r.URL)
+				return
+			}
+			return
+		}
+	}
+}
+
 // dummyFileInfo represents a dummy representation of a profile data file
 // present only in memory, it helps to generate the zip stream.
 type dummyFileInfo struct {
@@ -613,7 +696,7 @@ func (f dummyFileInfo) Sys() interface{}   { return f.sys }
 
 // DownloadProfilingHandler - POST /minio/admin/v3/profiling/download
 // ----------
-// Download profiling information of all nodes in a zip format
+// Download profiling information of all nodes in a zip format - deprecated API
 func (a adminAPIHandlers) DownloadProfilingHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "DownloadProfiling")
 
@@ -725,8 +808,7 @@ func (a adminAPIHandlers) HealHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if this setup has an erasure coded backend.
-	if !globalIsErasure {
+	if globalIsGateway {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrHealNotImplemented), r.URL)
 		return
 	}
@@ -918,7 +1000,7 @@ func (a adminAPIHandlers) BackgroundHealStatusHandler(w http.ResponseWriter, r *
 	}
 
 	// Check if this setup has an erasure coded backend.
-	if !globalIsErasure {
+	if globalIsGateway {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrHealNotImplemented), r.URL)
 		return
 	}
@@ -998,7 +1080,7 @@ func (a adminAPIHandlers) ObjectSpeedtestHandler(w http.ResponseWriter, r *http.
 		return
 	}
 
-	if !globalIsErasure {
+	if globalIsGateway {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
 		return
 	}
@@ -1028,38 +1110,29 @@ func (a adminAPIHandlers) ObjectSpeedtestHandler(w http.ResponseWriter, r *http.
 		duration = time.Second * 10
 	}
 
-	// ignores any errors here.
-	storageInfo, _ := objectAPI.StorageInfo(ctx)
-	capacityNeeded := uint64(concurrent * size)
-	capacity := uint64(GetTotalUsableCapacityFree(storageInfo.Disks, storageInfo))
-
-	if capacity < capacityNeeded {
+	sufficientCapacity, canAutotune, capacityErrMsg := validateObjPerfOptions(ctx, objectAPI, concurrent, size, autotune)
+	if !sufficientCapacity {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, AdminError{
-			Code: "XMinioSpeedtestInsufficientCapacity",
-			Message: fmt.Sprintf("not enough usable space available to perform speedtest - expected %s, got %s",
-				humanize.IBytes(capacityNeeded), humanize.IBytes(capacity)),
+			Code:       "XMinioSpeedtestInsufficientCapacity",
+			Message:    capacityErrMsg,
 			StatusCode: http.StatusInsufficientStorage,
 		}), r.URL)
 		return
 	}
 
-	// Verify if we can employ autotune without running out of capacity,
-	// if we do run out of capacity, make sure to turn-off autotuning
-	// in such situations.
-	newConcurrent := concurrent + (concurrent+1)/2
-	autoTunedCapacityNeeded := uint64(newConcurrent * size)
-	if autotune && capacity < autoTunedCapacityNeeded {
-		// Turn-off auto-tuning if next possible concurrency would reach beyond disk capacity.
+	if autotune && !canAutotune {
 		autotune = false
 	}
 
-	deleteBucket := func() {
-		objectAPI.DeleteBucket(context.Background(), pathJoin(minioMetaBucket, "speedtest"), DeleteBucketOptions{
-			Force:      true,
-			NoRecreate: true,
-		})
+	bucketExists, err := makeObjectPerfBucket(ctx, objectAPI)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
+		return
 	}
-	defer deleteBucket()
+
+	if !bucketExists {
+		defer deleteObjectPerfBucket(objectAPI)
+	}
 
 	// Freeze all incoming S3 API calls before running speedtest.
 	globalNotificationSys.ServiceFreeze(ctx, true)
@@ -1071,7 +1144,7 @@ func (a adminAPIHandlers) ObjectSpeedtestHandler(w http.ResponseWriter, r *http.
 	defer keepAliveTicker.Stop()
 
 	enc := json.NewEncoder(w)
-	ch := speedTest(ctx, speedTestOpts{size, concurrent, duration, autotune, storageClass})
+	ch := objectSpeedTest(ctx, speedTestOpts{size, concurrent, duration, autotune, storageClass})
 	for {
 		select {
 		case <-ctx.Done():
@@ -1094,6 +1167,50 @@ func (a adminAPIHandlers) ObjectSpeedtestHandler(w http.ResponseWriter, r *http.
 	}
 }
 
+func makeObjectPerfBucket(ctx context.Context, objectAPI ObjectLayer) (bucketExists bool, err error) {
+	err = objectAPI.MakeBucketWithLocation(ctx, globalObjectPerfBucket, BucketOptions{})
+	if err != nil {
+		if _, ok := err.(BucketExists); !ok {
+			// Only BucketExists error can be ignored.
+			return false, err
+		}
+		bucketExists = true
+	}
+	return bucketExists, nil
+}
+
+func deleteObjectPerfBucket(objectAPI ObjectLayer) {
+	objectAPI.DeleteBucket(context.Background(), globalObjectPerfBucket, DeleteBucketOptions{
+		Force:      true,
+		NoRecreate: true,
+	})
+}
+
+func validateObjPerfOptions(ctx context.Context, objectAPI ObjectLayer, concurrent int, size int, autotune bool) (sufficientCapacity bool, canAutotune bool, capacityErrMsg string) {
+	storageInfo, _ := objectAPI.StorageInfo(ctx)
+	capacityNeeded := uint64(concurrent * size)
+	capacity := uint64(GetTotalUsableCapacityFree(storageInfo.Disks, storageInfo))
+
+	if capacity < capacityNeeded {
+		return false, false, fmt.Sprintf("not enough usable space available to perform speedtest - expected %s, got %s",
+			humanize.IBytes(capacityNeeded), humanize.IBytes(capacity))
+	}
+
+	// Verify if we can employ autotune without running out of capacity,
+	// if we do run out of capacity, make sure to turn-off autotuning
+	// in such situations.
+	if autotune {
+		newConcurrent := concurrent + (concurrent+1)/2
+		autoTunedCapacityNeeded := uint64(newConcurrent * size)
+		if capacity < autoTunedCapacityNeeded {
+			// Turn-off auto-tuning if next possible concurrency would reach beyond disk capacity.
+			return true, false, ""
+		}
+	}
+
+	return true, autotune, ""
+}
+
 // NetSpeedtestHandler - reports maximum network throughput
 func (a adminAPIHandlers) NetSpeedtestHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "NetSpeedtestHandler")
@@ -1112,7 +1229,7 @@ func (a adminAPIHandlers) DriveSpeedtestHandler(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	if !globalIsErasure {
+	if globalIsGateway {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
 		return
 	}
@@ -1146,43 +1263,29 @@ func (a adminAPIHandlers) DriveSpeedtestHandler(w http.ResponseWriter, r *http.R
 	keepAliveTicker := time.NewTicker(500 * time.Millisecond)
 	defer keepAliveTicker.Stop()
 
-	enc := json.NewEncoder(w)
 	ch := globalNotificationSys.DriveSpeedTest(ctx, opts)
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	// local driveSpeedTest
-	go func() {
-		defer wg.Done()
-		enc.Encode(driveSpeedTest(ctx, opts))
-		if wf, ok := w.(http.Flusher); ok {
-			wf.Flush()
-		}
-	}()
-
+	enc := json.NewEncoder(w)
 	for {
 		select {
 		case <-ctx.Done():
-			goto endloop
+			return
 		case <-keepAliveTicker.C:
 			// Write a blank entry to prevent client from disconnecting
 			if err := enc.Encode(madmin.DriveSpeedTestResult{}); err != nil {
-				goto endloop
+				return
 			}
 			w.(http.Flusher).Flush()
 		case result, ok := <-ch:
 			if !ok {
-				goto endloop
+				return
 			}
 			if err := enc.Encode(result); err != nil {
-				goto endloop
+				return
 			}
 			w.(http.Flusher).Flush()
 		}
 	}
-endloop:
-	wg.Wait()
 }
 
 // Admin API errors
@@ -1294,9 +1397,15 @@ func (a adminAPIHandlers) TraceHandler(w http.ResponseWriter, r *http.Request) {
 
 	peers, _ := newPeerRestClients(globalEndpoints)
 
-	globalTrace.Subscribe(traceCh, ctx.Done(), func(entry interface{}) bool {
+	traceFn := func(entry interface{}) bool {
 		return mustTrace(entry, traceOpts)
-	})
+	}
+
+	err = globalTrace.Subscribe(traceCh, ctx.Done(), traceFn)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrSlowDown), r.URL)
+		return
+	}
 
 	for _, peer := range peers {
 		if peer == nil {
@@ -1368,7 +1477,11 @@ func (a adminAPIHandlers) ConsoleLogHandler(w http.ResponseWriter, r *http.Reque
 
 	peers, _ := newPeerRestClients(globalEndpoints)
 
-	globalConsoleSys.Subscribe(logCh, ctx.Done(), node, limitLines, logKind, nil)
+	err = globalConsoleSys.Subscribe(logCh, ctx.Done(), node, limitLines, logKind, nil)
+	if err != nil {
+		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrSlowDown), r.URL)
+		return
+	}
 
 	for _, peer := range peers {
 		if peer == nil {
@@ -1582,6 +1695,7 @@ func getServerInfo(ctx context.Context, r *http.Request) madmin.InfoMessage {
 
 	buckets := madmin.Buckets{}
 	objects := madmin.Objects{}
+	versions := madmin.Versions{}
 	usage := madmin.Usage{}
 
 	objectAPI := newObjectLayerFn()
@@ -1593,6 +1707,7 @@ func getServerInfo(ctx context.Context, r *http.Request) madmin.InfoMessage {
 		if err == nil {
 			buckets = madmin.Buckets{Count: dataUsageInfo.BucketsCount}
 			objects = madmin.Objects{Count: dataUsageInfo.ObjectsTotalCount}
+			versions = madmin.Versions{Count: dataUsageInfo.VersionsTotalCount}
 			usage = madmin.Usage{Size: dataUsageInfo.ObjectsTotalSize}
 		} else {
 			buckets = madmin.Buckets{Error: err.Error()}
@@ -1641,11 +1756,42 @@ func getServerInfo(ctx context.Context, r *http.Request) madmin.InfoMessage {
 		DeploymentID: globalDeploymentID,
 		Buckets:      buckets,
 		Objects:      objects,
+		Versions:     versions,
 		Usage:        usage,
 		Services:     services,
 		Backend:      backend,
 		Servers:      servers,
 	}
+}
+
+func getKubernetesInfo(dctx context.Context) madmin.KubernetesInfo {
+	ctx, cancel := context.WithCancel(dctx)
+	defer cancel()
+
+	ki := madmin.KubernetesInfo{}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, kubernetesVersionEndpoint, nil)
+	if err != nil {
+		ki.Error = err.Error()
+		return ki
+	}
+
+	client := &http.Client{
+		Transport: NewGatewayHTTPTransport(),
+		Timeout:   10 * time.Second,
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		ki.Error = err.Error()
+		return ki
+	}
+
+	decoder := json.NewDecoder(resp.Body)
+	if err := decoder.Decode(&ki); err != nil {
+		ki.Error = err.Error()
+	}
+	return ki
 }
 
 // HealthInfoHandler - GET /minio/admin/v3/healthinfo
@@ -1662,13 +1808,17 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	query := r.Form
-	healthInfo := madmin.HealthInfo{Version: madmin.HealthInfoVersion}
+	healthInfo := madmin.HealthInfo{
+		Version: madmin.HealthInfoVersion,
+		Minio: madmin.MinioHealthInfo{
+			Info: madmin.MinioInfo{
+				DeploymentID: globalDeploymentID,
+			},
+		},
+	}
 	healthInfoCh := make(chan madmin.HealthInfo)
 
 	enc := json.NewEncoder(w)
-	partialWrite := func(oinfo madmin.HealthInfo) {
-		healthInfoCh <- oinfo
-	}
 
 	setCommonHeaders(w)
 
@@ -1684,7 +1834,12 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 		logger.LogIf(ctx, enc.Encode(healthInfo))
 	}
 
-	deadline := 1 * time.Hour
+	deadline := 10 * time.Second // Default deadline is 10secs for health diagnostics.
+	if query.Get(string(madmin.HealthDataTypePerfNet)) != "" ||
+		query.Get(string(madmin.HealthDataTypePerfDrive)) != "" ||
+		query.Get(string(madmin.HealthDataTypePerfObj)) != "" {
+		deadline = 1 * time.Hour
+	}
 	if dstr := r.Form.Get("deadline"); dstr != "" {
 		var err error
 		deadline, err = time.ParseDuration(dstr)
@@ -1694,9 +1849,6 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	deadlinedCtx, deadlineCancel := context.WithTimeout(ctx, deadline)
-	defer deadlineCancel()
-
 	nsLock := objectAPI.NewNSLock(minioMetaBucket, "health-check-in-progress")
 	lkctx, err := nsLock.GetLock(ctx, newDynamicTimeout(deadline, deadline))
 	if err != nil { // returns a locked lock
@@ -1704,6 +1856,15 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	defer nsLock.Unlock(lkctx.Cancel)
+
+	healthCtx, healthCancel := context.WithTimeout(lkctx.Context(), deadline)
+	defer healthCancel()
+
+	// Freeze all incoming S3 API calls before running speedtest.
+	globalNotificationSys.ServiceFreeze(ctx, true)
+
+	// unfreeze all incoming S3 API calls after speedtest.
+	defer globalNotificationSys.ServiceFreeze(ctx, false)
 
 	hostAnonymizer := createHostAnonymizer()
 	// anonAddr - Anonymizes hosts in given input string.
@@ -1723,13 +1884,27 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 		info.SetAddr(anonAddr(info.GetAddr()))
 	}
 
+	partialWrite := func(oinfo madmin.HealthInfo) {
+		select {
+		case healthInfoCh <- oinfo:
+		case <-healthCtx.Done():
+		}
+	}
+
+	getAndWritePlatformInfo := func() {
+		if IsKubernetes() {
+			healthInfo.Sys.KubernetesInfo = getKubernetesInfo(healthCtx)
+			partialWrite(healthInfo)
+		}
+	}
+
 	getAndWriteCPUs := func() {
 		if query.Get("syscpu") == "true" {
-			localCPUInfo := madmin.GetCPUs(deadlinedCtx, globalLocalNodeName)
+			localCPUInfo := madmin.GetCPUs(healthCtx, globalLocalNodeName)
 			anonymizeAddr(&localCPUInfo)
 			healthInfo.Sys.CPUInfo = append(healthInfo.Sys.CPUInfo, localCPUInfo)
 
-			peerCPUInfo := globalNotificationSys.GetCPUs(deadlinedCtx)
+			peerCPUInfo := globalNotificationSys.GetCPUs(healthCtx)
 			for _, cpuInfo := range peerCPUInfo {
 				anonymizeAddr(&cpuInfo)
 				healthInfo.Sys.CPUInfo = append(healthInfo.Sys.CPUInfo, cpuInfo)
@@ -1741,11 +1916,11 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 
 	getAndWritePartitions := func() {
 		if query.Get("sysdrivehw") == "true" {
-			localPartitions := madmin.GetPartitions(deadlinedCtx, globalLocalNodeName)
+			localPartitions := madmin.GetPartitions(healthCtx, globalLocalNodeName)
 			anonymizeAddr(&localPartitions)
 			healthInfo.Sys.Partitions = append(healthInfo.Sys.Partitions, localPartitions)
 
-			peerPartitions := globalNotificationSys.GetPartitions(deadlinedCtx)
+			peerPartitions := globalNotificationSys.GetPartitions(healthCtx)
 			for _, p := range peerPartitions {
 				anonymizeAddr(&p)
 				healthInfo.Sys.Partitions = append(healthInfo.Sys.Partitions, p)
@@ -1756,11 +1931,11 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 
 	getAndWriteOSInfo := func() {
 		if query.Get("sysosinfo") == "true" {
-			localOSInfo := madmin.GetOSInfo(deadlinedCtx, globalLocalNodeName)
+			localOSInfo := madmin.GetOSInfo(healthCtx, globalLocalNodeName)
 			anonymizeAddr(&localOSInfo)
 			healthInfo.Sys.OSInfo = append(healthInfo.Sys.OSInfo, localOSInfo)
 
-			peerOSInfos := globalNotificationSys.GetOSInfo(deadlinedCtx)
+			peerOSInfos := globalNotificationSys.GetOSInfo(healthCtx)
 			for _, o := range peerOSInfos {
 				anonymizeAddr(&o)
 				healthInfo.Sys.OSInfo = append(healthInfo.Sys.OSInfo, o)
@@ -1771,11 +1946,11 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 
 	getAndWriteMemInfo := func() {
 		if query.Get("sysmem") == "true" {
-			localMemInfo := madmin.GetMemInfo(deadlinedCtx, globalLocalNodeName)
+			localMemInfo := madmin.GetMemInfo(healthCtx, globalLocalNodeName)
 			anonymizeAddr(&localMemInfo)
 			healthInfo.Sys.MemInfo = append(healthInfo.Sys.MemInfo, localMemInfo)
 
-			peerMemInfos := globalNotificationSys.GetMemInfo(deadlinedCtx)
+			peerMemInfos := globalNotificationSys.GetMemInfo(healthCtx)
 			for _, m := range peerMemInfos {
 				anonymizeAddr(&m)
 				healthInfo.Sys.MemInfo = append(healthInfo.Sys.MemInfo, m)
@@ -1786,12 +1961,12 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 
 	getAndWriteSysErrors := func() {
 		if query.Get(string(madmin.HealthDataTypeSysErrors)) == "true" {
-			localSysErrors := madmin.GetSysErrors(deadlinedCtx, globalLocalNodeName)
+			localSysErrors := madmin.GetSysErrors(healthCtx, globalLocalNodeName)
 			anonymizeAddr(&localSysErrors)
 			healthInfo.Sys.SysErrs = append(healthInfo.Sys.SysErrs, localSysErrors)
 			partialWrite(healthInfo)
 
-			peerSysErrs := globalNotificationSys.GetSysErrors(deadlinedCtx)
+			peerSysErrs := globalNotificationSys.GetSysErrors(healthCtx)
 			for _, se := range peerSysErrs {
 				anonymizeAddr(&se)
 				healthInfo.Sys.SysErrs = append(healthInfo.Sys.SysErrs, se)
@@ -1802,12 +1977,12 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 
 	getAndWriteSysConfig := func() {
 		if query.Get(string(madmin.HealthDataTypeSysConfig)) == "true" {
-			localSysConfig := madmin.GetSysConfig(deadlinedCtx, globalLocalNodeName)
+			localSysConfig := madmin.GetSysConfig(healthCtx, globalLocalNodeName)
 			anonymizeAddr(&localSysConfig)
 			healthInfo.Sys.SysConfig = append(healthInfo.Sys.SysConfig, localSysConfig)
 			partialWrite(healthInfo)
 
-			peerSysConfig := globalNotificationSys.GetSysConfig(deadlinedCtx)
+			peerSysConfig := globalNotificationSys.GetSysConfig(healthCtx)
 			for _, sc := range peerSysConfig {
 				anonymizeAddr(&sc)
 				healthInfo.Sys.SysConfig = append(healthInfo.Sys.SysConfig, sc)
@@ -1818,12 +1993,12 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 
 	getAndWriteSysServices := func() {
 		if query.Get(string(madmin.HealthDataTypeSysServices)) == "true" {
-			localSysServices := madmin.GetSysServices(deadlinedCtx, globalLocalNodeName)
+			localSysServices := madmin.GetSysServices(healthCtx, globalLocalNodeName)
 			anonymizeAddr(&localSysServices)
 			healthInfo.Sys.SysServices = append(healthInfo.Sys.SysServices, localSysServices)
 			partialWrite(healthInfo)
 
-			peerSysServices := globalNotificationSys.GetSysServices(deadlinedCtx)
+			peerSysServices := globalNotificationSys.GetSysServices(healthCtx)
 			for _, ss := range peerSysServices {
 				anonymizeAddr(&ss)
 				healthInfo.Sys.SysServices = append(healthInfo.Sys.SysServices, ss)
@@ -1898,10 +2073,10 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 
 	getAndWriteProcInfo := func() {
 		if query.Get("sysprocess") == "true" {
-			localProcInfo := madmin.GetProcInfo(deadlinedCtx, globalLocalNodeName)
+			localProcInfo := madmin.GetProcInfo(healthCtx, globalLocalNodeName)
 			anonymizeProcInfo(&localProcInfo)
 			healthInfo.Sys.ProcInfo = append(healthInfo.Sys.ProcInfo, localProcInfo)
-			peerProcInfos := globalNotificationSys.GetProcInfo(deadlinedCtx)
+			peerProcInfos := globalNotificationSys.GetProcInfo(healthCtx)
 			for _, p := range peerProcInfos {
 				anonymizeProcInfo(&p)
 				healthInfo.Sys.ProcInfo = append(healthInfo.Sys.ProcInfo, p)
@@ -1927,49 +2102,84 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	getAndWriteDrivePerfInfo := func() {
-		if query.Get("perfdrive") == "true" {
-			localDPI := getDrivePerfInfos(deadlinedCtx, globalLocalNodeName)
-			anonymizeAddr(&localDPI)
-			healthInfo.Perf.Drives = append(healthInfo.Perf.Drives, localDPI)
-			partialWrite(healthInfo)
-
-			perfCh := globalNotificationSys.GetDrivePerfInfos(deadlinedCtx)
-			for perfInfo := range perfCh {
-				anonymizeAddr(&perfInfo)
-				healthInfo.Perf.Drives = append(healthInfo.Perf.Drives, perfInfo)
-				partialWrite(healthInfo)
+		if query.Get(string(madmin.HealthDataTypePerfDrive)) == "true" {
+			opts := madmin.DriveSpeedTestOpts{
+				Serial:    false,
+				BlockSize: 4 * humanize.MiByte,
+				FileSize:  1 * humanize.GiByte,
 			}
+
+			localDPI := driveSpeedTest(ctx, opts)
+			healthInfo.Perf.DrivePerf = append(healthInfo.Perf.DrivePerf, localDPI)
+
+			perfCh := globalNotificationSys.DriveSpeedTest(ctx, opts)
+			for perfInfo := range perfCh {
+				healthInfo.Perf.DrivePerf = append(healthInfo.Perf.DrivePerf, perfInfo)
+			}
+			partialWrite(healthInfo)
 		}
 	}
 
-	anonymizeNetPerfInfo := func(npi *madmin.NetPerfInfo) {
-		anonymizeAddr(npi)
-		rps := npi.RemotePeers
-		for idx, peer := range rps {
-			anonymizeAddr(&peer)
-			rps[idx] = peer
+	getAndWriteObjPerfInfo := func() {
+		if query.Get(string(madmin.HealthDataTypePerfObj)) == "true" {
+			concurrent := 32
+			if runtime.GOMAXPROCS(0) < concurrent {
+				concurrent = runtime.GOMAXPROCS(0)
+			}
+
+			size := 64 * humanize.MiByte
+			autotune := true
+
+			sufficientCapacity, canAutotune, capacityErrMsg := validateObjPerfOptions(ctx, objectAPI, concurrent, size, autotune)
+
+			if !sufficientCapacity {
+				healthInfo.Perf.Error = capacityErrMsg
+				partialWrite(healthInfo)
+				return
+			}
+
+			if !canAutotune {
+				autotune = false
+			}
+
+			bucketExists, err := makeObjectPerfBucket(ctx, objectAPI)
+			if err != nil {
+				healthInfo.Perf.Error = "Could not make object perf bucket: " + err.Error()
+				partialWrite(healthInfo)
+				return
+			}
+
+			if !bucketExists {
+				defer deleteObjectPerfBucket(objectAPI)
+			}
+
+			opts := speedTestOpts{
+				throughputSize:   size,
+				concurrencyStart: concurrent,
+				duration:         10 * time.Second,
+				autotune:         autotune,
+			}
+
+			perfCh := objectSpeedTest(ctx, opts)
+			for perfInfo := range perfCh {
+				healthInfo.Perf.ObjPerf = append(healthInfo.Perf.ObjPerf, perfInfo)
+			}
+			partialWrite(healthInfo)
 		}
-		npi.RemotePeers = rps
 	}
 
 	getAndWriteNetPerfInfo := func() {
-		if globalIsDistErasure && query.Get("perfnet") == "true" {
-			localNPI := globalNotificationSys.GetNetPerfInfo(deadlinedCtx)
-			anonymizeNetPerfInfo(&localNPI)
-			healthInfo.Perf.Net = append(healthInfo.Perf.Net, localNPI)
-
-			partialWrite(healthInfo)
-
-			netInfos := globalNotificationSys.DispatchNetPerfChan(deadlinedCtx)
-			for netInfo := range netInfos {
-				anonymizeNetPerfInfo(&netInfo)
-				healthInfo.Perf.Net = append(healthInfo.Perf.Net, netInfo)
-				partialWrite(healthInfo)
+		if query.Get(string(madmin.HealthDataTypePerfObj)) == "true" {
+			if !globalIsDistErasure {
+				return
 			}
 
-			ppi := globalNotificationSys.GetParallelNetPerfInfo(deadlinedCtx)
-			anonymizeNetPerfInfo(&ppi)
-			healthInfo.Perf.NetParallel = ppi
+			netPerf := globalNotificationSys.Netperf(ctx, time.Second*10)
+			for _, np := range netPerf {
+				np.Endpoint = anonAddr(np.Endpoint)
+				healthInfo.Perf.NetPerf = append(healthInfo.Perf.NetPerf, np)
+			}
+
 			partialWrite(healthInfo)
 		}
 	}
@@ -1995,7 +2205,8 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 	go func() {
 		defer close(healthInfoCh)
 
-		partialWrite(healthInfo) // Write first message with only version populated
+		partialWrite(healthInfo) // Write first message with only version and deployment id populated
+		getAndWritePlatformInfo()
 		getAndWriteCPUs()
 		getAndWritePartitions()
 		getAndWriteOSInfo()
@@ -2003,6 +2214,7 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 		getAndWriteProcInfo()
 		getAndWriteMinioConfig()
 		getAndWriteDrivePerfInfo()
+		getAndWriteObjPerfInfo()
 		getAndWriteNetPerfInfo()
 		getAndWriteSysErrors()
 		getAndWriteSysServices()
@@ -2076,7 +2288,7 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 				return
 			}
 			w.(http.Flusher).Flush()
-		case <-deadlinedCtx.Done():
+		case <-healthCtx.Done():
 			return
 		}
 	}
@@ -2426,8 +2638,7 @@ func (a adminAPIHandlers) InspectDataHandler(w http.ResponseWriter, r *http.Requ
 	// of profiling data of all nodes
 	zipWriter := zip.NewWriter(encw)
 	defer zipWriter.Close()
-
-	err = o.GetRawData(ctx, volume, file, func(r io.Reader, host, disk, filename string, si StatInfo) error {
+	rawDataFn := func(r io.Reader, host, disk, filename string, si StatInfo) error {
 		// Prefix host+disk
 		filename = path.Join(host, disk, filename)
 		if si.Dir {
@@ -2437,6 +2648,10 @@ func (a adminAPIHandlers) InspectDataHandler(w http.ResponseWriter, r *http.Requ
 		if si.Mode == 0 {
 			// Not, set it to default.
 			si.Mode = 0o600
+		}
+		if si.ModTime.IsZero() {
+			// Set time to now.
+			si.ModTime = time.Now()
 		}
 		header, zerr := zip.FileInfoHeader(dummyFileInfo{
 			name:    filename,
@@ -2460,8 +2675,31 @@ func (a adminAPIHandlers) InspectDataHandler(w http.ResponseWriter, r *http.Requ
 			logger.LogIf(ctx, err)
 		}
 		return nil
-	})
+	}
+	err = o.GetRawData(ctx, volume, file, rawDataFn)
 	if !errors.Is(err, errFileNotFound) {
+		logger.LogIf(ctx, err)
+	}
+
+	// save the format.json as part of inspect by default
+	if volume != minioMetaBucket && file != formatConfigFile {
+		err = o.GetRawData(ctx, minioMetaBucket, formatConfigFile, rawDataFn)
+	}
+	if !errors.Is(err, errFileNotFound) {
+		logger.LogIf(ctx, err)
+	}
+	// save args passed to inspect command
+	inspectArgs := []string{fmt.Sprintf(" Inspect path: %s%s%s\n", volume, slashSeparator, file)}
+	cmdLine := []string{"Server command line args: "}
+	for _, pool := range globalEndpoints {
+		cmdLine = append(cmdLine, pool.CmdLine)
+	}
+	cmdLine = append(cmdLine, "\n")
+	inspectArgs = append(inspectArgs, cmdLine...)
+	inspectArgsBytes := []byte(strings.Join(inspectArgs, " "))
+	if err = rawDataFn(bytes.NewReader(inspectArgsBytes), "", "", "inspect-input.txt", StatInfo{
+		Size: int64(len(inspectArgsBytes)),
+	}); err != nil {
 		logger.LogIf(ctx, err)
 	}
 }
@@ -2509,6 +2747,7 @@ func anonymizeHost(hostAnonymizer map[string]string, endpoint Endpoint, poolNum 
 	if !found {
 		// In distributed setup, anonymized addr = 'poolNum.serverNum'
 		newHost := fmt.Sprintf("pool%d.server%d", poolNum, srvrNum)
+		schemePfx := endpoint.Scheme + "://"
 
 		// Hostname
 		mapIfNotPresent(hostAnonymizer, endpoint.Hostname(), newHost)
@@ -2518,6 +2757,7 @@ func anonymizeHost(hostAnonymizer map[string]string, endpoint Endpoint, poolNum 
 			// Host + port
 			newHostPort = newHost + ":" + endpoint.Port()
 			mapIfNotPresent(hostAnonymizer, endpoint.Host, newHostPort)
+			mapIfNotPresent(hostAnonymizer, schemePfx+endpoint.Host, newHostPort)
 		}
 
 		newHostPortPath := newHostPort
@@ -2526,10 +2766,11 @@ func anonymizeHost(hostAnonymizer map[string]string, endpoint Endpoint, poolNum 
 			currentHostPortPath := endpoint.Host + endpoint.Path
 			newHostPortPath = newHostPort + endpoint.Path
 			mapIfNotPresent(hostAnonymizer, currentHostPortPath, newHostPortPath)
+			mapIfNotPresent(hostAnonymizer, schemePfx+currentHostPortPath, newHostPortPath)
 		}
 
 		// Full url
-		hostAnonymizer[currentURL] = endpoint.Scheme + "://" + newHostPortPath
+		hostAnonymizer[currentURL] = schemePfx + newHostPortPath
 	}
 }
 

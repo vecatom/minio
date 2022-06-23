@@ -196,12 +196,6 @@ iptables -A INPUT -p tcp --dport 9000:9010 -j ACCEPT
 service iptables restart
 ```
 
-## Pre-existing data
-
-When deployed on a single drive, MinIO server lets clients access any pre-existing data in the data directory. For example, if MinIO is started with the command  `minio server /mnt/data`, any pre-existing data in the `/mnt/data` directory would be accessible to the clients.
-
-The above statement is also valid for all gateway backends.
-
 ## Test MinIO Connectivity
 
 ### Test using MinIO Console
@@ -242,16 +236,16 @@ Upgrades require zero downtime in MinIO, all upgrades are non-disruptive, all tr
 mc admin update <minio alias, e.g., myminio>
 ```
 
-- For deployments without external internet access (e.g. airgapped environments), download the binary from <https://dl.min.io> and replace the existing MinIO binary let's say for example `/opt/bin/minio`, apply executable permissions `chmod +x /opt/bin/minio` and do `mc admin service restart alias/`.
+- For deployments without external internet access (e.g. airgapped environments), download the binary from <https://dl.min.io> and replace the existing MinIO binary let's say for example `/opt/bin/minio`, apply executable permissions `chmod +x /opt/bin/minio` and proceed to perform `mc admin service restart alias/`.
 
-- For RPM/DEB installations, upgrade packages **parallelly** on all servers. Once upgraded, perform `systemctl restart minio` across all nodes in **parallel**. RPM/DEB based installations are usually automated using [`ansible`](https://github.com/minio/ansible-minio).
+- For installations using Systemd MinIO service, upgrade via RPM/DEB packages **parallelly** on all servers or replace the binary lets say `/opt/bin/minio` on all nodes, apply executable permissions `chmod +x /opt/bin/minio` and process to perform `mc admin service restart alias/`.
 
 ### Upgrade Checklist
 
 - Test all upgrades in a lower environment (DEV, QA, UAT) before applying to production. Performing blind upgrades in production environments carries significant risk.
-- Read the release notes for the targeted MinIO release *before* performing any installation, there is no forced requirement to upgrade to latest releases every week. If it has a bug fix you are looking for then yes, else avoid actively upgrading a running production system.
-- Make sure MinIO process has write access to `/opt/bin` if you plan to use `mc admin update`. This is needed for MinIO to download the latest binary from <https://dl.min.io> and save it locally for upgrades.
-- `mc admin update` is not supported in kubernetes/container environments, container environments provide their own mechanisms for container updates.
+- Read the release notes for MinIO *before* performing any upgrade, there is no forced requirement to upgrade to latest releases upon every releases. Some releases may not be relevant to your setup, avoid upgrading production environments unnecessarily.
+- If you plan to use `mc admin update`, MinIO process must have write access to the parent directory where the binary is present on the host system.
+- `mc admin update` is not supported and should be avoided in kubernetes/container environments, please upgrade containers by upgrading relevant container images.
 - **We do not recommend upgrading one MinIO server at a time, the product is designed to support parallel upgrades please follow our recommended guidelines.**
 
 ## Explore Further

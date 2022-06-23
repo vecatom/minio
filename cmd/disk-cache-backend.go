@@ -803,7 +803,7 @@ func newCacheEncryptReader(content io.Reader, bucket, object string, metadata ma
 		return nil, err
 	}
 
-	reader, err := sio.EncryptReader(content, sio.Config{Key: objectEncryptionKey, MinVersion: sio.Version20, CipherSuites: fips.CipherSuitesDARE()})
+	reader, err := sio.EncryptReader(content, sio.Config{Key: objectEncryptionKey, MinVersion: sio.Version20, CipherSuites: fips.DARECiphers()})
 	if err != nil {
 		return nil, crypto.ErrInvalidCustomerKey
 	}
@@ -884,6 +884,7 @@ func (c *diskCache) put(ctx context.Context, bucket, object string, data io.Read
 	}
 
 	if err := os.MkdirAll(cachePath, 0o777); err != nil {
+		removeAll(cachePath)
 		return oi, err
 	}
 	metadata := cloneMSS(opts.UserDefined)
@@ -892,6 +893,7 @@ func (c *diskCache) put(ctx context.Context, bucket, object string, data io.Read
 	if globalCacheKMS != nil {
 		reader, err = newCacheEncryptReader(data, bucket, object, metadata)
 		if err != nil {
+			removeAll(cachePath)
 			return oi, err
 		}
 		actualSize, _ = sio.EncryptedSize(uint64(size))
@@ -1452,7 +1454,7 @@ func newCachePartEncryptReader(ctx context.Context, bucket, object string, partI
 		return nil, err
 	}
 
-	reader, err := sio.EncryptReader(content, sio.Config{Key: partEncryptionKey[:], MinVersion: sio.Version20, CipherSuites: fips.CipherSuitesDARE()})
+	reader, err := sio.EncryptReader(content, sio.Config{Key: partEncryptionKey[:], MinVersion: sio.Version20, CipherSuites: fips.DARECiphers()})
 	if err != nil {
 		return nil, crypto.ErrInvalidCustomerKey
 	}
@@ -1628,8 +1630,6 @@ func (c *diskCache) cleanupStaleUploads(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			// Reset for the next interval
-			timer.Reset(cacheStaleUploadCleanupInterval)
 			now := time.Now()
 			readDirFn(pathJoin(c.dir, minioMetaBucket, cacheMultipartDir), func(shaDir string, typ os.FileMode) error {
 				return readDirFn(pathJoin(c.dir, minioMetaBucket, cacheMultipartDir, shaDir), func(uploadIDDir string, typ os.FileMode) error {
@@ -1660,6 +1660,9 @@ func (c *diskCache) cleanupStaleUploads(ctx context.Context) {
 				}
 				return nil
 			})
+
+			// Reset for the next interval
+			timer.Reset(cacheStaleUploadCleanupInterval)
 		}
 	}
 }

@@ -189,33 +189,22 @@ func (api objectAPIHandlers) SelectObjectContentHandler(w http.ResponseWriter, r
 	getObjectNInfo := objectAPI.GetObjectNInfo
 	if api.CacheAPI() != nil {
 		getObjectNInfo = api.CacheAPI().GetObjectNInfo
-	}
-
-	getObject := func(offset, length int64) (rc io.ReadCloser, err error) {
-		isSuffixLength := false
-		if offset < 0 {
-			isSuffixLength = true
+	} else {
+		// Take read lock on object, here so subsequent lower-level
+		// calls do not need to.
+		lock := objectAPI.NewNSLock(bucket, object)
+		lkctx, err := lock.GetRLock(ctx, globalOperationTimeout)
+		if err != nil {
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return
 		}
-
-		if length > 0 {
-			length--
-		}
-
-		rs := &HTTPRangeSpec{
-			IsSuffixLength: isSuffixLength,
-			Start:          offset,
-			End:            offset + length,
-		}
-		if length == -1 {
-			rs.End = -1
-		}
-
-		return getObjectNInfo(ctx, bucket, object, rs, r.Header, readLock, opts)
+		ctx = lkctx.Context()
+		defer lock.RUnlock(lkctx.Cancel)
 	}
 
 	objInfo, err := getObjectInfo(ctx, bucket, object, opts)
 	if err != nil {
-		if globalBucketVersioningSys.Enabled(bucket) {
+		if globalBucketVersioningSys.PrefixEnabled(bucket, object) {
 			// Versioning enabled quite possibly object is deleted might be delete-marker
 			// if present set the headers, no idea why AWS S3 sets these headers.
 			if objInfo.VersionID != "" && objInfo.DeleteMarker {
@@ -241,6 +230,24 @@ func (api objectAPIHandlers) SelectObjectContentHandler(w http.ResponseWriter, r
 		}
 	}
 
+	actualSize, err := objInfo.GetActualSize()
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+
+	objectRSC := s3select.NewObjectReadSeekCloser(
+		func(offset int64) (io.ReadCloser, error) {
+			rs := &HTTPRangeSpec{
+				IsSuffixLength: false,
+				Start:          offset,
+				End:            -1,
+			}
+			return getObjectNInfo(ctx, bucket, object, rs, r.Header, noLock, opts)
+		},
+		actualSize,
+	)
+
 	s3Select, err := s3select.NewS3Select(r.Body)
 	if err != nil {
 		if serr, ok := err.(s3select.SelectError); ok {
@@ -261,7 +268,7 @@ func (api objectAPIHandlers) SelectObjectContentHandler(w http.ResponseWriter, r
 	}
 	defer s3Select.Close()
 
-	if err = s3Select.Open(getObject); err != nil {
+	if err = s3Select.Open(objectRSC); err != nil {
 		if serr, ok := err.(s3select.SelectError); ok {
 			encodedErrorResponse := encodeResponse(APIErrorResponse{
 				Code:       serr.ErrorCode(),
@@ -413,19 +420,25 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 
 	gr, err := getObjectNInfo(ctx, bucket, object, rs, r.Header, readLock, opts)
 	if err != nil {
+		if isErrPreconditionFailed(err) {
+			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return
+		}
+
 		var (
 			reader *GetObjectReader
 			proxy  proxyResult
+			perr   error
 		)
-		proxytgts := getproxyTargets(ctx, bucket, object, opts)
+		proxytgts := getProxyTargets(ctx, bucket, object, opts)
 		if !proxytgts.Empty() {
 			// proxy to replication target if active-active replication is in place.
-			reader, proxy, err = proxyGetToReplicationTarget(ctx, bucket, object, rs, r.Header, opts, proxytgts)
-			if err != nil && !isErrObjectNotFound(ErrorRespToObjectError(err, bucket, object)) &&
-				!isErrVersionNotFound(ErrorRespToObjectError(err, bucket, object)) {
-				logger.LogIf(ctx, fmt.Errorf("Replication proxy failed for %s/%s(%s) - %w", bucket, object, opts.VersionID, err))
+			reader, proxy, perr = proxyGetToReplicationTarget(ctx, bucket, object, rs, r.Header, opts, proxytgts)
+			if perr != nil && !isErrObjectNotFound(ErrorRespToObjectError(perr, bucket, object)) &&
+				!isErrVersionNotFound(ErrorRespToObjectError(perr, bucket, object)) {
+				logger.LogIf(ctx, fmt.Errorf("Replication proxy failed for %s/%s(%s) - %w", bucket, object, opts.VersionID, perr))
 			}
-			if reader != nil && proxy.Proxy && err == nil {
+			if reader != nil && proxy.Proxy && perr == nil {
 				gr = reader
 			}
 		}
@@ -437,7 +450,7 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 				writeErrorResponse(ctx, w, toAPIError(ctx, proxy.Err), r.URL)
 				return
 			}
-			if globalBucketVersioningSys.Enabled(bucket) && gr != nil {
+			if globalBucketVersioningSys.PrefixEnabled(bucket, object) && gr != nil {
 				if !gr.ObjInfo.VersionPurgeStatus.Empty() {
 					// Shows the replication status of a permanent delete of a version
 					w.Header()[xhttp.MinIODeleteReplicationStatus] = []string{string(gr.ObjInfo.VersionPurgeStatus)}
@@ -463,7 +476,8 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 
 	// Automatically remove the object/version is an expiry lifecycle rule can be applied
 	if lc, err := globalLifecycleSys.Get(bucket); err == nil {
-		action := evalActionFromLifecycle(ctx, *lc, objInfo, false)
+		rcfg, _ := globalBucketObjectLockSys.Get(bucket)
+		action := evalActionFromLifecycle(ctx, *lc, rcfg, objInfo, false)
 		var success bool
 		switch action {
 		case lifecycle.DeleteVersionAction, lifecycle.DeleteAction:
@@ -653,7 +667,7 @@ func (api objectAPIHandlers) headObjectHandler(ctx context.Context, objectAPI Ob
 			oi    ObjectInfo
 		)
 		// proxy HEAD to replication target if active-active replication configured on bucket
-		proxytgts := getproxyTargets(ctx, bucket, object, opts)
+		proxytgts := getProxyTargets(ctx, bucket, object, opts)
 		if !proxytgts.Empty() {
 			if rangeHeader != "" {
 				rs, _ = parseRequestRangeSpec(rangeHeader)
@@ -664,7 +678,7 @@ func (api objectAPIHandlers) headObjectHandler(ctx context.Context, objectAPI Ob
 			}
 		}
 		if !proxy.Proxy {
-			if globalBucketVersioningSys.Enabled(bucket) {
+			if globalBucketVersioningSys.PrefixEnabled(bucket, object) {
 				switch {
 				case !objInfo.VersionPurgeStatus.Empty():
 					w.Header()[xhttp.MinIODeleteReplicationStatus] = []string{string(objInfo.VersionPurgeStatus)}
@@ -685,7 +699,8 @@ func (api objectAPIHandlers) headObjectHandler(ctx context.Context, objectAPI Ob
 
 	// Automatically remove the object/version is an expiry lifecycle rule can be applied
 	if lc, err := globalLifecycleSys.Get(bucket); err == nil {
-		action := evalActionFromLifecycle(ctx, *lc, objInfo, false)
+		rcfg, _ := globalBucketObjectLockSys.Get(bucket)
+		action := evalActionFromLifecycle(ctx, *lc, rcfg, objInfo, false)
 		var success bool
 		switch action {
 		case lifecycle.DeleteVersionAction, lifecycle.DeleteAction:
@@ -1031,7 +1046,11 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	srcOpts.VersionID = vid
 
 	// convert copy src encryption options for GET calls
-	getOpts := ObjectOptions{VersionID: srcOpts.VersionID, Versioned: srcOpts.Versioned}
+	getOpts := ObjectOptions{
+		VersionID:        srcOpts.VersionID,
+		Versioned:        srcOpts.Versioned,
+		VersionSuspended: srcOpts.VersionSuspended,
+	}
 	getSSE := encrypt.SSE(srcOpts.ServerSideEncryption)
 	if getSSE != srcOpts.ServerSideEncryption {
 		getOpts.ServerSideEncryption = getSSE
@@ -1077,7 +1096,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		if isErrPreconditionFailed(err) {
 			return
 		}
-		if globalBucketVersioningSys.Enabled(srcBucket) && gr != nil {
+		if globalBucketVersioningSys.PrefixEnabled(srcBucket, srcObject) && gr != nil {
 			// Versioning enabled quite possibly object is deleted might be delete-marker
 			// if present set the headers, no idea why AWS S3 sets these headers.
 			if gr.ObjInfo.VersionID != "" && gr.ObjInfo.DeleteMarker {
@@ -1108,10 +1127,10 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	}
 
 	var chStorageClass bool
-	if dstSc != "" {
+	if dstSc != "" && dstSc != srcInfo.StorageClass {
 		chStorageClass = true
 		srcInfo.metadataOnly = false
-	}
+	} // no changes in storage-class expected so its a metadataonly operation.
 
 	var reader io.Reader = gr
 
@@ -2470,7 +2489,7 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 		if isErrPreconditionFailed(err) {
 			return
 		}
-		if globalBucketVersioningSys.Enabled(srcBucket) && gr != nil {
+		if globalBucketVersioningSys.PrefixEnabled(srcBucket, srcObject) && gr != nil {
 			// Versioning enabled quite possibly object is deleted might be delete-marker
 			// if present set the headers, no idea why AWS S3 sets these headers.
 			if gr.ObjInfo.VersionID != "" && gr.ObjInfo.DeleteMarker {
@@ -2604,7 +2623,7 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 		copy(objectEncryptionKey[:], key)
 
 		partEncryptionKey := objectEncryptionKey.DerivePartKey(uint32(partID))
-		encReader, err := sio.EncryptReader(reader, sio.Config{Key: partEncryptionKey[:], CipherSuites: fips.CipherSuitesDARE()})
+		encReader, err := sio.EncryptReader(reader, sio.Config{Key: partEncryptionKey[:], CipherSuites: fips.DARECiphers()})
 		if err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
@@ -2867,7 +2886,7 @@ func (api objectAPIHandlers) PutObjectPartHandler(w http.ResponseWriter, r *http
 			// We add a buffer on bigger files to reduce the number of syscalls upstream.
 			in = bufio.NewReaderSize(hashReader, encryptBufferSize)
 		}
-		reader, err = sio.EncryptReader(in, sio.Config{Key: partEncryptionKey[:], CipherSuites: fips.CipherSuitesDARE()})
+		reader, err = sio.EncryptReader(in, sio.Config{Key: partEncryptionKey[:], CipherSuites: fips.DARECiphers()})
 		if err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
@@ -3024,34 +3043,29 @@ func (api objectAPIHandlers) ListObjectPartsHandler(w http.ResponseWriter, r *ht
 		return
 	}
 
-	var ssec bool
-	if _, ok := crypto.IsEncrypted(listPartsInfo.UserDefined); ok && objectAPI.IsEncryptionSupported() {
-		var key []byte
-		if crypto.SSEC.IsEncrypted(listPartsInfo.UserDefined) {
-			ssec = true
-		}
+	// We have to adjust the size of encrypted parts since encrypted parts
+	// are slightly larger due to encryption overhead.
+	// Further, we have to adjust the ETags of parts when using SSE-S3.
+	// Due to AWS S3, SSE-S3 encrypted parts return the plaintext ETag
+	// being the content MD5 of that particular part. This is not the
+	// case for SSE-C and SSE-KMS objects.
+	if kind, ok := crypto.IsEncrypted(listPartsInfo.UserDefined); ok && objectAPI.IsEncryptionSupported() {
 		var objectEncryptionKey []byte
-		if crypto.S3.IsEncrypted(listPartsInfo.UserDefined) {
-			// Calculating object encryption key
-			objectEncryptionKey, err = decryptObjectInfo(key, bucket, object, listPartsInfo.UserDefined)
+		if kind == crypto.S3 {
+			objectEncryptionKey, err = decryptObjectInfo(nil, bucket, object, listPartsInfo.UserDefined)
 			if err != nil {
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 				return
 			}
 		}
-		for i := range listPartsInfo.Parts {
-			curp := listPartsInfo.Parts[i]
-			curp.ETag = tryDecryptETag(objectEncryptionKey, curp.ETag, ssec)
-			if !ssec {
-				var partSize uint64
-				partSize, err = sio.DecryptedSize(uint64(curp.Size))
-				if err != nil {
-					writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-					return
-				}
-				curp.Size = int64(partSize)
+		for i, p := range listPartsInfo.Parts {
+			listPartsInfo.Parts[i].ETag = tryDecryptETag(objectEncryptionKey, p.ETag, kind != crypto.S3)
+			size, err := sio.DecryptedSize(uint64(p.Size))
+			if err != nil {
+				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+				return
 			}
-			listPartsInfo.Parts[i] = curp
+			listPartsInfo.Parts[i].Size = int64(size)
 		}
 	}
 
@@ -3088,10 +3102,12 @@ func (w *whiteSpaceWriter) WriteHeader(statusCode int) {
 // we do background append as and when the parts arrive and completeMultiPartUpload
 // is quick. Only in a rare case where parts would be out of order will
 // FS:completeMultiPartUpload() take a longer time.
-func sendWhiteSpace(w http.ResponseWriter) <-chan bool {
+func sendWhiteSpace(ctx context.Context, w http.ResponseWriter) <-chan bool {
 	doneCh := make(chan bool)
 	go func() {
+		defer close(doneCh)
 		ticker := time.NewTicker(time.Second * 10)
+		defer ticker.Stop()
 		headerWritten := false
 		for {
 			select {
@@ -3111,7 +3127,8 @@ func sendWhiteSpace(w http.ResponseWriter) <-chan bool {
 				}
 				w.(http.Flusher).Flush()
 			case doneCh <- headerWritten:
-				ticker.Stop()
+				return
+			case <-ctx.Done():
 				return
 			}
 		}
@@ -3206,8 +3223,8 @@ func (api objectAPIHandlers) CompleteMultipartUploadHandler(w http.ResponseWrite
 		w.Write(encodedErrorResponse)
 	}
 
-	versioned := globalBucketVersioningSys.Enabled(bucket)
-	suspended := globalBucketVersioningSys.Suspended(bucket)
+	versioned := globalBucketVersioningSys.PrefixEnabled(bucket, object)
+	suspended := globalBucketVersioningSys.PrefixSuspended(bucket, object)
 	os := newObjSweeper(bucket, object).WithVersioning(versioned, suspended)
 	if !globalTierConfigMgr.Empty() {
 		// Get appropriate object info to identify the remote object to delete
@@ -3285,7 +3302,7 @@ func (api objectAPIHandlers) CompleteMultipartUploadHandler(w http.ResponseWrite
 	}
 
 	w = &whiteSpaceWriter{ResponseWriter: w, Flusher: w.(http.Flusher)}
-	completeDoneCh := sendWhiteSpace(w)
+	completeDoneCh := sendWhiteSpace(ctx, w)
 	objInfo, err := completeMultiPartUpload(ctx, bucket, object, uploadID, complMultipartUpload.Parts, opts)
 	// Stop writing white spaces to the client. Note that close(doneCh) style is not used as it
 	// can cause white space to be written after we send XML response in a race condition.
@@ -3444,17 +3461,15 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 			writeErrorResponse(ctx, w, toAPIError(ctx, errors.New("force-delete is forbidden in a locked-enabled bucket")), r.URL)
 			return
 		}
-		if vID != "" {
-			apiErr = enforceRetentionBypassForDelete(ctx, r, bucket, ObjectToDelete{
-				ObjectV: ObjectV{
-					ObjectName: object,
-					VersionID:  vID,
-				},
-			}, goi, gerr)
-			if apiErr != ErrNone && apiErr != ErrNoSuchKey {
-				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(apiErr), r.URL)
-				return
-			}
+		apiErr = enforceRetentionBypassForDelete(ctx, r, bucket, ObjectToDelete{
+			ObjectV: ObjectV{
+				ObjectName: object,
+				VersionID:  vID,
+			},
+		}, goi, gerr)
+		if apiErr != ErrNone && apiErr != ErrNoSuchKey {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(apiErr), r.URL)
+			return
 		}
 	}
 
@@ -4193,23 +4208,26 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 	go func() {
 		rctx := GlobalContext
 		if !rreq.SelectParameters.IsEmpty() {
-			getObject := func(offset, length int64) (rc io.ReadCloser, err error) {
-				isSuffixLength := false
-				if offset < 0 {
-					isSuffixLength = true
-				}
-
-				rs := &HTTPRangeSpec{
-					IsSuffixLength: isSuffixLength,
-					Start:          offset,
-					End:            offset + length,
-				}
-
-				return getTransitionedObjectReader(rctx, bucket, object, rs, r.Header, objInfo, ObjectOptions{
-					VersionID: objInfo.VersionID,
-				})
+			actualSize, err := objInfo.GetActualSize()
+			if err != nil {
+				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+				return
 			}
-			if err = rreq.SelectParameters.Open(getObject); err != nil {
+
+			objectRSC := s3select.NewObjectReadSeekCloser(
+				func(offset int64) (io.ReadCloser, error) {
+					rs := &HTTPRangeSpec{
+						IsSuffixLength: false,
+						Start:          offset,
+						End:            -1,
+					}
+					return getTransitionedObjectReader(rctx, bucket, object, rs, r.Header,
+						objInfo, ObjectOptions{VersionID: objInfo.VersionID})
+				},
+				actualSize,
+			)
+
+			if err = rreq.SelectParameters.Open(objectRSC); err != nil {
 				if serr, ok := err.(s3select.SelectError); ok {
 					encodedErrorResponse := encodeResponse(APIErrorResponse{
 						Code:       serr.ErrorCode(),

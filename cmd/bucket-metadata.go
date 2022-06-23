@@ -81,6 +81,13 @@ type BucketMetadata struct {
 	ReplicationConfigXML        []byte
 	BucketTargetsConfigJSON     []byte
 	BucketTargetsConfigMetaJSON []byte
+	PolicyConfigUpdatedAt       time.Time
+	ObjectLockConfigUpdatedAt   time.Time
+	EncryptionConfigUpdatedAt   time.Time
+	TaggingConfigUpdatedAt      time.Time
+	QuotaConfigUpdatedAt        time.Time
+	ReplicationConfigUpdatedAt  time.Time
+	VersioningConfigUpdatedAt   time.Time
 
 	// Unexported fields. Must be updated atomically.
 	policyConfig           *policy.Policy
@@ -98,9 +105,10 @@ type BucketMetadata struct {
 
 // newBucketMetadata creates BucketMetadata with the supplied name and Created to Now.
 func newBucketMetadata(name string) BucketMetadata {
+	now := UTCNow()
 	return BucketMetadata{
 		Name:    name,
-		Created: UTCNow(),
+		Created: now,
 		notificationConfig: &event.Config{
 			XMLNS: "http://s3.amazonaws.com/doc/2006-03-01/",
 		},
@@ -157,8 +165,13 @@ func loadBucketMetadata(ctx context.Context, objectAPI ObjectLayer, bucket strin
 	if err := b.convertLegacyConfigs(ctx, objectAPI); err != nil {
 		return b, err
 	}
+
 	// migrate unencrypted remote targets
-	return b, b.migrateTargetConfig(ctx, objectAPI)
+	if err = b.migrateTargetConfig(ctx, objectAPI); err != nil {
+		return b, err
+	}
+	b.defaultTimestamps()
+	return b, nil
 }
 
 // parseAllConfigs will parse all configs and populate the private fields.
@@ -347,6 +360,37 @@ func (b *BucketMetadata) convertLegacyConfigs(ctx context.Context, objectAPI Obj
 	return nil
 }
 
+// default timestamps to metadata Created timestamp if unset.
+func (b *BucketMetadata) defaultTimestamps() {
+	if b.PolicyConfigUpdatedAt.IsZero() {
+		b.PolicyConfigUpdatedAt = b.Created
+	}
+
+	if b.EncryptionConfigUpdatedAt.IsZero() {
+		b.EncryptionConfigUpdatedAt = b.Created
+	}
+
+	if b.TaggingConfigUpdatedAt.IsZero() {
+		b.TaggingConfigUpdatedAt = b.Created
+	}
+
+	if b.ObjectLockConfigUpdatedAt.IsZero() {
+		b.ObjectLockConfigUpdatedAt = b.Created
+	}
+
+	if b.QuotaConfigUpdatedAt.IsZero() {
+		b.QuotaConfigUpdatedAt = b.Created
+	}
+
+	if b.ReplicationConfigUpdatedAt.IsZero() {
+		b.ReplicationConfigUpdatedAt = b.Created
+	}
+
+	if b.VersioningConfigUpdatedAt.IsZero() {
+		b.VersioningConfigUpdatedAt = b.Created
+	}
+}
+
 // Save config to supplied ObjectLayer api.
 func (b *BucketMetadata) Save(ctx context.Context, api ObjectLayer) error {
 	if err := b.parseAllConfigs(ctx, api); err != nil {
@@ -421,7 +465,7 @@ func encryptBucketMetadata(bucket string, input []byte, kmsContext kms.Context) 
 	objectKey := crypto.GenerateKey(key.Plaintext, rand.Reader)
 	sealedKey := objectKey.Seal(key.Plaintext, crypto.GenerateIV(rand.Reader), crypto.S3.String(), bucket, "")
 	crypto.S3.CreateMetadata(metadata, key.KeyID, key.Ciphertext, sealedKey)
-	_, err = sio.Encrypt(outbuf, bytes.NewBuffer(input), sio.Config{Key: objectKey[:], MinVersion: sio.Version20, CipherSuites: fips.CipherSuitesDARE()})
+	_, err = sio.Encrypt(outbuf, bytes.NewBuffer(input), sio.Config{Key: objectKey[:], MinVersion: sio.Version20, CipherSuites: fips.DARECiphers()})
 	if err != nil {
 		return output, metabytes, err
 	}
@@ -451,6 +495,6 @@ func decryptBucketMetadata(input []byte, bucket string, meta map[string]string, 
 	}
 
 	outbuf := bytes.NewBuffer(nil)
-	_, err = sio.Decrypt(outbuf, bytes.NewBuffer(input), sio.Config{Key: objectKey[:], MinVersion: sio.Version20, CipherSuites: fips.CipherSuitesDARE()})
+	_, err = sio.Decrypt(outbuf, bytes.NewBuffer(input), sio.Config{Key: objectKey[:], MinVersion: sio.Version20, CipherSuites: fips.DARECiphers()})
 	return outbuf.Bytes(), err
 }

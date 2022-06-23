@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -31,7 +32,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/minio/cli"
 	"github.com/minio/madmin-go"
-	"github.com/minio/minio/internal/color"
+	"github.com/minio/minio/internal/config"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/certs"
@@ -210,15 +211,14 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 	// Handle gateway specific env
 	gatewayHandleEnvVars()
 
+	// Initialize KMS configuration
+	handleKMSConfig()
+
 	// Set system resources to maximum.
 	setMaxResources()
 
 	// Set when gateway is enabled
 	globalIsGateway = true
-
-	// TODO: We need to move this code with globalConfigSys.Init()
-	// for now keep it here such that "s3" gateway layer initializes
-	// itself properly when KMS is set.
 
 	// Initialize server config.
 	srvCfg := newServerConfig()
@@ -292,6 +292,9 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 		SecretKey: globalActiveCred.SecretKey,
 	})
 	if err != nil {
+		if errors.Is(err, errFreshDisk) {
+			err = config.ErrInvalidFSValue(err)
+		}
 		logger.FatalIf(err, "Unable to initialize gateway backend")
 	}
 	newObject = NewGatewayLayerWithLocker(newObject)
@@ -375,16 +378,6 @@ func StartGateway(ctx *cli.Context, gw Gateway) {
 		}
 		logger.Info("======")
 	}
-
-	// TODO: remove the following line by June 1st.
-	logger.Info(
-		color.RedBold(`
-===================================================================================
-**** WARNING: MinIO Gateway will be removed by June 1st from MinIO repository *****
-
-Please read https://github.com/minio/minio/issues/14331
-===================================================================================
-`))
 
 	<-globalOSSignalCh
 }

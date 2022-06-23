@@ -386,13 +386,13 @@ func getHostFromSrv(records []dns.SrvRecord) (host string) {
 }
 
 // IsCompressed returns true if the object is marked as compressed.
-func (o ObjectInfo) IsCompressed() bool {
+func (o *ObjectInfo) IsCompressed() bool {
 	_, ok := o.UserDefined[ReservedMetadataPrefix+"compression"]
 	return ok
 }
 
 // IsCompressedOK returns whether the object is compressed and can be decompressed.
-func (o ObjectInfo) IsCompressedOK() (bool, error) {
+func (o *ObjectInfo) IsCompressedOK() (bool, error) {
 	scheme, ok := o.UserDefined[ReservedMetadataPrefix+"compression"]
 	if !ok {
 		return false, nil
@@ -404,17 +404,8 @@ func (o ObjectInfo) IsCompressedOK() (bool, error) {
 	return true, fmt.Errorf("unknown compression scheme: %s", scheme)
 }
 
-// GetActualETag - returns the actual etag of the stored object
-// decrypts SSE objects.
-func (o ObjectInfo) GetActualETag(h http.Header) string {
-	if _, ok := crypto.IsEncrypted(o.UserDefined); !ok {
-		return o.ETag
-	}
-	return getDecryptedETag(h, o, false)
-}
-
 // GetActualSize - returns the actual size of the stored object
-func (o ObjectInfo) GetActualSize() (int64, error) {
+func (o *ObjectInfo) GetActualSize() (int64, error) {
 	if o.IsCompressed() {
 		sizeStr, ok := o.UserDefined[ReservedMetadataPrefix+"actual-size"]
 		if !ok {
@@ -959,7 +950,7 @@ func compressSelfTest() {
 
 // getDiskInfos returns the disk information for the provided disks.
 // If a disk is nil or an error is returned the result will be nil as well.
-func getDiskInfos(ctx context.Context, disks []StorageAPI) []*DiskInfo {
+func getDiskInfos(ctx context.Context, disks ...StorageAPI) []*DiskInfo {
 	res := make([]*DiskInfo, len(disks))
 	for i, disk := range disks {
 		if disk == nil {

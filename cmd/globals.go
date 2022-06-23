@@ -37,12 +37,14 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/config/cache"
+	"github.com/minio/minio/internal/config/callhome"
 	"github.com/minio/minio/internal/config/compress"
 	"github.com/minio/minio/internal/config/dns"
 	xldap "github.com/minio/minio/internal/config/identity/ldap"
 	"github.com/minio/minio/internal/config/identity/openid"
+	idplugin "github.com/minio/minio/internal/config/identity/plugin"
 	xtls "github.com/minio/minio/internal/config/identity/tls"
-	"github.com/minio/minio/internal/config/policy/opa"
+	polplugin "github.com/minio/minio/internal/config/policy/plugin"
 	"github.com/minio/minio/internal/config/storageclass"
 	"github.com/minio/minio/internal/config/subnet"
 	xhttp "github.com/minio/minio/internal/http"
@@ -73,6 +75,7 @@ const (
 	globalWindowsOSName            = "windows"
 	globalMacOSName                = "darwin"
 	globalMinioModeFS              = "mode-server-fs"
+	globalMinioModeErasureSD       = "mode-server-xl-single"
 	globalMinioModeErasure         = "mode-server-xl"
 	globalMinioModeDistErasure     = "mode-server-distributed-xl"
 	globalMinioModeGatewayPrefix   = "mode-gateway-"
@@ -102,7 +105,7 @@ const (
 	GlobalStaleUploadsCleanupInterval = time.Hour * 6 // 6 hrs.
 
 	// Refresh interval to update in-memory iam config cache.
-	globalRefreshIAMInterval = 5 * time.Minute
+	globalRefreshIAMInterval = 10 * time.Minute
 
 	// Limit of location constraint XML for unauthenticated PUT bucket operations.
 	maxLocationConstraintSize = 3 * humanize.MiByte
@@ -112,6 +115,10 @@ const (
 
 	// diskFillFraction is the fraction of a disk we allow to be filled.
 	diskFillFraction = 0.99
+
+	// diskReserveFraction is the fraction of a disk where we will fill other server pools first.
+	// If all pools reach this, we will use all pools with regular placement.
+	diskReserveFraction = 0.15
 
 	// diskAssumeUnknownSize is the size to assume when an unknown size upload is requested.
 	diskAssumeUnknownSize = 1 << 30
@@ -136,10 +143,16 @@ var (
 	// Indicates if the running minio server is an erasure-code backend.
 	globalIsErasure = false
 
+	// Indicates if the running minio server is in single drive XL mode.
+	globalIsErasureSD = false
+
 	// Indicates if the running minio is in gateway mode.
 	globalIsGateway = false
 
-	// Name of gateway server, e.g S3, GCS, Azure, etc
+	// Indicates if server code should go through testing path.
+	globalIsTesting = false
+
+	// Name of gateway server, e.g S3, NAS etc
 	globalGatewayName = ""
 
 	// This flag is set to 'true' by default
@@ -190,12 +203,15 @@ var (
 	globalBucketTargetSys    *BucketTargetSys
 	// globalAPIConfig controls S3 API requests throttling,
 	// healthcheck readiness deadlines and cors settings.
-	globalAPIConfig = apiConfig{listQuorum: 3}
+	globalAPIConfig = apiConfig{listQuorum: "strict"}
 
 	globalStorageClass storageclass.Config
+
 	globalLDAPConfig   xldap.Config
 	globalOpenIDConfig openid.Config
 	globalSTSTLSConfig xtls.Config
+
+	globalAuthNPlugin *idplugin.AuthNPlugin
 
 	// CA root certificates, a nil value means system certs pool will be used
 	globalRootCAs *x509.CertPool
@@ -211,10 +227,10 @@ var (
 
 	// global Trace system to send HTTP request/response
 	// and Storage/OS calls info to registered listeners.
-	globalTrace = pubsub.New()
+	globalTrace = pubsub.New(8)
 
 	// global Listen system to send S3 API events to registered listeners
-	globalHTTPListen = pubsub.New()
+	globalHTTPListen = pubsub.New(0)
 
 	// global console system to send console logs to
 	// registered listeners
@@ -228,6 +244,9 @@ var (
 	// The global subnet config
 	globalSubnetConfig subnet.Config
 
+	// The global callhome config
+	globalCallhomeConfig callhome.Config
+
 	globalRemoteEndpoints map[string]Endpoint
 
 	// Global server's network statistics
@@ -235,6 +254,9 @@ var (
 
 	// Global HTTP request statisitics
 	globalHTTPStats = newHTTPStats()
+
+	// Global bucket network statistics
+	globalBucketConnStats = newBucketConnStats()
 
 	// Time when the server is started
 	globalBootTime = UTCNow()
@@ -290,11 +312,8 @@ var (
 	// Some standard content-types which we strictly dis-allow for compression.
 	standardExcludeCompressContentTypes = []string{"video/*", "audio/*", "application/zip", "application/x-gzip", "application/x-zip-compressed", " application/x-compress", "application/x-spoon"}
 
-	// Authorization validators list.
-	globalOpenIDValidators *openid.Validators
-
-	// OPA policy system.
-	globalPolicyOPA *opa.Opa
+	// AuthZ Plugin system.
+	globalAuthZPlugin *polplugin.AuthZPlugin
 
 	// Deployment ID - unique per deployment
 	globalDeploymentID string
@@ -318,6 +337,8 @@ var (
 	globalInternodeTransport http.RoundTripper
 
 	globalProxyTransport http.RoundTripper
+
+	globalRemoteTargetTransport http.RoundTripper
 
 	globalDNSCache = &dnscache.Resolver{
 		Timeout: 5 * time.Second,
@@ -347,10 +368,26 @@ var (
 	globalRootDiskThreshold uint64
 
 	// Used for collecting stats for netperf
-	globalNetPerfMinDuration = time.Second * 10
-	globalNetPerfRX          netPerfRX
+	globalNetPerfMinDuration     = time.Second * 10
+	globalNetPerfRX              netPerfRX
+	globalObjectPerfBucket       = "minio-perf-test-tmp-bucket"
+	globalObjectPerfUserMetadata = "X-Amz-Meta-Minio-Object-Perf" // Clients can set this to bypass S3 API service freeze. Used by object pref tests.
 
 	// Add new variable global values here.
 )
+
+var globalAuthZPluginMutex sync.Mutex
+
+func newGlobalAuthZPluginFn() *polplugin.AuthZPlugin {
+	globalAuthZPluginMutex.Lock()
+	defer globalAuthZPluginMutex.Unlock()
+	return globalAuthZPlugin
+}
+
+func setGlobalAuthZPlugin(authz *polplugin.AuthZPlugin) {
+	globalAuthZPluginMutex.Lock()
+	globalAuthZPlugin = authz
+	globalAuthZPluginMutex.Unlock()
+}
 
 var errSelfTestFailure = errors.New("self test failed. unsafe to start server")

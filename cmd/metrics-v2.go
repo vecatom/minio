@@ -62,6 +62,7 @@ func init() {
 		getS3TTFBMetric(),
 		getILMNodeMetrics(),
 		getScannerNodeMetrics(),
+		getIAMNodeMetrics(),
 	}
 
 	allMetricsGroups := func() (allMetrics []*MetricsGroup) {
@@ -121,6 +122,7 @@ const (
 	quotaSubsystem            MetricSubsystem = "quota"
 	ilmSubsystem              MetricSubsystem = "ilm"
 	scannerSubsystem          MetricSubsystem = "scanner"
+	iamSubsystem              MetricSubsystem = "iam"
 )
 
 // MetricName are the individual names for the metric.
@@ -291,7 +293,7 @@ func getClusterCapacityTotalBytesMD() MetricDescription {
 		Namespace: clusterMetricNamespace,
 		Subsystem: capacityRawSubsystem,
 		Name:      totalBytes,
-		Help:      "Total capacity online in the cluster.",
+		Help:      "Total capacity online in the cluster",
 		Type:      gaugeMetric,
 	}
 }
@@ -301,7 +303,7 @@ func getClusterCapacityFreeBytesMD() MetricDescription {
 		Namespace: clusterMetricNamespace,
 		Subsystem: capacityRawSubsystem,
 		Name:      freeBytes,
-		Help:      "Total free capacity online in the cluster.",
+		Help:      "Total free capacity online in the cluster",
 		Type:      gaugeMetric,
 	}
 }
@@ -311,7 +313,7 @@ func getClusterCapacityUsageBytesMD() MetricDescription {
 		Namespace: clusterMetricNamespace,
 		Subsystem: capacityUsableSubsystem,
 		Name:      totalBytes,
-		Help:      "Total usable capacity online in the cluster.",
+		Help:      "Total usable capacity online in the cluster",
 		Type:      gaugeMetric,
 	}
 }
@@ -321,7 +323,7 @@ func getClusterCapacityUsageFreeBytesMD() MetricDescription {
 		Namespace: clusterMetricNamespace,
 		Subsystem: capacityUsableSubsystem,
 		Name:      freeBytes,
-		Help:      "Total free usable capacity online in the cluster.",
+		Help:      "Total free usable capacity online in the cluster",
 		Type:      gaugeMetric,
 	}
 }
@@ -331,7 +333,7 @@ func getNodeDiskAPILatencyMD() MetricDescription {
 		Namespace: nodeMetricNamespace,
 		Subsystem: diskSubsystem,
 		Name:      apiLatencyMicroSec,
-		Help:      "Average last minute latency in µs for disk API storage operations.",
+		Help:      "Average last minute latency in µs for disk API storage operations",
 		Type:      gaugeMetric,
 	}
 }
@@ -341,7 +343,7 @@ func getNodeDiskUsedBytesMD() MetricDescription {
 		Namespace: nodeMetricNamespace,
 		Subsystem: diskSubsystem,
 		Name:      usedBytes,
-		Help:      "Total storage used on a disk.",
+		Help:      "Total storage used on a disk",
 		Type:      gaugeMetric,
 	}
 }
@@ -351,7 +353,7 @@ func getNodeDiskFreeBytesMD() MetricDescription {
 		Namespace: nodeMetricNamespace,
 		Subsystem: diskSubsystem,
 		Name:      freeBytes,
-		Help:      "Total storage available on a disk.",
+		Help:      "Total storage available on a disk",
 		Type:      gaugeMetric,
 	}
 }
@@ -361,7 +363,7 @@ func getClusterDisksOfflineTotalMD() MetricDescription {
 		Namespace: clusterMetricNamespace,
 		Subsystem: diskSubsystem,
 		Name:      offlineTotal,
-		Help:      "Total disks offline.",
+		Help:      "Total disks offline",
 		Type:      gaugeMetric,
 	}
 }
@@ -371,7 +373,7 @@ func getClusterDisksOnlineTotalMD() MetricDescription {
 		Namespace: clusterMetricNamespace,
 		Subsystem: diskSubsystem,
 		Name:      onlineTotal,
-		Help:      "Total disks online.",
+		Help:      "Total disks online",
 		Type:      gaugeMetric,
 	}
 }
@@ -381,7 +383,7 @@ func getClusterDisksTotalMD() MetricDescription {
 		Namespace: clusterMetricNamespace,
 		Subsystem: diskSubsystem,
 		Name:      total,
-		Help:      "Total disks.",
+		Help:      "Total disks",
 		Type:      gaugeMetric,
 	}
 }
@@ -391,7 +393,7 @@ func getClusterDisksFreeInodes() MetricDescription {
 		Namespace: clusterMetricNamespace,
 		Subsystem: diskSubsystem,
 		Name:      freeInodes,
-		Help:      "Total free inodes.",
+		Help:      "Total free inodes",
 		Type:      gaugeMetric,
 	}
 }
@@ -401,7 +403,7 @@ func getNodeDiskTotalBytesMD() MetricDescription {
 		Namespace: nodeMetricNamespace,
 		Subsystem: diskSubsystem,
 		Name:      totalBytes,
-		Help:      "Total storage on a disk.",
+		Help:      "Total storage on a disk",
 		Type:      gaugeMetric,
 	}
 }
@@ -422,6 +424,26 @@ func getBucketUsageQuotaTotalBytesMD() MetricDescription {
 		Subsystem: quotaSubsystem,
 		Name:      totalBytes,
 		Help:      "Total bucket quota size in bytes",
+		Type:      gaugeMetric,
+	}
+}
+
+func getBucketTrafficReceivedBytes() MetricDescription {
+	return MetricDescription{
+		Namespace: bucketMetricNamespace,
+		Subsystem: trafficSubsystem,
+		Name:      receivedBytes,
+		Help:      "Total number of S3 bytes received for this bucket",
+		Type:      gaugeMetric,
+	}
+}
+
+func getBucketTrafficSentBytes() MetricDescription {
+	return MetricDescription{
+		Namespace: bucketMetricNamespace,
+		Subsystem: trafficSubsystem,
+		Name:      sentBytes,
+		Help:      "Total number of S3 bytes sent for this bucket",
 		Type:      gaugeMetric,
 	}
 }
@@ -451,7 +473,7 @@ func getBucketRepLatencyMD() MetricDescription {
 		Namespace: bucketMetricNamespace,
 		Subsystem: replicationSubsystem,
 		Name:      latencyMilliSec,
-		Help:      "Replication latency in milliseconds.",
+		Help:      "Replication latency in milliseconds",
 		Type:      histogramMetric,
 	}
 }
@@ -461,7 +483,7 @@ func getBucketRepFailedBytesMD() MetricDescription {
 		Namespace: bucketMetricNamespace,
 		Subsystem: replicationSubsystem,
 		Name:      failedBytes,
-		Help:      "Total number of bytes failed at least once to replicate.",
+		Help:      "Total number of bytes failed at least once to replicate",
 		Type:      gaugeMetric,
 	}
 }
@@ -471,7 +493,7 @@ func getBucketRepSentBytesMD() MetricDescription {
 		Namespace: bucketMetricNamespace,
 		Subsystem: replicationSubsystem,
 		Name:      sentBytes,
-		Help:      "Total number of bytes replicated to the target bucket.",
+		Help:      "Total number of bytes replicated to the target bucket",
 		Type:      gaugeMetric,
 	}
 }
@@ -481,7 +503,7 @@ func getBucketRepReceivedBytesMD() MetricDescription {
 		Namespace: bucketMetricNamespace,
 		Subsystem: replicationSubsystem,
 		Name:      receivedBytes,
-		Help:      "Total number of bytes replicated to this bucket from another source bucket.",
+		Help:      "Total number of bytes replicated to this bucket from another source bucket",
 		Type:      gaugeMetric,
 	}
 }
@@ -501,7 +523,7 @@ func getBucketObjectDistributionMD() MetricDescription {
 		Namespace: bucketMetricNamespace,
 		Subsystem: objectsSubsystem,
 		Name:      sizeDistribution,
-		Help:      "Distribution of object sizes in the bucket, includes label for the bucket name.",
+		Help:      "Distribution of object sizes in the bucket, includes label for the bucket name",
 		Type:      histogramMetric,
 	}
 }
@@ -511,7 +533,7 @@ func getInternodeFailedRequests() MetricDescription {
 		Namespace: interNodeMetricNamespace,
 		Subsystem: trafficSubsystem,
 		Name:      errorsTotal,
-		Help:      "Total number of failed internode calls.",
+		Help:      "Total number of failed internode calls",
 		Type:      counterMetric,
 	}
 }
@@ -521,7 +543,7 @@ func getInterNodeSentBytesMD() MetricDescription {
 		Namespace: interNodeMetricNamespace,
 		Subsystem: trafficSubsystem,
 		Name:      sentBytes,
-		Help:      "Total number of bytes sent to the other peer nodes.",
+		Help:      "Total number of bytes sent to the other peer nodes",
 		Type:      counterMetric,
 	}
 }
@@ -531,7 +553,7 @@ func getInterNodeReceivedBytesMD() MetricDescription {
 		Namespace: interNodeMetricNamespace,
 		Subsystem: trafficSubsystem,
 		Name:      receivedBytes,
-		Help:      "Total number of bytes received from other peer nodes.",
+		Help:      "Total number of bytes received from other peer nodes",
 		Type:      counterMetric,
 	}
 }
@@ -551,7 +573,7 @@ func getS3ReceivedBytesMD() MetricDescription {
 		Namespace: s3MetricNamespace,
 		Subsystem: trafficSubsystem,
 		Name:      receivedBytes,
-		Help:      "Total number of s3 bytes received.",
+		Help:      "Total number of s3 bytes received",
 		Type:      counterMetric,
 	}
 }
@@ -601,7 +623,27 @@ func getS3RequestsErrorsMD() MetricDescription {
 		Namespace: s3MetricNamespace,
 		Subsystem: requestsSubsystem,
 		Name:      errorsTotal,
-		Help:      "Total number S3 requests with errors",
+		Help:      "Total number S3 requests with (4xx and 5xx) errors",
+		Type:      counterMetric,
+	}
+}
+
+func getS3Requests4xxErrorsMD() MetricDescription {
+	return MetricDescription{
+		Namespace: s3MetricNamespace,
+		Subsystem: requestsSubsystem,
+		Name:      "4xx_" + errorsTotal,
+		Help:      "Total number S3 requests with (4xx) errors",
+		Type:      counterMetric,
+	}
+}
+
+func getS3Requests5xxErrorsMD() MetricDescription {
+	return MetricDescription{
+		Namespace: s3MetricNamespace,
+		Subsystem: requestsSubsystem,
+		Name:      "5xx_" + errorsTotal,
+		Help:      "Total number S3 requests with (5xx) errors",
 		Type:      counterMetric,
 	}
 }
@@ -621,7 +663,7 @@ func getS3RejectedAuthRequestsTotalMD() MetricDescription {
 		Namespace: s3MetricNamespace,
 		Subsystem: requestsRejectedSubsystem,
 		Name:      authTotal,
-		Help:      "Total number S3 requests rejected for auth failure.",
+		Help:      "Total number S3 requests rejected for auth failure",
 		Type:      counterMetric,
 	}
 }
@@ -631,7 +673,7 @@ func getS3RejectedHeaderRequestsTotalMD() MetricDescription {
 		Namespace: s3MetricNamespace,
 		Subsystem: requestsRejectedSubsystem,
 		Name:      headerTotal,
-		Help:      "Total number S3 requests rejected for invalid header.",
+		Help:      "Total number S3 requests rejected for invalid header",
 		Type:      counterMetric,
 	}
 }
@@ -641,7 +683,7 @@ func getS3RejectedTimestampRequestsTotalMD() MetricDescription {
 		Namespace: s3MetricNamespace,
 		Subsystem: requestsRejectedSubsystem,
 		Name:      timestampTotal,
-		Help:      "Total number S3 requests rejected for invalid timestamp.",
+		Help:      "Total number S3 requests rejected for invalid timestamp",
 		Type:      counterMetric,
 	}
 }
@@ -651,7 +693,7 @@ func getS3RejectedInvalidRequestsTotalMD() MetricDescription {
 		Namespace: s3MetricNamespace,
 		Subsystem: requestsRejectedSubsystem,
 		Name:      invalidTotal,
-		Help:      "Total number S3 invalid requests.",
+		Help:      "Total number S3 invalid requests",
 		Type:      counterMetric,
 	}
 }
@@ -771,7 +813,7 @@ func getNodeOnlineTotalMD() MetricDescription {
 		Namespace: clusterMetricNamespace,
 		Subsystem: nodesSubsystem,
 		Name:      onlineTotal,
-		Help:      "Total number of MinIO nodes online.",
+		Help:      "Total number of MinIO nodes online",
 		Type:      gaugeMetric,
 	}
 }
@@ -781,7 +823,7 @@ func getNodeOfflineTotalMD() MetricDescription {
 		Namespace: clusterMetricNamespace,
 		Subsystem: nodesSubsystem,
 		Name:      offlineTotal,
-		Help:      "Total number of MinIO nodes offline.",
+		Help:      "Total number of MinIO nodes offline",
 		Type:      gaugeMetric,
 	}
 }
@@ -801,7 +843,7 @@ func getMinIOCommitMD() MetricDescription {
 		Namespace: minioMetricNamespace,
 		Subsystem: softwareSubsystem,
 		Name:      commitInfo,
-		Help:      "Git commit hash for the MinIO release.",
+		Help:      "Git commit hash for the MinIO release",
 		Type:      gaugeMetric,
 	}
 }
@@ -811,7 +853,7 @@ func getS3TTFBDistributionMD() MetricDescription {
 		Namespace: s3MetricNamespace,
 		Subsystem: timeSubsystem,
 		Name:      ttfbDistribution,
-		Help:      "Distribution of the time to first byte across API calls.",
+		Help:      "Distribution of the time to first byte across API calls",
 		Type:      gaugeMetric,
 	}
 }
@@ -821,7 +863,7 @@ func getMinioFDOpenMD() MetricDescription {
 		Namespace: nodeMetricNamespace,
 		Subsystem: fileDescriptorSubsystem,
 		Name:      openTotal,
-		Help:      "Total number of open file descriptors by the MinIO Server process.",
+		Help:      "Total number of open file descriptors by the MinIO Server process",
 		Type:      gaugeMetric,
 	}
 }
@@ -831,7 +873,7 @@ func getMinioFDLimitMD() MetricDescription {
 		Namespace: nodeMetricNamespace,
 		Subsystem: fileDescriptorSubsystem,
 		Name:      limitTotal,
-		Help:      "Limit on total number of open file descriptors for the MinIO Server process.",
+		Help:      "Limit on total number of open file descriptors for the MinIO Server process",
 		Type:      gaugeMetric,
 	}
 }
@@ -901,7 +943,7 @@ func getMinIOGORoutineCountMD() MetricDescription {
 		Namespace: nodeMetricNamespace,
 		Subsystem: goRoutines,
 		Name:      total,
-		Help:      "Total number of go routines running.",
+		Help:      "Total number of go routines running",
 		Type:      gaugeMetric,
 	}
 }
@@ -911,7 +953,7 @@ func getMinIOProcessStartTimeMD() MetricDescription {
 		Namespace: nodeMetricNamespace,
 		Subsystem: processSubsystem,
 		Name:      startTime,
-		Help:      "Start time for MinIO process per node, time in seconds since Unix epoc.",
+		Help:      "Start time for MinIO process per node, time in seconds since Unix epoc",
 		Type:      gaugeMetric,
 	}
 }
@@ -921,7 +963,7 @@ func getMinIOProcessUptimeMD() MetricDescription {
 		Namespace: nodeMetricNamespace,
 		Subsystem: processSubsystem,
 		Name:      upTime,
-		Help:      "Uptime for MinIO process per node in seconds.",
+		Help:      "Uptime for MinIO process per node in seconds",
 		Type:      gaugeMetric,
 	}
 }
@@ -931,7 +973,7 @@ func getMinIOProcessResidentMemory() MetricDescription {
 		Namespace: nodeMetricNamespace,
 		Subsystem: processSubsystem,
 		Name:      memory,
-		Help:      "Resident memory size in bytes.",
+		Help:      "Resident memory size in bytes",
 		Type:      gaugeMetric,
 	}
 }
@@ -941,7 +983,7 @@ func getMinIOProcessCPUTime() MetricDescription {
 		Namespace: nodeMetricNamespace,
 		Subsystem: processSubsystem,
 		Name:      cpu,
-		Help:      "Total user and system CPU time spent in seconds.",
+		Help:      "Total user and system CPU time spent in seconds",
 		Type:      counterMetric,
 	}
 }
@@ -1126,7 +1168,7 @@ func getTransitionPendingTasksMD() MetricDescription {
 		Namespace: nodeMetricNamespace,
 		Subsystem: ilmSubsystem,
 		Name:      transitionPendingTasks,
-		Help:      "Number of pending ILM transition tasks in the queue.",
+		Help:      "Number of pending ILM transition tasks in the queue",
 		Type:      gaugeMetric,
 	}
 }
@@ -1136,7 +1178,7 @@ func getTransitionActiveTasksMD() MetricDescription {
 		Namespace: nodeMetricNamespace,
 		Subsystem: ilmSubsystem,
 		Name:      transitionActiveTasks,
-		Help:      "Number of active ILM transition tasks.",
+		Help:      "Number of active ILM transition tasks",
 		Type:      gaugeMetric,
 	}
 }
@@ -1146,7 +1188,7 @@ func getExpiryPendingTasksMD() MetricDescription {
 		Namespace: nodeMetricNamespace,
 		Subsystem: ilmSubsystem,
 		Name:      expiryPendingTasks,
-		Help:      "Number of pending ILM expiry tasks in the queue.",
+		Help:      "Number of pending ILM expiry tasks in the queue",
 		Type:      gaugeMetric,
 	}
 }
@@ -1188,7 +1230,7 @@ func getScannerNodeMetrics() *MetricsGroup {
 					Namespace: nodeMetricNamespace,
 					Subsystem: scannerSubsystem,
 					Name:      "objects_scanned",
-					Help:      "Total number of unique objects scanned since server start.",
+					Help:      "Total number of unique objects scanned since server start",
 					Type:      counterMetric,
 				},
 				Value: float64(atomic.LoadUint64(&globalScannerStats.accTotalObjects)),
@@ -1198,7 +1240,7 @@ func getScannerNodeMetrics() *MetricsGroup {
 					Namespace: nodeMetricNamespace,
 					Subsystem: scannerSubsystem,
 					Name:      "versions_scanned",
-					Help:      "Total number of object versions scanned since server start.",
+					Help:      "Total number of object versions scanned since server start",
 					Type:      counterMetric,
 				},
 				Value: float64(atomic.LoadUint64(&globalScannerStats.accTotalVersions)),
@@ -1208,7 +1250,7 @@ func getScannerNodeMetrics() *MetricsGroup {
 					Namespace: nodeMetricNamespace,
 					Subsystem: scannerSubsystem,
 					Name:      "directories_scanned",
-					Help:      "Total number of directories scanned since server start.",
+					Help:      "Total number of directories scanned since server start",
 					Type:      counterMetric,
 				},
 				Value: float64(atomic.LoadUint64(&globalScannerStats.accFolders)),
@@ -1266,6 +1308,62 @@ func getScannerNodeMetrics() *MetricsGroup {
 	return mg
 }
 
+func getIAMNodeMetrics() *MetricsGroup {
+	mg := &MetricsGroup{}
+	mg.RegisterRead(func(_ context.Context) (metrics []Metric) {
+		lastSyncTime := atomic.LoadUint64(&globalIAMSys.LastRefreshTimeUnixNano)
+		var sinceLastSyncMillis uint64
+		if lastSyncTime != 0 {
+			sinceLastSyncMillis = (uint64(time.Now().UnixNano()) - lastSyncTime) / uint64(time.Millisecond)
+		}
+
+		metrics = []Metric{
+			{
+				Description: MetricDescription{
+					Namespace: nodeMetricNamespace,
+					Subsystem: iamSubsystem,
+					Name:      "last_sync_duration_millis",
+					Help:      "Last successful IAM data sync duration in milliseconds",
+					Type:      gaugeMetric,
+				},
+				Value: float64(atomic.LoadUint64(&globalIAMSys.LastRefreshDurationMilliseconds)),
+			},
+			{
+				Description: MetricDescription{
+					Namespace: nodeMetricNamespace,
+					Subsystem: iamSubsystem,
+					Name:      "since_last_sync_millis",
+					Help:      "Time (in milliseconds) since last successful IAM data sync. This is set to 0 until the first sync after server start.",
+					Type:      gaugeMetric,
+				},
+				Value: float64(sinceLastSyncMillis),
+			},
+			{
+				Description: MetricDescription{
+					Namespace: nodeMetricNamespace,
+					Subsystem: iamSubsystem,
+					Name:      "sync_successes",
+					Help:      "Number of successful IAM data syncs since server start.",
+					Type:      counterMetric,
+				},
+				Value: float64(atomic.LoadUint64(&globalIAMSys.TotalRefreshSuccesses)),
+			},
+			{
+				Description: MetricDescription{
+					Namespace: nodeMetricNamespace,
+					Subsystem: iamSubsystem,
+					Name:      "sync_failures",
+					Help:      "Number of failed IAM data syncs since server start.",
+					Type:      counterMetric,
+				},
+				Value: float64(atomic.LoadUint64(&globalIAMSys.TotalRefreshFailures)),
+			},
+		}
+		return metrics
+	})
+	return mg
+}
+
 func getMinioVersionMetrics() *MetricsGroup {
 	mg := &MetricsGroup{}
 	mg.RegisterRead(func(_ context.Context) (metrics []Metric) {
@@ -1289,7 +1387,7 @@ func getNodeHealthMetrics() *MetricsGroup {
 			return
 		}
 		metrics = make([]Metric, 0, 16)
-		nodesUp, nodesDown := GetPeerOnlineCount()
+		nodesUp, nodesDown := globalNotificationSys.GetPeerOnlineCount()
 		metrics = append(metrics, Metric{
 			Description: getNodeOnlineTotalMD(),
 			Value:       float64(nodesUp),
@@ -1307,7 +1405,7 @@ func getMinioHealingMetrics() *MetricsGroup {
 	mg := &MetricsGroup{}
 	mg.RegisterRead(func(_ context.Context) (metrics []Metric) {
 		metrics = make([]Metric, 0, 5)
-		if !globalIsErasure {
+		if globalIsGateway {
 			return
 		}
 		bgSeq, exists := globalBackgroundHealState.getHealSequenceByToken(bgHealingUUID)
@@ -1430,7 +1528,9 @@ func getHTTPMetrics() *MetricsGroup {
 		metrics = make([]Metric, 0, 3+
 			len(httpStats.CurrentS3Requests.APIStats)+
 			len(httpStats.TotalS3Requests.APIStats)+
-			len(httpStats.TotalS3Errors.APIStats))
+			len(httpStats.TotalS3Errors.APIStats)+
+			len(httpStats.TotalS35xxErrors.APIStats)+
+			len(httpStats.TotalS34xxErrors.APIStats))
 		metrics = append(metrics, Metric{
 			Description: getS3RejectedAuthRequestsTotalMD(),
 			Value:       float64(httpStats.TotalS3RejectedAuth),
@@ -1477,6 +1577,20 @@ func getHTTPMetrics() *MetricsGroup {
 				VariableLabels: map[string]string{"api": api},
 			})
 		}
+		for api, value := range httpStats.TotalS35xxErrors.APIStats {
+			metrics = append(metrics, Metric{
+				Description:    getS3Requests5xxErrorsMD(),
+				Value:          float64(value),
+				VariableLabels: map[string]string{"api": api},
+			})
+		}
+		for api, value := range httpStats.TotalS34xxErrors.APIStats {
+			metrics = append(metrics, Metric{
+				Description:    getS3Requests4xxErrorsMD(),
+				Value:          float64(value),
+				VariableLabels: map[string]string{"api": api},
+			})
+		}
 		for api, value := range httpStats.TotalS3Canceled.APIStats {
 			metrics = append(metrics, Metric{
 				Description:    getS3RequestsCanceledMD(),
@@ -1493,19 +1607,21 @@ func getNetworkMetrics() *MetricsGroup {
 	mg := &MetricsGroup{}
 	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
 		metrics = make([]Metric, 0, 10)
-		metrics = append(metrics, Metric{
-			Description: getInternodeFailedRequests(),
-			Value:       float64(loadAndResetRPCNetworkErrsCounter()),
-		})
 		connStats := globalConnStats.toServerConnStats()
-		metrics = append(metrics, Metric{
-			Description: getInterNodeSentBytesMD(),
-			Value:       float64(connStats.TotalOutputBytes),
-		})
-		metrics = append(metrics, Metric{
-			Description: getInterNodeReceivedBytesMD(),
-			Value:       float64(connStats.TotalInputBytes),
-		})
+		if globalIsDistErasure {
+			metrics = append(metrics, Metric{
+				Description: getInternodeFailedRequests(),
+				Value:       float64(loadAndResetRPCNetworkErrsCounter()),
+			})
+			metrics = append(metrics, Metric{
+				Description: getInterNodeSentBytesMD(),
+				Value:       float64(connStats.TotalOutputBytes),
+			})
+			metrics = append(metrics, Metric{
+				Description: getInterNodeReceivedBytesMD(),
+				Value:       float64(connStats.TotalInputBytes),
+			})
+		}
 		metrics = append(metrics, Metric{
 			Description: getS3SentBytesMD(),
 			Value:       float64(connStats.S3OutputBytes),
@@ -1546,8 +1662,9 @@ func getBucketUsageMetrics() *MetricsGroup {
 			Value:       float64(time.Since(dataUsageInfo.LastUpdate)),
 		})
 
+		bucketReplStats := getAllLatestReplicationStats(dataUsageInfo.BucketsUsage)
 		for bucket, usage := range dataUsageInfo.BucketsUsage {
-			stats := getLatestReplicationStats(bucket, usage)
+			stats := bucketReplStats[bucket]
 
 			quota, _ := globalBucketQuotaSys.Get(ctx, bucket)
 
@@ -1573,6 +1690,24 @@ func getBucketUsageMetrics() *MetricsGroup {
 				metrics = append(metrics, Metric{
 					Description:    getBucketUsageQuotaTotalBytesMD(),
 					Value:          float64(quota.Quota),
+					VariableLabels: map[string]string{"bucket": bucket},
+				})
+			}
+
+			recvBytes := globalBucketConnStats.getS3InputBytes(bucket)
+			if recvBytes > 0 {
+				metrics = append(metrics, Metric{
+					Description:    getBucketTrafficReceivedBytes(),
+					Value:          float64(recvBytes),
+					VariableLabels: map[string]string{"bucket": bucket},
+				})
+			}
+
+			sentBytes := globalBucketConnStats.getS3OutputBytes(bucket)
+			if sentBytes > 0 {
+				metrics = append(metrics, Metric{
+					Description:    getBucketTrafficSentBytes(),
+					Value:          float64(sentBytes),
 					VariableLabels: map[string]string{"bucket": bucket},
 				})
 			}
@@ -1651,11 +1786,11 @@ func getClusterTierMetrics() *MetricsGroup {
 		cacheInterval: 10 * time.Second,
 	}
 	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
-		if globalTierConfigMgr.Empty() {
-			return
-		}
 		objLayer := newObjectLayerFn()
 		if objLayer == nil || globalIsGateway {
+			return
+		}
+		if globalTierConfigMgr.Empty() {
 			return
 		}
 
@@ -1758,7 +1893,7 @@ func getClusterStorageMetrics() *MetricsGroup {
 	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
 		objLayer := newObjectLayerFn()
 		// Service not initialized yet
-		if objLayer == nil || !globalIsErasure {
+		if objLayer == nil || globalIsGateway {
 			return
 		}
 
@@ -1873,11 +2008,9 @@ func (c *minioClusterCollector) Collect(out chan<- prometheus.Metric) {
 	}
 
 	// Call peer api to fetch metrics
-	peerCh := globalNotificationSys.GetClusterMetrics(GlobalContext)
-	selfCh := ReportMetrics(GlobalContext, c.metricsGroups)
 	wg.Add(2)
-	go publish(peerCh)
-	go publish(selfCh)
+	go publish(ReportMetrics(GlobalContext, c.metricsGroups))
+	go publish(globalNotificationSys.GetClusterMetrics(GlobalContext))
 	wg.Wait()
 }
 

@@ -18,54 +18,26 @@
 package subnet
 
 import (
-	"net/url"
-
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/pkg/env"
+	xnet "github.com/minio/pkg/net"
 )
 
-var (
-	// DefaultKVS - default KV config for subnet settings
-	DefaultKVS = config.KVS{
-		config.KV{
-			Key:   config.License, // Deprecated Dec 2021
-			Value: "",
-		},
-		config.KV{
-			Key:   config.APIKey,
-			Value: "",
-		},
-		config.KV{
-			Key:   config.Proxy,
-			Value: "",
-		},
-	}
-
-	// HelpSubnet - provides help for subnet api key config
-	HelpSubnet = config.HelpKVS{
-		config.HelpKV{
-			Key:         config.License, // Deprecated Dec 2021
-			Type:        "string",
-			Description: "[DEPRECATED use api_key] Subnet license token for the cluster",
-			Optional:    true,
-			Sensitive:   true,
-		},
-		config.HelpKV{
-			Key:         config.APIKey,
-			Type:        "string",
-			Description: "Subnet api key for the cluster",
-			Optional:    true,
-			Sensitive:   true,
-		},
-		config.HelpKV{
-			Key:         config.Proxy,
-			Type:        "string",
-			Description: "HTTP(S) proxy URL to use for connecting to SUBNET",
-			Optional:    true,
-			Sensitive:   true,
-		},
-	}
-)
+// DefaultKVS - default KV config for subnet settings
+var DefaultKVS = config.KVS{
+	config.KV{
+		Key:   config.License, // Deprecated Dec 2021
+		Value: "",
+	},
+	config.KV{
+		Key:   config.APIKey,
+		Value: "",
+	},
+	config.KV{
+		Key:   config.Proxy,
+		Value: "",
+	},
+}
 
 // Config represents the subnet related configuration
 type Config struct {
@@ -76,7 +48,7 @@ type Config struct {
 	APIKey string `json:"api_key"`
 
 	// The HTTP(S) proxy URL to use for connecting to SUBNET
-	Proxy string `json:"proxy"`
+	ProxyURL *xnet.URL `json:"proxy_url"`
 }
 
 // LookupConfig - lookup config and override with valid environment settings if any.
@@ -85,10 +57,12 @@ func LookupConfig(kvs config.KVS) (cfg Config, err error) {
 		return cfg, err
 	}
 
-	cfg.Proxy = env.Get(config.EnvMinIOSubnetProxy, kvs.Get(config.Proxy))
-	_, err = url.Parse(cfg.Proxy)
-	if err != nil {
-		return cfg, err
+	proxy := env.Get(config.EnvMinIOSubnetProxy, kvs.Get(config.Proxy))
+	if len(proxy) > 0 {
+		cfg.ProxyURL, err = xnet.ParseHTTPURL(proxy)
+		if err != nil {
+			return cfg, err
+		}
 	}
 
 	cfg.License = env.Get(config.EnvMinIOSubnetLicense, kvs.Get(config.License))

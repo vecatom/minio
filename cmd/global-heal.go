@@ -44,8 +44,7 @@ func newBgHealSequence() *healSequence {
 
 	hs := madmin.HealOpts{
 		// Remove objects that do not have read-quorum
-		Remove:   healDeleteDangling,
-		ScanMode: globalHealConfig.ScanMode(),
+		Remove: healDeleteDangling,
 	}
 
 	return &healSequence{
@@ -165,12 +164,22 @@ func mustGetHealSequence(ctx context.Context) *healSequence {
 // healErasureSet lists and heals all objects in a specific erasure set
 func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, tracker *healingTracker) error {
 	bgSeq := mustGetHealSequence(ctx)
-	scanMode := globalHealConfig.ScanMode()
+	scanMode := madmin.HealNormalScan
 
 	// Make sure to copy since `buckets slice`
 	// is modified in place by tracker.
 	healBuckets := make([]string, len(buckets))
 	copy(healBuckets, buckets)
+
+	// Heal all buckets first in this erasure set - this is useful
+	// for new objects upload in different buckets to be successful
+	for _, bucket := range healBuckets {
+		_, err := er.HealBucket(ctx, bucket, madmin.HealOpts{ScanMode: scanMode})
+		if err != nil {
+			// Log bucket healing error if any, we shall retry again.
+			logger.LogIf(ctx, err)
+		}
+	}
 
 	var retErr error
 	// Heal all buckets with all objects
@@ -190,7 +199,8 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 		}
 		tracker.Object = ""
 		tracker.Bucket = bucket
-		// Heal current bucket
+		// Heal current bucket again in case if it is failed
+		// in the  being of erasure set healing
 		if _, err := er.HealBucket(ctx, bucket, madmin.HealOpts{
 			ScanMode: scanMode,
 		}); err != nil {
@@ -341,7 +351,9 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 // healObject heals given object path in deep to fix bitrot.
 func healObject(bucket, object, versionID string, scan madmin.HealScanMode) {
 	// Get background heal sequence to send elements to heal
+	globalHealStateLK.Lock()
 	bgSeq, ok := globalBackgroundHealState.getHealSequenceByToken(bgHealingUUID)
+	globalHealStateLK.Unlock()
 	if ok {
 		bgSeq.queueHealTask(healSource{
 			bucket:    bucket,

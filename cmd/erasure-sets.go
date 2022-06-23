@@ -301,14 +301,14 @@ func (s *erasureSets) monitorAndConnectEndpoints(ctx context.Context, monitorInt
 		case <-ctx.Done():
 			return
 		case <-monitor.C:
-			// Reset the timer once fired for required interval.
-			monitor.Reset(monitorInterval)
-
 			if serverDebugLog {
 				console.Debugln("running disk monitoring")
 			}
 
 			s.connectDisks()
+
+			// Reset the timer for next interval
+			monitor.Reset(monitorInterval)
 		}
 	}
 }
@@ -485,7 +485,9 @@ func newErasureSets(ctx context.Context, endpoints PoolEndpoints, storageDisks [
 	go s.cleanupDeletedObjects(ctx)
 
 	// Start the disk monitoring and connect routine.
-	go s.monitorAndConnectEndpoints(ctx, defaultMonitorConnectEndpointInterval)
+	if !globalIsTesting {
+		go s.monitorAndConnectEndpoints(ctx, defaultMonitorConnectEndpointInterval)
+	}
 
 	return s, nil
 }
@@ -502,9 +504,6 @@ func (s *erasureSets) cleanupDeletedObjects(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			// Reset for the next interval
-			timer.Reset(globalAPIConfig.getDeleteCleanupInterval())
-
 			var wg sync.WaitGroup
 			for _, set := range s.sets {
 				wg.Add(1)
@@ -517,6 +516,9 @@ func (s *erasureSets) cleanupDeletedObjects(ctx context.Context) {
 				}(set)
 			}
 			wg.Wait()
+
+			// Reset for the next interval
+			timer.Reset(globalAPIConfig.getDeleteCleanupInterval())
 		}
 	}
 }
@@ -530,9 +532,6 @@ func (s *erasureSets) cleanupStaleUploads(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			// Reset for the next interval
-			timer.Reset(globalAPIConfig.getStaleUploadsCleanupInterval())
-
 			var wg sync.WaitGroup
 			for _, set := range s.sets {
 				wg.Add(1)
@@ -545,6 +544,9 @@ func (s *erasureSets) cleanupStaleUploads(ctx context.Context) {
 				}(set)
 			}
 			wg.Wait()
+
+			// Reset for the next interval
+			timer.Reset(globalAPIConfig.getStaleUploadsCleanupInterval())
 		}
 	}
 }
@@ -572,6 +574,7 @@ func (a *auditObjectErasureMap) MarshalJSON() ([]byte, error) {
 	return json.Marshal(mapCopy)
 }
 
+// Add erasure set information to the current context
 func auditObjectErasureSet(ctx context.Context, object string, set *erasureObjects) {
 	if len(logger.AuditTargets()) == 0 {
 		return
@@ -933,21 +936,18 @@ func (s *erasureSets) ListBuckets(ctx context.Context) (buckets []BucketInfo, er
 // GetObjectNInfo - returns object info and locked object ReadCloser
 func (s *erasureSets) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, lockType LockType, opts ObjectOptions) (gr *GetObjectReader, err error) {
 	set := s.getHashedSet(object)
-	auditObjectErasureSet(ctx, object, set)
 	return set.GetObjectNInfo(ctx, bucket, object, rs, h, lockType, opts)
 }
 
 // PutObject - writes an object to hashedSet based on the object name.
 func (s *erasureSets) PutObject(ctx context.Context, bucket string, object string, data *PutObjReader, opts ObjectOptions) (objInfo ObjectInfo, err error) {
 	set := s.getHashedSet(object)
-	auditObjectErasureSet(ctx, object, set)
 	return set.PutObject(ctx, bucket, object, data, opts)
 }
 
 // GetObjectInfo - reads object metadata from the hashedSet based on the object name.
 func (s *erasureSets) GetObjectInfo(ctx context.Context, bucket, object string, opts ObjectOptions) (objInfo ObjectInfo, err error) {
 	set := s.getHashedSet(object)
-	auditObjectErasureSet(ctx, object, set)
 	return set.GetObjectInfo(ctx, bucket, object, opts)
 }
 
@@ -967,13 +967,11 @@ func (s *erasureSets) deletePrefix(ctx context.Context, bucket string, prefix st
 
 // DeleteObject - deletes an object from the hashedSet based on the object name.
 func (s *erasureSets) DeleteObject(ctx context.Context, bucket string, object string, opts ObjectOptions) (objInfo ObjectInfo, err error) {
-	set := s.getHashedSet(object)
-	auditObjectErasureSet(ctx, object, set)
-
 	if opts.DeletePrefix {
 		err := s.deletePrefix(ctx, bucket, object)
 		return ObjectInfo{}, err
 	}
+	set := s.getHashedSet(object)
 	return set.DeleteObject(ctx, bucket, object, opts)
 }
 
@@ -1030,9 +1028,6 @@ func (s *erasureSets) DeleteObjects(ctx context.Context, bucket string, objects 
 			for i, obj := range group {
 				delErrs[obj.origIndex] = errs[i]
 				delObjects[obj.origIndex] = dobjects[i]
-				if errs[i] == nil {
-					auditObjectErasureSet(ctx, obj.object.ObjectName, set)
-				}
 			}
 		}(s.sets[setIdx], objsGroup)
 	}
@@ -1046,19 +1041,19 @@ func (s *erasureSets) CopyObject(ctx context.Context, srcBucket, srcObject, dstB
 	srcSet := s.getHashedSet(srcObject)
 	dstSet := s.getHashedSet(dstObject)
 
-	auditObjectErasureSet(ctx, dstObject, dstSet)
-
 	cpSrcDstSame := srcSet == dstSet
 	// Check if this request is only metadata update.
 	if cpSrcDstSame && srcInfo.metadataOnly {
 		// Version ID is set for the destination and source == destination version ID.
 		// perform an in-place update.
 		if dstOpts.VersionID != "" && srcOpts.VersionID == dstOpts.VersionID {
+			srcInfo.Reader.Close() // We are not interested in the reader stream at this point close it.
 			return srcSet.CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts)
 		}
 		// Destination is not versioned and source version ID is empty
 		// perform an in-place update.
 		if !dstOpts.Versioned && srcOpts.VersionID == "" {
+			srcInfo.Reader.Close() // We are not interested in the reader stream at this point close it.
 			return srcSet.CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts)
 		}
 		// CopyObject optimization where we don't create an entire copy
@@ -1067,6 +1062,7 @@ func (s *erasureSets) CopyObject(ctx context.Context, srcBucket, srcObject, dstB
 		// that we actually create a new dataDir for legacy objects.
 		if dstOpts.Versioned && srcOpts.VersionID != dstOpts.VersionID && !srcInfo.Legacy {
 			srcInfo.versionOnly = true
+			srcInfo.Reader.Close() // We are not interested in the reader stream at this point close it.
 			return srcSet.CopyObject(ctx, srcBucket, srcObject, dstBucket, dstObject, srcInfo, srcOpts, dstOpts)
 		}
 	}
@@ -1086,57 +1082,50 @@ func (s *erasureSets) ListMultipartUploads(ctx context.Context, bucket, prefix, 
 	// In list multipart uploads we are going to treat input prefix as the object,
 	// this means that we are not supporting directory navigation.
 	set := s.getHashedSet(prefix)
-	auditObjectErasureSet(ctx, prefix, set)
 	return set.ListMultipartUploads(ctx, bucket, prefix, keyMarker, uploadIDMarker, delimiter, maxUploads)
 }
 
 // Initiate a new multipart upload on a hashedSet based on object name.
 func (s *erasureSets) NewMultipartUpload(ctx context.Context, bucket, object string, opts ObjectOptions) (uploadID string, err error) {
 	set := s.getHashedSet(object)
-	auditObjectErasureSet(ctx, object, set)
 	return set.NewMultipartUpload(ctx, bucket, object, opts)
 }
 
 // Copies a part of an object from source hashedSet to destination hashedSet.
 func (s *erasureSets) CopyObjectPart(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, uploadID string, partID int,
-	startOffset int64, length int64, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (partInfo PartInfo, err error) {
+	startOffset int64, length int64, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions,
+) (partInfo PartInfo, err error) {
 	destSet := s.getHashedSet(destObject)
-	auditObjectErasureSet(ctx, destObject, destSet)
 	return destSet.PutObjectPart(ctx, destBucket, destObject, uploadID, partID, NewPutObjReader(srcInfo.Reader), dstOpts)
 }
 
 // PutObjectPart - writes part of an object to hashedSet based on the object name.
 func (s *erasureSets) PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *PutObjReader, opts ObjectOptions) (info PartInfo, err error) {
 	set := s.getHashedSet(object)
-	auditObjectErasureSet(ctx, object, set)
 	return set.PutObjectPart(ctx, bucket, object, uploadID, partID, data, opts)
 }
 
 // GetMultipartInfo - return multipart metadata info uploaded at hashedSet.
 func (s *erasureSets) GetMultipartInfo(ctx context.Context, bucket, object, uploadID string, opts ObjectOptions) (result MultipartInfo, err error) {
 	set := s.getHashedSet(object)
-	auditObjectErasureSet(ctx, object, set)
 	return set.GetMultipartInfo(ctx, bucket, object, uploadID, opts)
 }
 
 // ListObjectParts - lists all uploaded parts to an object in hashedSet.
 func (s *erasureSets) ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker int, maxParts int, opts ObjectOptions) (result ListPartsInfo, err error) {
 	set := s.getHashedSet(object)
-	auditObjectErasureSet(ctx, object, set)
 	return set.ListObjectParts(ctx, bucket, object, uploadID, partNumberMarker, maxParts, opts)
 }
 
 // Aborts an in-progress multipart operation on hashedSet based on the object name.
 func (s *erasureSets) AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string, opts ObjectOptions) error {
 	set := s.getHashedSet(object)
-	auditObjectErasureSet(ctx, object, set)
 	return set.AbortMultipartUpload(ctx, bucket, object, uploadID, opts)
 }
 
 // CompleteMultipartUpload - completes a pending multipart transaction, on hashedSet based on object name.
 func (s *erasureSets) CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []CompletePart, opts ObjectOptions) (objInfo ObjectInfo, err error) {
 	set := s.getHashedSet(object)
-	auditObjectErasureSet(ctx, object, set)
 	return set.CompleteMultipartUpload(ctx, bucket, object, uploadID, uploadedParts, opts)
 }
 
@@ -1266,7 +1255,7 @@ func (s *erasureSets) HealFormat(ctx context.Context, dryRun bool) (res madmin.H
 
 	defer func(storageDisks []StorageAPI) {
 		if err != nil {
-			closeStorageDisks(storageDisks)
+			closeStorageDisks(storageDisks...)
 		}
 	}(storageDisks)
 

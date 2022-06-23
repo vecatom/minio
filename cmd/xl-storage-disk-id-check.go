@@ -61,6 +61,7 @@ const (
 	storageMetricWriteMetadata
 	storageMetricUpdateMetadata
 	storageMetricReadVersion
+	storageMetricReadXL
 	storageMetricReadAll
 	storageMetricStatInfoFile
 
@@ -153,7 +154,7 @@ func (p *xlStorageDiskIDCheck) Healing() *healingTracker {
 	return p.storage.Healing()
 }
 
-func (p *xlStorageDiskIDCheck) NSScanner(ctx context.Context, cache dataUsageCache, updates chan<- dataUsageEntry) (dataUsageCache, error) {
+func (p *xlStorageDiskIDCheck) NSScanner(ctx context.Context, cache dataUsageCache, updates chan<- dataUsageEntry, scanMode madmin.HealScanMode) (dataUsageCache, error) {
 	if contextCanceled(ctx) {
 		return dataUsageCache{}, ctx.Err()
 	}
@@ -161,7 +162,7 @@ func (p *xlStorageDiskIDCheck) NSScanner(ctx context.Context, cache dataUsageCac
 	if err := p.checkDiskStale(); err != nil {
 		return dataUsageCache{}, err
 	}
-	return p.storage.NSScanner(ctx, cache, updates)
+	return p.storage.NSScanner(ctx, cache, updates, scanMode)
 }
 
 func (p *xlStorageDiskIDCheck) GetDiskLoc() (poolIdx, setIdx, diskIdx int) {
@@ -473,6 +474,16 @@ func (p *xlStorageDiskIDCheck) ReadAll(ctx context.Context, volume string, path 
 	return p.storage.ReadAll(ctx, volume, path)
 }
 
+func (p *xlStorageDiskIDCheck) ReadXL(ctx context.Context, volume string, path string, readData bool) (rf RawFileInfo, err error) {
+	ctx, done, err := p.TrackDiskHealth(ctx, storageMetricReadXL, volume, path)
+	if err != nil {
+		return RawFileInfo{}, err
+	}
+	defer done(&err)
+
+	return p.storage.ReadXL(ctx, volume, path, readData)
+}
+
 func (p *xlStorageDiskIDCheck) StatInfoFile(ctx context.Context, volume, path string, glob bool) (stat []StatInfo, err error) {
 	ctx, done, err := p.TrackDiskHealth(ctx, storageMetricStatInfoFile, volume, path)
 	if err != nil {
@@ -506,6 +517,7 @@ func (p *xlStorageDiskIDCheck) updateStorageMetrics(s storageMetric, paths ...st
 		atomic.AddUint64(&p.apiCalls[s], 1)
 		p.apiLatencies[s].add(duration)
 
+		paths = append([]string{p.String()}, paths...)
 		if trace {
 			globalTrace.Publish(storageTrace(s, startTime, duration, strings.Join(paths, " ")))
 		}
@@ -519,7 +531,7 @@ const (
 
 // diskMaxConcurrent is the maximum number of running concurrent operations
 // for local and (incoming) remote disk ops respectively.
-var diskMaxConcurrent = 50
+var diskMaxConcurrent = 512
 
 func init() {
 	if s, ok := os.LookupEnv("_MINIO_DISK_MAX_CONCURRENT"); ok && s != "" {

@@ -217,8 +217,8 @@ func getClaimsFromTokenWithSecret(token, secret string) (map[string]interface{},
 		}
 	}
 
-	// If OPA is set, return without any further checks.
-	if globalPolicyOPA != nil {
+	// If AuthZPlugin is set, return without any further checks.
+	if newGlobalAuthZPluginFn() != nil {
 		return claims.Map(), nil
 	}
 
@@ -235,7 +235,7 @@ func getClaimsFromTokenWithSecret(token, secret string) (map[string]interface{},
 			logger.LogIf(GlobalContext, err, logger.Application)
 			return nil, errAuthentication
 		}
-		claims.MapClaims[iampolicy.SessionPolicyName] = string(spBytes)
+		claims.MapClaims[sessionPolicyNameExtracted] = string(spBytes)
 	}
 
 	return claims.Map(), nil

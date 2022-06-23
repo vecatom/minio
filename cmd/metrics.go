@@ -110,7 +110,7 @@ func nodeHealthMetricsPrometheus(ch chan<- prometheus.Metric) {
 		return
 	}
 
-	nodesUp, nodesDown := GetPeerOnlineCount()
+	nodesUp, nodesDown := globalNotificationSys.GetPeerOnlineCount()
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc(
 			prometheus.BuildFQName(minioNamespace, "nodes", "online"),
@@ -132,7 +132,7 @@ func nodeHealthMetricsPrometheus(ch chan<- prometheus.Metric) {
 // collects healing specific metrics for MinIO instance in Prometheus specific format
 // and sends to given channel
 func healingMetricsPrometheus(ch chan<- prometheus.Metric) {
-	if !globalIsErasure {
+	if globalIsGateway {
 		return
 	}
 	bgSeq, exists := globalBackgroundHealState.getHealSequenceByToken(bgHealingUUID)
@@ -191,7 +191,7 @@ func healingMetricsPrometheus(ch chan<- prometheus.Metric) {
 // collects gateway specific metrics for MinIO instance in Prometheus specific format
 // and sends to given channel
 func gatewayMetricsPrometheus(ch chan<- prometheus.Metric) {
-	if !globalIsGateway || (globalGatewayName != S3BackendGateway && globalGatewayName != AzureBackendGateway && globalGatewayName != GCSBackendGateway) {
+	if !globalIsGateway || (globalGatewayName != S3BackendGateway) {
 		return
 	}
 

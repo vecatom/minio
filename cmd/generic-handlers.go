@@ -18,6 +18,7 @@
 package cmd
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"path"
@@ -114,9 +115,11 @@ func setRequestLimitHandler(h http.Handler) http.Handler {
 
 // Reserved bucket.
 const (
-	minioReservedBucket     = "minio"
-	minioReservedBucketPath = SlashSeparator + minioReservedBucket
-	loginPathPrefix         = SlashSeparator + "login"
+	minioReservedBucket              = "minio"
+	minioReservedBucketPath          = SlashSeparator + minioReservedBucket
+	minioReservedBucketPathWithSlash = SlashSeparator + minioReservedBucket + SlashSeparator
+
+	loginPathPrefix = SlashSeparator + "login"
 )
 
 func guessIsBrowserReq(r *http.Request) bool {
@@ -141,6 +144,14 @@ func setBrowserRedirectHandler(h http.Handler) http.Handler {
 	})
 }
 
+var redirectPrefixes = map[string]struct{}{
+	"favicon-16x16.png": {},
+	"favicon-32x32.png": {},
+	"favicon-96x96.png": {},
+	"index.html":        {},
+	minioReservedBucket: {},
+}
+
 // Fetch redirect location if urlPath satisfies certain
 // criteria. Some special names are considered to be
 // redirectable, this is purely internal function and
@@ -151,32 +162,25 @@ func getRedirectLocation(r *http.Request) *xnet.URL {
 	if err != nil {
 		return nil
 	}
-	for _, prefix := range []string{
-		"favicon-16x16.png",
-		"favicon-32x32.png",
-		"favicon-96x96.png",
-		"index.html",
-		minioReservedBucket,
-	} {
-		bucket, _ := path2BucketObject(resource)
-		if path.Clean(bucket) == prefix || resource == slashSeparator {
-			if globalBrowserRedirectURL != nil {
-				return globalBrowserRedirectURL
-			}
-			hostname, _, _ := net.SplitHostPort(r.Host)
-			if hostname == "" {
-				hostname = r.Host
-			}
-			return &xnet.URL{
-				Host: net.JoinHostPort(hostname, globalMinioConsolePort),
-				Scheme: func() string {
-					scheme := "http"
-					if r.TLS != nil {
-						scheme = "https"
-					}
-					return scheme
-				}(),
-			}
+	bucket, _ := path2BucketObject(resource)
+	_, redirect := redirectPrefixes[path.Clean(bucket)]
+	if redirect || resource == slashSeparator {
+		if globalBrowserRedirectURL != nil {
+			return globalBrowserRedirectURL
+		}
+		xhost, err := xnet.ParseHost(r.Host)
+		if err != nil {
+			return nil
+		}
+		return &xnet.URL{
+			Host: net.JoinHostPort(xhost.Name, globalMinioConsolePort),
+			Scheme: func() string {
+				scheme := "http"
+				if r.TLS != nil {
+					scheme = "https"
+				}
+				return scheme
+			}(),
 		}
 	}
 	return nil
@@ -267,6 +271,22 @@ func parseAmzDateHeader(req *http.Request) (time.Time, APIErrorCode) {
 	return time.Time{}, ErrMissingDateHeader
 }
 
+// splitStr splits a string into n parts, empty strings are added
+// if we are not able to reach n elements
+func splitStr(path, sep string, n int) []string {
+	splits := strings.SplitN(path, sep, n)
+	// Add empty strings if we found elements less than nr
+	for i := n - len(splits); i > 0; i-- {
+		splits = append(splits, "")
+	}
+	return splits
+}
+
+func url2Bucket(p string) (bucket string) {
+	tokens := splitStr(p, SlashSeparator, 3)
+	return tokens[1]
+}
+
 // setHttpStatsHandler sets a http Stats handler to gather HTTP statistics
 func setHTTPStatsHandler(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -278,12 +298,28 @@ func setHTTPStatsHandler(h http.Handler) http.Handler {
 		r.Body = meteredRequest
 		h.ServeHTTP(meteredResponse, r)
 
-		if strings.HasPrefix(r.URL.Path, minioReservedBucketPath) {
+		if strings.HasPrefix(r.URL.Path, storageRESTPrefix) ||
+			strings.HasPrefix(r.URL.Path, peerRESTPrefix) ||
+			strings.HasPrefix(r.URL.Path, lockRESTPrefix) {
 			globalConnStats.incInputBytes(meteredRequest.BytesRead())
 			globalConnStats.incOutputBytes(meteredResponse.BytesWritten())
-		} else {
-			globalConnStats.incS3InputBytes(meteredRequest.BytesRead())
-			globalConnStats.incS3OutputBytes(meteredResponse.BytesWritten())
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, minioReservedBucketPath) {
+			globalConnStats.incAdminInputBytes(meteredRequest.BytesRead())
+			globalConnStats.incAdminOutputBytes(meteredResponse.BytesWritten())
+			return
+		}
+
+		globalConnStats.incS3InputBytes(meteredRequest.BytesRead())
+		globalConnStats.incS3OutputBytes(meteredResponse.BytesWritten())
+
+		if r.URL != nil {
+			bucket := url2Bucket(r.URL.Path)
+			if bucket != "" && bucket != minioReservedBucket {
+				globalBucketConnStats.incS3InputBytes(bucket, meteredRequest.BytesRead())
+				globalBucketConnStats.incS3OutputBytes(bucket, meteredResponse.BytesWritten())
+			}
 		}
 	})
 }
@@ -293,6 +329,15 @@ const (
 	dotdotComponent = ".."
 	dotComponent    = "."
 )
+
+func hasBadHost(host string) error {
+	if globalIsCICD && strings.TrimSpace(host) == "" {
+		// under CI/CD test setups ignore empty hosts as invalid hosts
+		return nil
+	}
+	_, err := xnet.ParseHost(host)
+	return err
+}
 
 // Check if the incoming path has bad path components,
 // such as ".." and "."
@@ -312,7 +357,11 @@ func hasBadPathComponent(path string) bool {
 // Check if client is sending a malicious request.
 func hasMultipleAuth(r *http.Request) bool {
 	authTypeCount := 0
-	for _, hasValidAuth := range []func(*http.Request) bool{isRequestSignatureV2, isRequestPresignedSignatureV2, isRequestSignatureV4, isRequestPresignedSignatureV4, isRequestJWT, isRequestPostPolicySignatureV4} {
+	for _, hasValidAuth := range []func(*http.Request) bool{
+		isRequestSignatureV2, isRequestPresignedSignatureV2,
+		isRequestSignatureV4, isRequestPresignedSignatureV4,
+		isRequestJWT, isRequestPostPolicySignatureV4,
+	} {
 		if hasValidAuth(r) {
 			authTypeCount++
 		}
@@ -324,6 +373,14 @@ func hasMultipleAuth(r *http.Request) bool {
 // any malicious requests.
 func setRequestValidityHandler(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := hasBadHost(r.Host); err != nil {
+			invalidReq := errorCodes.ToAPIErr(ErrInvalidRequest)
+			invalidReq.Description = fmt.Sprintf("%s (%s)", invalidReq.Description, err)
+			writeErrorResponse(r.Context(), w, invalidReq, r.URL)
+			atomic.AddUint64(&globalHTTPStats.rejectedRequestsInvalid, 1)
+			return
+		}
+
 		// Check for bad components in URL path.
 		if hasBadPathComponent(r.URL.Path) {
 			writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrInvalidResourceName), r.URL)
@@ -341,7 +398,9 @@ func setRequestValidityHandler(h http.Handler) http.Handler {
 			}
 		}
 		if hasMultipleAuth(r) {
-			writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
+			invalidReq := errorCodes.ToAPIErr(ErrInvalidRequest)
+			invalidReq.Description = fmt.Sprintf("%s (request has multiple authentication types, please use one)", invalidReq.Description)
+			writeErrorResponse(r.Context(), w, invalidReq, r.URL)
 			atomic.AddUint64(&globalHTTPStats.rejectedRequestsInvalid, 1)
 			return
 		}

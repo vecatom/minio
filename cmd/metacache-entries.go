@@ -168,8 +168,10 @@ func (e *metaCacheEntry) isLatestDeletemarker() bool {
 	if !isXL2V1Format(e.metadata) {
 		return false
 	}
-	if meta, _ := isIndexedMetaV2(e.metadata); meta != nil {
+	if meta, _, err := isIndexedMetaV2(e.metadata); meta != nil {
 		return meta.IsLatestDeleteMarker()
+	} else if err != nil {
+		return true
 	}
 	// Fall back...
 	xlMeta, err := e.xlmeta()
@@ -281,10 +283,16 @@ func (m metaCacheEntries) shallowClone() metaCacheEntries {
 }
 
 type metadataResolutionParams struct {
-	dirQuorum int    // Number if disks needed for a directory to 'exist'.
-	objQuorum int    // Number of disks needed for an object to 'exist'.
-	bucket    string // Name of the bucket. Used for generating cached fileinfo.
-	strict    bool   // Versions must match exactly, including all metadata.
+	dirQuorum int // Number if disks needed for a directory to 'exist'.
+	objQuorum int // Number of disks needed for an object to 'exist'.
+
+	// An optimization request only an 'n' amount of versions from xl.meta
+	// to avoid resolving all versions to figure out the latest 'version'
+	// for ListObjects, ListObjectsV2
+	requestedVersions int
+
+	bucket string // Name of the bucket. Used for generating cached fileinfo.
+	strict bool   // Versions must match exactly, including all metadata.
 
 	// Reusable slice for resolution
 	candidates [][]xlMetaV2ShallowVersion
@@ -372,7 +380,7 @@ func (m metaCacheEntries) resolve(r *metadataResolutionParams) (selected *metaCa
 		reusable: true,
 		cached:   &xlMetaV2{metaV: selected.cached.metaV},
 	}
-	selected.cached.versions = mergeXLV2Versions(r.objQuorum, r.strict, r.candidates...)
+	selected.cached.versions = mergeXLV2Versions(r.objQuorum, r.strict, r.requestedVersions, r.candidates...)
 	if len(selected.cached.versions) == 0 {
 		return nil, false
 	}
@@ -432,6 +440,8 @@ func (m metaCacheEntriesSorted) shallowClone() metaCacheEntriesSorted {
 func (m *metaCacheEntriesSorted) fileInfoVersions(bucket, prefix, delimiter, afterV string) (versions []ObjectInfo) {
 	versions = make([]ObjectInfo, 0, m.len())
 	prevPrefix := ""
+	vcfg, _ := globalBucketVersioningSys.Get(bucket)
+
 	for _, entry := range m.o {
 		if entry.isObject() {
 			if delimiter != "" {
@@ -467,7 +477,8 @@ func (m *metaCacheEntriesSorted) fileInfoVersions(bucket, prefix, delimiter, aft
 			}
 
 			for _, version := range fiVersions {
-				versions = append(versions, version.ToObjectInfo(bucket, entry.name))
+				versioned := vcfg != nil && vcfg.Versioned(entry.name)
+				versions = append(versions, version.ToObjectInfo(bucket, entry.name, versioned))
 			}
 
 			continue
@@ -498,11 +509,14 @@ func (m *metaCacheEntriesSorted) fileInfoVersions(bucket, prefix, delimiter, aft
 	return versions
 }
 
-// fileInfoVersions converts the metadata to FileInfoVersions where possible.
+// fileInfos converts the metadata to ObjectInfo where possible.
 // Metadata that cannot be decoded is skipped.
 func (m *metaCacheEntriesSorted) fileInfos(bucket, prefix, delimiter string) (objects []ObjectInfo) {
 	objects = make([]ObjectInfo, 0, m.len())
 	prevPrefix := ""
+
+	vcfg, _ := globalBucketVersioningSys.Get(bucket)
+
 	for _, entry := range m.o {
 		if entry.isObject() {
 			if delimiter != "" {
@@ -525,7 +539,8 @@ func (m *metaCacheEntriesSorted) fileInfos(bucket, prefix, delimiter string) (ob
 
 			fi, err := entry.fileInfo(bucket)
 			if err == nil {
-				objects = append(objects, fi.ToObjectInfo(bucket, entry.name))
+				versioned := vcfg != nil && vcfg.Versioned(entry.name)
+				objects = append(objects, fi.ToObjectInfo(bucket, entry.name, versioned))
 			}
 			continue
 		}
@@ -680,8 +695,12 @@ func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<
 			}
 		}
 		if best.name > last {
-			out <- *best
-			last = best.name
+			select {
+			case <-ctxDone:
+				return ctx.Err()
+			case out <- *best:
+				last = best.name
+			}
 		} else if serverDebugLog {
 			console.Debugln("mergeEntryChannels: discarding duplicate", best.name, "<=", last)
 		}

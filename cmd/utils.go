@@ -88,6 +88,14 @@ func IsErr(err error, errs ...error) bool {
 	return false
 }
 
+// returns 'true' if either string has space in the
+// - beginning of a string
+// OR
+// - end of a string
+func hasSpaceBE(s string) bool {
+	return strings.TrimSpace(s) != s
+}
+
 func request2BucketObjectName(r *http.Request) (bucketName, objectName string) {
 	path, err := getResource(r.URL.Path, r.Host, globalDomainNames)
 	if err != nil {
@@ -121,6 +129,9 @@ func getWriteQuorum(drive int) int {
 	}
 	return quorum
 }
+
+// CloneMSS is an exposed function of cloneMSS for gateway usage.
+var CloneMSS = cloneMSS
 
 // cloneMSS will clone a map[string]string.
 // If input is nil an empty map is returned, not nil.
@@ -320,8 +331,7 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			defer os.RemoveAll(dirPath)
 			return ioutil.ReadFile(fn)
 		}
-		// TODO(klauspost): Replace with madmin.ProfilerCPUIO on next update.
-	case "cpuio":
+	case madmin.ProfilerCPUIO:
 		// at 10k or more goroutines fgprof is likely to become
 		// unable to maintain its sampling rate and to significantly
 		// degrade the performance of your application
@@ -339,10 +349,6 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			return nil, err
 		}
 		stop := fgprof.Start(f, fgprof.FormatPprof)
-		err = pprof.StartCPUProfile(f)
-		if err != nil {
-			return nil, err
-		}
 		prof.stopFn = func() ([]byte, error) {
 			err := stop()
 			if err != nil {
@@ -555,9 +561,8 @@ func newCustomHTTPProxyTransport(tlsConfig *tls.Config, dialTimeout time.Duratio
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           xhttp.DialContextWithDNSCache(globalDNSCache, xhttp.NewInternodeDialContext(dialTimeout)),
 		MaxIdleConnsPerHost:   1024,
-		MaxConnsPerHost:       1024,
-		WriteBufferSize:       16 << 10, // 16KiB moving up from 4KiB default
-		ReadBufferSize:        16 << 10, // 16KiB moving up from 4KiB default
+		WriteBufferSize:       32 << 10, // 32KiB moving up from 4KiB default
+		ReadBufferSize:        32 << 10, // 32KiB moving up from 4KiB default
 		IdleConnTimeout:       15 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Minute, // Set larger timeouts for proxied requests.
 		TLSHandshakeTimeout:   10 * time.Second,
@@ -581,10 +586,10 @@ func newCustomHTTPTransport(tlsConfig *tls.Config, dialTimeout time.Duration) fu
 		Proxy:                 http.ProxyFromEnvironment,
 		DialContext:           xhttp.DialContextWithDNSCache(globalDNSCache, xhttp.NewInternodeDialContext(dialTimeout)),
 		MaxIdleConnsPerHost:   1024,
-		WriteBufferSize:       16 << 10, // 16KiB moving up from 4KiB default
-		ReadBufferSize:        16 << 10, // 16KiB moving up from 4KiB default
+		WriteBufferSize:       32 << 10, // 32KiB moving up from 4KiB default
+		ReadBufferSize:        32 << 10, // 32KiB moving up from 4KiB default
 		IdleConnTimeout:       15 * time.Second,
-		ResponseHeaderTimeout: 3 * time.Minute, // Set conservative timeouts for MinIO internode.
+		ResponseHeaderTimeout: 3 * time.Minute,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 10 * time.Second,
 		TLSClientConfig:       tlsConfig,
@@ -660,7 +665,7 @@ func newGatewayHTTPTransport(timeout time.Duration) *http.Transport {
 
 // NewRemoteTargetHTTPTransport returns a new http configuration
 // used while communicating with the remote replication targets.
-func NewRemoteTargetHTTPTransport() *http.Transport {
+func NewRemoteTargetHTTPTransport() func() *http.Transport {
 	// For more details about various values used here refer
 	// https://golang.org/pkg/net/http/#Transport documentation
 	tr := &http.Transport{
@@ -670,8 +675,8 @@ func NewRemoteTargetHTTPTransport() *http.Transport {
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		MaxIdleConnsPerHost:   1024,
-		WriteBufferSize:       16 << 10, // 16KiB moving up from 4KiB default
-		ReadBufferSize:        16 << 10, // 16KiB moving up from 4KiB default
+		WriteBufferSize:       32 << 10, // 32KiB moving up from 4KiB default
+		ReadBufferSize:        32 << 10, // 32KiB moving up from 4KiB default
 		IdleConnTimeout:       15 * time.Second,
 		TLSHandshakeTimeout:   5 * time.Second,
 		ExpectContinueTimeout: 5 * time.Second,
@@ -684,7 +689,9 @@ func NewRemoteTargetHTTPTransport() *http.Transport {
 		// in raw stream.
 		DisableCompression: true,
 	}
-	return tr
+	return func() *http.Transport {
+		return tr
+	}
 }
 
 // Load the json (typically from disk file).
@@ -699,7 +706,8 @@ func jsonLoad(r io.ReadSeeker, data interface{}) error {
 func jsonSave(f interface {
 	io.WriteSeeker
 	Truncate(int64) error
-}, data interface{}) error {
+}, data interface{},
+) error {
 	b, err := json.Marshal(data)
 	if err != nil {
 		return err
@@ -899,12 +907,14 @@ func getMinioMode() string {
 		mode = globalMinioModeErasure
 	} else if globalIsGateway {
 		mode = globalMinioModeGatewayPrefix + globalGatewayName
+	} else if globalIsErasureSD {
+		mode = globalMinioModeErasureSD
 	}
 	return mode
 }
 
 func iamPolicyClaimNameOpenID() string {
-	return globalOpenIDConfig.ClaimPrefix + globalOpenIDConfig.ClaimName
+	return globalOpenIDConfig.GetIAMPolicyClaimName()
 }
 
 func iamPolicyClaimNameSA() string {
@@ -1015,12 +1025,14 @@ type AuditLogOptions struct {
 	APIName   string
 	Status    string
 	VersionID string
+	Error     string
 }
 
 // sends audit logs for internal subsystem activity
 func auditLogInternal(ctx context.Context, bucket, object string, opts AuditLogOptions) {
 	entry := audit.NewEntry(globalDeploymentID)
 	entry.Trigger = opts.Trigger
+	entry.Error = opts.Error
 	entry.API.Name = opts.APIName
 	entry.API.Bucket = bucket
 	entry.API.Object = object
@@ -1029,6 +1041,11 @@ func auditLogInternal(ctx context.Context, bucket, object string, opts AuditLogO
 		entry.ReqQuery[xhttp.VersionID] = opts.VersionID
 	}
 	entry.API.Status = opts.Status
+	// Merge tag information if found - this is currently needed for tags
+	// set during decommissioning.
+	if reqInfo := logger.GetReqInfo(ctx); reqInfo != nil {
+		entry.Tags = reqInfo.GetTagsMap()
+	}
 	ctx = logger.SetAuditEntry(ctx, &entry)
 	logger.AuditLog(ctx, nil, nil, nil)
 }
@@ -1051,17 +1068,12 @@ func newTLSConfig(getCert certs.GetCertificateFunc) *tls.Config {
 		tlsConfig.ClientAuth = tls.RequestClientCert
 	}
 
-	secureCiphers := env.Get(api.EnvAPISecureCiphers, config.EnableOn) == config.EnableOn
-	if secureCiphers || fips.Enabled {
-		// Hardened ciphers
-		tlsConfig.CipherSuites = fips.CipherSuitesTLS()
-		tlsConfig.CurvePreferences = fips.EllipticCurvesTLS()
+	if secureCiphers := env.Get(api.EnvAPISecureCiphers, config.EnableOn) == config.EnableOn; secureCiphers {
+		tlsConfig.CipherSuites = fips.TLSCiphers()
 	} else {
-		// Default ciphers while excluding those with security issues
-		for _, cipher := range tls.CipherSuites() {
-			tlsConfig.CipherSuites = append(tlsConfig.CipherSuites, cipher.ID)
-		}
+		tlsConfig.CipherSuites = fips.TLSCiphersBackwardCompatible()
 	}
+	tlsConfig.CurvePreferences = fips.TLSCurveIDs()
 	return tlsConfig
 }
 

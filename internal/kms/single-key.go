@@ -18,10 +18,10 @@
 package kms
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -32,6 +32,8 @@ import (
 	"github.com/secure-io/sio-go/sioutil"
 	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
+
+	"github.com/minio/minio/internal/hash/sha256"
 )
 
 // Parse parses s as single-key KMS. The given string
@@ -222,6 +224,18 @@ func (kms secretKey) DecryptKey(keyID string, ciphertext []byte, context Context
 		return nil, fmt.Errorf("kms: encrypted key is not authentic")
 	}
 	return plaintext, nil
+}
+
+func (kms secretKey) DecryptAll(_ context.Context, keyID string, ciphertexts [][]byte, contexts []Context) ([][]byte, error) {
+	plaintexts := make([][]byte, 0, len(ciphertexts))
+	for i := range ciphertexts {
+		plaintext, err := kms.DecryptKey(keyID, ciphertexts[i], contexts[i])
+		if err != nil {
+			return nil, err
+		}
+		plaintexts = append(plaintexts, plaintext)
+	}
+	return plaintexts, nil
 }
 
 type encryptedKey struct {
