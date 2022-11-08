@@ -15,12 +15,12 @@ checks: ## check dependencies
 	@(env bash $(PWD)/buildscripts/checkdeps.sh)
 
 help: ## print this help
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' Makefile | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' Makefile | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-40s\033[0m %s\n", $$1, $$2}'
 
 getdeps: ## fetch necessary dependencies
 	@mkdir -p ${GOPATH}/bin
-	@echo "Installing golangci-lint" && curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin v1.45.2
-	@echo "Installing msgp" && go install -v github.com/tinylib/msgp@v1.1.7-0.20211026165309-e818a1881b0e
+	@echo "Installing golangci-lint" && curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(GOPATH)/bin
+	@echo "Installing msgp" && go install -v github.com/tinylib/msgp@f3635b96e4838a6c773babb65ef35297fe5fe2f9
 	@echo "Installing stringer" && go install -v golang.org/x/tools/cmd/stringer@latest
 
 crosscompile: ## cross compile minio
@@ -39,7 +39,14 @@ lint: ## runs golangci-lint suite of linters
 check: test
 test: verifiers build ## builds minio, runs linters, tests
 	@echo "Running unit tests"
-	@CGO_ENABLED=0 go test -tags kqueue ./...
+	@MINIO_API_REQUESTS_MAX=10000 CGO_ENABLED=0 go test -tags kqueue ./...
+
+test-decom: install
+	@echo "Running minio decom tests"
+	@env bash $(PWD)/docs/distributed/decom.sh
+	@env bash $(PWD)/docs/distributed/decom-encrypted.sh
+	@env bash $(PWD)/docs/distributed/decom-encrypted-sse-s3.sh
+	@env bash $(PWD)/docs/distributed/decom-compressed-sse-s3.sh
 
 test-upgrade: build
 	@echo "Running minio upgrade tests"
@@ -51,9 +58,9 @@ test-race: verifiers build ## builds minio, runs linters, tests (race)
 
 test-iam: build ## verify IAM (external IDP, etcd backends)
 	@echo "Running tests for IAM (external IDP, etcd backends)"
-	@CGO_ENABLED=0 go test -tags kqueue -v -run TestIAM* ./cmd
+	@MINIO_API_REQUESTS_MAX=10000 CGO_ENABLED=0 go test -tags kqueue -v -run TestIAM* ./cmd
 	@echo "Running tests for IAM (external IDP, etcd backends) with -race"
-	@GORACE=history_size=7 CGO_ENABLED=1 go test -race -tags kqueue -v -run TestIAM* ./cmd
+	@MINIO_API_REQUESTS_MAX=10000 GORACE=history_size=7 CGO_ENABLED=1 go test -race -tags kqueue -v -run TestIAM* ./cmd
 
 test-replication: install ## verify multi site replication
 	@echo "Running tests for replicating three sites"
@@ -82,6 +89,17 @@ verify-healing: ## verify healing and replacing disks with minio binary
 	@GORACE=history_size=7 CGO_ENABLED=1 go build -race -tags kqueue -trimpath --ldflags "$(LDFLAGS)" -o $(PWD)/minio 1>/dev/null
 	@(env bash $(PWD)/buildscripts/verify-healing.sh)
 	@(env bash $(PWD)/buildscripts/unaligned-healing.sh)
+	@(env bash $(PWD)/buildscripts/heal-inconsistent-versions.sh)
+
+verify-healing-with-root-disks: ## verify healing root disks
+	@echo "Verify healing with root drives"
+	@GORACE=history_size=7 CGO_ENABLED=1 go build -race -tags kqueue -trimpath --ldflags "$(LDFLAGS)" -o $(PWD)/minio 1>/dev/null
+	@(env bash $(PWD)/buildscripts/verify-healing-with-root-disks.sh)
+
+verify-healing-with-rewrite: ## verify healing to rewrite old xl.meta -> new xl.meta
+	@echo "Verify healing with rewrite"
+	@GORACE=history_size=7 CGO_ENABLED=1 go build -race -tags kqueue -trimpath --ldflags "$(LDFLAGS)" -o $(PWD)/minio 1>/dev/null
+	@(env bash $(PWD)/buildscripts/rewrite-old-new.sh)
 
 verify-healing-inconsistent-versions: ## verify resolving inconsistent versions
 	@echo "Verify resolving inconsistent versions build with race"
@@ -128,6 +146,8 @@ clean: ## cleanup all generated assets
 	@echo "Cleaning up all the generated files"
 	@find . -name '*.test' | xargs rm -fv
 	@find . -name '*~' | xargs rm -fv
+	@find . -name '.#*#' | xargs rm -fv
+	@find . -name '#*#' | xargs rm -fv
 	@rm -rvf minio
 	@rm -rvf build
 	@rm -rvf release

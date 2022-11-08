@@ -22,10 +22,36 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
+	"strings"
 
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/sync/errgroup"
 )
+
+// figure out the most commonVersions across disk that satisfies
+// the 'writeQuorum' this function returns '0' if quorum cannot
+// be achieved and disks have too many inconsistent versions.
+func reduceCommonVersions(diskVersions []uint64, writeQuorum int) (commonVersions uint64) {
+	diskVersionsCount := make(map[uint64]int)
+	for _, versions := range diskVersions {
+		diskVersionsCount[versions]++
+	}
+
+	max := 0
+	for versions, count := range diskVersionsCount {
+		if max < count {
+			max = count
+			commonVersions = versions
+		}
+	}
+
+	if max >= writeQuorum {
+		return commonVersions
+	}
+
+	return 0
+}
 
 // Returns number of errors that occurred the most (incl. nil) and the
 // corresponding error value. NB When there is more than one error value that
@@ -141,18 +167,23 @@ func readAllFileInfo(ctx context.Context, disks []StorageAPI, bucket, object, ve
 		}, index)
 	}
 
+	ignoredErrs := []error{
+		errFileNotFound,
+		errVolumeNotFound,
+		errFileVersionNotFound,
+		errDiskNotFound,
+		errUnformattedDisk,
+	}
+	if strings.HasPrefix(bucket, minioMetaBucket) {
+		// listing object might be truncated, ignore such errors from logging.
+		ignoredErrs = append(ignoredErrs, io.ErrUnexpectedEOF)
+	}
 	errs := g.Wait()
 	for index, err := range errs {
 		if err == nil {
 			continue
 		}
-		if !IsErr(err, []error{
-			errFileNotFound,
-			errVolumeNotFound,
-			errFileVersionNotFound,
-			errDiskNotFound,
-			errUnformattedDisk,
-		}...) {
+		if !IsErr(err, ignoredErrs...) {
 			logger.LogOnceIf(ctx, fmt.Errorf("Drive %s, path (%s/%s) returned an error (%w)",
 				disks[index], bucket, object, err),
 				disks[index].String())
@@ -275,7 +306,7 @@ func shuffleDisks(disks []StorageAPI, distribution []int) (shuffledDisks []Stora
 // the corresponding error in errs slice is not nil
 func evalDisks(disks []StorageAPI, errs []error) []StorageAPI {
 	if len(errs) != len(disks) {
-		logger.LogIf(GlobalContext, errors.New("unexpected disks/errors slice length"))
+		logger.LogIf(GlobalContext, errors.New("unexpected drives/errors slice length"))
 		return nil
 	}
 	newDisks := make([]StorageAPI, len(disks))

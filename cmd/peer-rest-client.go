@@ -34,6 +34,7 @@ import (
 	"github.com/minio/minio/internal/http"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/logger/message/log"
 	"github.com/minio/minio/internal/rest"
 	xnet "github.com/minio/pkg/net"
 	"github.com/tinylib/msgp/msgp"
@@ -193,6 +194,23 @@ func (client *peerRESTClient) GetMemInfo(ctx context.Context) (info madmin.MemIn
 	return info, err
 }
 
+// GetMetrics - fetch metrics from a remote node.
+func (client *peerRESTClient) GetMetrics(ctx context.Context, t madmin.MetricType, opts collectMetricsOpts) (info madmin.RealtimeMetrics, err error) {
+	values := make(url.Values)
+	values.Set(peerRESTMetricsTypes, strconv.FormatUint(uint64(t), 10))
+	for disk := range opts.disks {
+		values.Set(peerRESTDisk, disk)
+	}
+	values.Set(peerRESTJobID, opts.jobID)
+	respBody, err := client.callWithContext(ctx, peerRESTMethodMetrics, values, nil, -1)
+	if err != nil {
+		return
+	}
+	defer http.DrainBody(respBody)
+	err = gob.NewDecoder(respBody).Decode(&info)
+	return info, err
+}
+
 // GetProcInfo - fetch MinIO process information for a remote node.
 func (client *peerRESTClient) GetProcInfo(ctx context.Context) (info madmin.ProcInfo, err error) {
 	respBody, err := client.callWithContext(ctx, peerRESTMethodProcInfo, nil, nil, -1)
@@ -246,7 +264,7 @@ func (client *peerRESTClient) GetAllBucketStats() (BucketStatsMap, error) {
 	values := make(url.Values)
 	respBody, err := client.call(peerRESTMethodGetAllBucketStats, values, nil, -1)
 	if err != nil {
-		return nil, err
+		return BucketStatsMap{}, err
 	}
 
 	bsMap := BucketStatsMap{}
@@ -324,9 +342,10 @@ func (client *peerRESTClient) LoadPolicy(policyName string) (err error) {
 }
 
 // LoadPolicyMapping - reload a specific policy mapping
-func (client *peerRESTClient) LoadPolicyMapping(userOrGroup string, isGroup bool) error {
+func (client *peerRESTClient) LoadPolicyMapping(userOrGroup string, userType IAMUserType, isGroup bool) error {
 	values := make(url.Values)
 	values.Set(peerRESTUserOrGroup, userOrGroup)
+	values.Set(peerRESTUserType, strconv.Itoa(int(userType)))
 	if isGroup {
 		values.Set(peerRESTIsGroup, "")
 	}
@@ -404,26 +423,36 @@ func (client *peerRESTClient) LoadGroup(group string) error {
 	return nil
 }
 
-type serverUpdateInfo struct {
+type binaryInfo struct {
 	URL         *url.URL
 	Sha256Sum   []byte
-	Time        time.Time
 	ReleaseInfo string
+	BinaryFile  []byte
 }
 
-// ServerUpdate - sends server update message to remote peers.
-func (client *peerRESTClient) ServerUpdate(ctx context.Context, u *url.URL, sha256Sum []byte, lrTime time.Time, releaseInfo string) error {
+// VerifyBinary - sends verify binary message to remote peers.
+func (client *peerRESTClient) VerifyBinary(ctx context.Context, u *url.URL, sha256Sum []byte, releaseInfo string, readerInput []byte) error {
 	values := make(url.Values)
 	var reader bytes.Buffer
-	if err := gob.NewEncoder(&reader).Encode(serverUpdateInfo{
+	if err := gob.NewEncoder(&reader).Encode(binaryInfo{
 		URL:         u,
 		Sha256Sum:   sha256Sum,
-		Time:        lrTime,
 		ReleaseInfo: releaseInfo,
+		BinaryFile:  readerInput,
 	}); err != nil {
 		return err
 	}
-	respBody, err := client.callWithContext(ctx, peerRESTMethodServerUpdate, values, &reader, -1)
+	respBody, err := client.callWithContext(ctx, peerRESTMethodDownloadBinary, values, &reader, -1)
+	if err != nil {
+		return err
+	}
+	defer http.DrainBody(respBody)
+	return nil
+}
+
+// CommitBinary - sends commit binary message to remote peers.
+func (client *peerRESTClient) CommitBinary(ctx context.Context) error {
+	respBody, err := client.callWithContext(ctx, peerRESTMethodCommitBinary, nil, nil, -1)
 	if err != nil {
 		return err
 	}
@@ -522,6 +551,28 @@ func (client *peerRESTClient) ReloadPoolMeta(ctx context.Context) error {
 	return nil
 }
 
+func (client *peerRESTClient) StopRebalance(ctx context.Context) error {
+	respBody, err := client.callWithContext(ctx, peerRESTMethodStopRebalance, nil, nil, 0)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return err
+	}
+	defer http.DrainBody(respBody)
+	return nil
+}
+
+func (client *peerRESTClient) LoadRebalanceMeta(ctx context.Context, startRebalance bool) error {
+	values := url.Values{}
+	values.Set(peerRESTStartRebalance, strconv.FormatBool(startRebalance))
+	respBody, err := client.callWithContext(ctx, peerRESTMethodLoadRebalanceMeta, values, nil, 0)
+	if err != nil {
+		logger.LogIf(ctx, err)
+		return err
+	}
+	defer http.DrainBody(respBody)
+	return nil
+}
+
 func (client *peerRESTClient) LoadTransitionTierConfig(ctx context.Context) error {
 	respBody, err := client.callWithContext(ctx, peerRESTMethodLoadTransitionTierConfig, nil, nil, 0)
 	if err != nil {
@@ -532,14 +583,9 @@ func (client *peerRESTClient) LoadTransitionTierConfig(ctx context.Context) erro
 	return nil
 }
 
-func (client *peerRESTClient) doTrace(traceCh chan interface{}, doneCh <-chan struct{}, traceOpts madmin.ServiceTraceOpts) {
+func (client *peerRESTClient) doTrace(traceCh chan<- madmin.TraceInfo, doneCh <-chan struct{}, traceOpts madmin.ServiceTraceOpts) {
 	values := make(url.Values)
-	values.Set(peerRESTTraceErr, strconv.FormatBool(traceOpts.OnlyErrors))
-	values.Set(peerRESTTraceS3, strconv.FormatBool(traceOpts.S3))
-	values.Set(peerRESTTraceStorage, strconv.FormatBool(traceOpts.Storage))
-	values.Set(peerRESTTraceOS, strconv.FormatBool(traceOpts.OS))
-	values.Set(peerRESTTraceInternal, strconv.FormatBool(traceOpts.Internal))
-	values.Set(peerRESTTraceThreshold, traceOpts.Threshold.String())
+	traceOpts.AddParams(values)
 
 	// To cancel the REST request in case doneCh gets closed.
 	ctx, cancel := context.WithCancel(GlobalContext)
@@ -578,7 +624,7 @@ func (client *peerRESTClient) doTrace(traceCh chan interface{}, doneCh <-chan st
 	}
 }
 
-func (client *peerRESTClient) doListen(listenCh chan interface{}, doneCh <-chan struct{}, v url.Values) {
+func (client *peerRESTClient) doListen(listenCh chan<- event.Event, doneCh <-chan struct{}, v url.Values) {
 	// To cancel the REST request in case doneCh gets closed.
 	ctx, cancel := context.WithCancel(GlobalContext)
 
@@ -617,7 +663,7 @@ func (client *peerRESTClient) doListen(listenCh chan interface{}, doneCh <-chan 
 }
 
 // Listen - listen on peers.
-func (client *peerRESTClient) Listen(listenCh chan interface{}, doneCh <-chan struct{}, v url.Values) {
+func (client *peerRESTClient) Listen(listenCh chan<- event.Event, doneCh <-chan struct{}, v url.Values) {
 	go func() {
 		for {
 			client.doListen(listenCh, doneCh, v)
@@ -633,7 +679,7 @@ func (client *peerRESTClient) Listen(listenCh chan interface{}, doneCh <-chan st
 }
 
 // Trace - send http trace request to peer nodes
-func (client *peerRESTClient) Trace(traceCh chan interface{}, doneCh <-chan struct{}, traceOpts madmin.ServiceTraceOpts) {
+func (client *peerRESTClient) Trace(traceCh chan<- madmin.TraceInfo, doneCh <-chan struct{}, traceOpts madmin.ServiceTraceOpts) {
 	go func() {
 		for {
 			client.doTrace(traceCh, doneCh, traceOpts)
@@ -648,7 +694,7 @@ func (client *peerRESTClient) Trace(traceCh chan interface{}, doneCh <-chan stru
 	}()
 }
 
-func (client *peerRESTClient) doConsoleLog(logCh chan interface{}, doneCh <-chan struct{}) {
+func (client *peerRESTClient) doConsoleLog(logCh chan log.Info, doneCh <-chan struct{}) {
 	// To cancel the REST request in case doneCh gets closed.
 	ctx, cancel := context.WithCancel(GlobalContext)
 
@@ -671,22 +717,20 @@ func (client *peerRESTClient) doConsoleLog(logCh chan interface{}, doneCh <-chan
 
 	dec := gob.NewDecoder(respBody)
 	for {
-		var lg madmin.LogInfo
+		var lg log.Info
 		if err = dec.Decode(&lg); err != nil {
 			break
 		}
-		if lg.DeploymentID != "" {
-			select {
-			case logCh <- lg:
-			default:
-				// Do not block on slow receivers.
-			}
+		select {
+		case logCh <- lg:
+		default:
+			// Do not block on slow receivers.
 		}
 	}
 }
 
 // ConsoleLog - sends request to peer nodes to get console logs
-func (client *peerRESTClient) ConsoleLog(logCh chan interface{}, doneCh <-chan struct{}) {
+func (client *peerRESTClient) ConsoleLog(logCh chan log.Info, doneCh <-chan struct{}) {
 	go func() {
 		for {
 			client.doConsoleLog(logCh, doneCh)
@@ -794,26 +838,25 @@ func (client *peerRESTClient) GetPeerMetrics(ctx context.Context) (<-chan Metric
 	return ch, nil
 }
 
-func (client *peerRESTClient) Speedtest(ctx context.Context, size,
-	concurrent int, duration time.Duration, storageClass string,
-) (SpeedtestResult, error) {
+func (client *peerRESTClient) SpeedTest(ctx context.Context, opts speedTestOpts) (SpeedTestResult, error) {
 	values := make(url.Values)
-	values.Set(peerRESTSize, strconv.Itoa(size))
-	values.Set(peerRESTConcurrent, strconv.Itoa(concurrent))
-	values.Set(peerRESTDuration, duration.String())
-	values.Set(peerRESTStorageClass, storageClass)
+	values.Set(peerRESTSize, strconv.Itoa(opts.objectSize))
+	values.Set(peerRESTConcurrent, strconv.Itoa(opts.concurrency))
+	values.Set(peerRESTDuration, opts.duration.String())
+	values.Set(peerRESTStorageClass, opts.storageClass)
+	values.Set(peerRESTBucket, opts.bucketName)
 
-	respBody, err := client.callWithContext(context.Background(), peerRESTMethodSpeedtest, values, nil, -1)
+	respBody, err := client.callWithContext(context.Background(), peerRESTMethodSpeedTest, values, nil, -1)
 	if err != nil {
-		return SpeedtestResult{}, err
+		return SpeedTestResult{}, err
 	}
 	defer http.DrainBody(respBody)
 	waitReader, err := waitForHTTPResponse(respBody)
 	if err != nil {
-		return SpeedtestResult{}, err
+		return SpeedTestResult{}, err
 	}
 
-	var result SpeedtestResult
+	var result SpeedTestResult
 	err = gob.NewDecoder(waitReader).Decode(&result)
 	if err != nil {
 		return result, err

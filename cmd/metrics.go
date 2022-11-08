@@ -20,13 +20,12 @@ package cmd
 import (
 	"net/http"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/minio/minio/internal/logger"
 	iampolicy "github.com/minio/pkg/iam/policy"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/expfmt"
 )
 
 var (
@@ -55,7 +54,6 @@ var (
 
 const (
 	healMetricsNamespace = "self_heal"
-	gatewayNamespace     = "gateway"
 	cacheNamespace       = "cache"
 	s3Namespace          = "s3"
 	bucketNamespace      = "bucket"
@@ -101,15 +99,10 @@ func (c *minioCollector) Collect(ch chan<- prometheus.Metric) {
 	networkMetricsPrometheus(ch)
 	httpMetricsPrometheus(ch)
 	cacheMetricsPrometheus(ch)
-	gatewayMetricsPrometheus(ch)
 	healingMetricsPrometheus(ch)
 }
 
 func nodeHealthMetricsPrometheus(ch chan<- prometheus.Metric) {
-	if globalIsGateway {
-		return
-	}
-
 	nodesUp, nodesDown := globalNotificationSys.GetPeerOnlineCount()
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc(
@@ -132,9 +125,6 @@ func nodeHealthMetricsPrometheus(ch chan<- prometheus.Metric) {
 // collects healing specific metrics for MinIO instance in Prometheus specific format
 // and sends to given channel
 func healingMetricsPrometheus(ch chan<- prometheus.Metric) {
-	if globalIsGateway {
-		return
-	}
 	bgSeq, exists := globalBackgroundHealState.getHealSequenceByToken(bgHealingUUID)
 	if !exists {
 		return
@@ -188,79 +178,6 @@ func healingMetricsPrometheus(ch chan<- prometheus.Metric) {
 	}
 }
 
-// collects gateway specific metrics for MinIO instance in Prometheus specific format
-// and sends to given channel
-func gatewayMetricsPrometheus(ch chan<- prometheus.Metric) {
-	if !globalIsGateway || (globalGatewayName != S3BackendGateway) {
-		return
-	}
-
-	objLayer := newObjectLayerFn()
-	// Service not initialized yet
-	if objLayer == nil {
-		return
-	}
-
-	m, err := objLayer.GetMetrics(GlobalContext)
-	if err != nil {
-		return
-	}
-
-	ch <- prometheus.MustNewConstMetric(
-		prometheus.NewDesc(
-			prometheus.BuildFQName(gatewayNamespace, globalGatewayName, "bytes_received"),
-			"Total number of bytes received by current MinIO Gateway "+globalGatewayName+" backend",
-			nil, nil),
-		prometheus.CounterValue,
-		float64(m.GetBytesReceived()),
-	)
-	ch <- prometheus.MustNewConstMetric(
-		prometheus.NewDesc(
-			prometheus.BuildFQName(gatewayNamespace, globalGatewayName, "bytes_sent"),
-			"Total number of bytes sent by current MinIO Gateway to "+globalGatewayName+" backend",
-			nil, nil),
-		prometheus.CounterValue,
-		float64(m.GetBytesSent()),
-	)
-	s := m.GetRequests()
-	ch <- prometheus.MustNewConstMetric(
-		prometheus.NewDesc(
-			prometheus.BuildFQName(gatewayNamespace, globalGatewayName, "requests"),
-			"Total number of requests made to "+globalGatewayName+" by current MinIO Gateway",
-			[]string{"method"}, nil),
-		prometheus.CounterValue,
-		float64(atomic.LoadUint64(&s.Get)),
-		http.MethodGet,
-	)
-	ch <- prometheus.MustNewConstMetric(
-		prometheus.NewDesc(
-			prometheus.BuildFQName(gatewayNamespace, globalGatewayName, "requests"),
-			"Total number of requests made to "+globalGatewayName+" by current MinIO Gateway",
-			[]string{"method"}, nil),
-		prometheus.CounterValue,
-		float64(atomic.LoadUint64(&s.Head)),
-		http.MethodHead,
-	)
-	ch <- prometheus.MustNewConstMetric(
-		prometheus.NewDesc(
-			prometheus.BuildFQName(gatewayNamespace, globalGatewayName, "requests"),
-			"Total number of requests made to "+globalGatewayName+" by current MinIO Gateway",
-			[]string{"method"}, nil),
-		prometheus.CounterValue,
-		float64(atomic.LoadUint64(&s.Put)),
-		http.MethodPut,
-	)
-	ch <- prometheus.MustNewConstMetric(
-		prometheus.NewDesc(
-			prometheus.BuildFQName(gatewayNamespace, globalGatewayName, "requests"),
-			"Total number of requests made to "+globalGatewayName+" by current MinIO Gateway",
-			[]string{"method"}, nil),
-		prometheus.CounterValue,
-		float64(atomic.LoadUint64(&s.Post)),
-		http.MethodPost,
-	)
-}
-
 // collects cache metrics for MinIO server in Prometheus specific format
 // and sends to given channel
 func cacheMetricsPrometheus(ch chan<- prometheus.Metric) {
@@ -273,7 +190,7 @@ func cacheMetricsPrometheus(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc(
 			prometheus.BuildFQName(cacheNamespace, "hits", "total"),
-			"Total number of disk cache hits in current MinIO instance",
+			"Total number of drive cache hits in current MinIO instance",
 			nil, nil),
 		prometheus.CounterValue,
 		float64(cacheObjLayer.CacheStats().getHits()),
@@ -281,7 +198,7 @@ func cacheMetricsPrometheus(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc(
 			prometheus.BuildFQName(cacheNamespace, "misses", "total"),
-			"Total number of disk cache misses in current MinIO instance",
+			"Total number of drive cache misses in current MinIO instance",
 			nil, nil),
 		prometheus.CounterValue,
 		float64(cacheObjLayer.CacheStats().getMisses()),
@@ -328,7 +245,7 @@ func cacheMetricsPrometheus(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(
 			prometheus.NewDesc(
 				prometheus.BuildFQName("cache", "total", "size"),
-				"Indicates total size of cache disk",
+				"Indicates total size of cache drive",
 				[]string{"disk"}, nil),
 			prometheus.GaugeValue,
 			float64(cdStats.TotalCapacity),
@@ -444,10 +361,6 @@ func bucketUsageMetricsPrometheus(ch chan<- prometheus.Metric) {
 		return
 	}
 
-	if globalIsGateway {
-		return
-	}
-
 	dataUsageInfo, err := loadDataUsageFromBackend(GlobalContext, objLayer)
 	if err != nil {
 		return
@@ -458,7 +371,7 @@ func bucketUsageMetricsPrometheus(ch chan<- prometheus.Metric) {
 	}
 
 	for bucket, usageInfo := range dataUsageInfo.BucketsUsage {
-		stat := getLatestReplicationStats(bucket, usageInfo)
+		stat := globalReplicationStats.getLatestReplicationStats(bucket, usageInfo)
 		// Total space used by bucket
 		ch <- prometheus.MustNewConstMetric(
 			prometheus.NewDesc(
@@ -538,10 +451,6 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 		return
 	}
 
-	if globalIsGateway {
-		return
-	}
-
 	server := getLocalServerProperty(globalEndpoints, &http.Request{
 		Host: globalLocalNodeName,
 	})
@@ -577,7 +486,7 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 			"Total usable capacity online in the cluster",
 			nil, nil),
 		prometheus.GaugeValue,
-		GetTotalUsableCapacity(server.Disks, s),
+		float64(GetTotalUsableCapacity(server.Disks, s)),
 	)
 	// Report total usable capacity free
 	ch <- prometheus.MustNewConstMetric(
@@ -586,14 +495,14 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 			"Total free usable capacity online in the cluster",
 			nil, nil),
 		prometheus.GaugeValue,
-		GetTotalUsableCapacityFree(server.Disks, s),
+		float64(GetTotalUsableCapacityFree(server.Disks, s)),
 	)
 
 	// MinIO Offline Disks per node
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc(
 			prometheus.BuildFQName(minioNamespace, "disks", "offline"),
-			"Total number of offline disks in current MinIO server instance",
+			"Total number of offline drives in current MinIO server instance",
 			nil, nil),
 		prometheus.GaugeValue,
 		float64(offlineDisks.Sum()),
@@ -602,8 +511,8 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 	// MinIO Total Disks per node
 	ch <- prometheus.MustNewConstMetric(
 		prometheus.NewDesc(
-			prometheus.BuildFQName(minioNamespace, "disks", "total"),
-			"Total number of disks for current MinIO server instance",
+			prometheus.BuildFQName(minioNamespace, "drives", "total"),
+			"Total number of drives for current MinIO server instance",
 			nil, nil),
 		prometheus.GaugeValue,
 		float64(totalDisks.Sum()),
@@ -614,7 +523,7 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(
 			prometheus.NewDesc(
 				prometheus.BuildFQName(diskNamespace, "storage", "used"),
-				"Total disk storage used on the disk",
+				"Total disk storage used on the drive",
 				[]string{"disk"}, nil),
 			prometheus.GaugeValue,
 			float64(disk.UsedSpace),
@@ -625,7 +534,7 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(
 			prometheus.NewDesc(
 				prometheus.BuildFQName(diskNamespace, "storage", "available"),
-				"Total available space left on the disk",
+				"Total available space left on the drive",
 				[]string{"disk"}, nil),
 			prometheus.GaugeValue,
 			float64(disk.AvailableSpace),
@@ -636,7 +545,7 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(
 			prometheus.NewDesc(
 				prometheus.BuildFQName(diskNamespace, "storage", "total"),
-				"Total space on the disk",
+				"Total space on the drive",
 				[]string{"disk"}, nil),
 			prometheus.GaugeValue,
 			float64(disk.TotalSpace),
@@ -648,35 +557,59 @@ func storageMetricsPrometheus(ch chan<- prometheus.Metric) {
 func metricsHandler() http.Handler {
 	registry := prometheus.NewRegistry()
 
-	err := registry.Register(minioVersionInfo)
-	logger.LogIf(GlobalContext, err)
+	logger.CriticalIf(GlobalContext, registry.Register(minioVersionInfo))
 
-	err = registry.Register(httpRequestsDuration)
-	logger.LogIf(GlobalContext, err)
-
-	err = registry.Register(newMinioCollector())
-	logger.LogIf(GlobalContext, err)
+	logger.CriticalIf(GlobalContext, registry.Register(newMinioCollector()))
 
 	gatherers := prometheus.Gatherers{
 		prometheus.DefaultGatherer,
 		registry,
 	}
-	// Delegate http serving to Prometheus client library, which will call collector.Collect.
-	return promhttp.InstrumentMetricHandler(
-		registry,
-		promhttp.HandlerFor(gatherers,
-			promhttp.HandlerOpts{
-				ErrorHandling: promhttp.ContinueOnError,
-			}),
-	)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tc, ok := r.Context().Value(contextTraceReqKey).(*traceCtxt)
+		if ok {
+			tc.funcName = "handler.MetricsLegacy"
+			tc.responseRecorder.LogErrBody = true
+		}
+
+		mfs, err := gatherers.Gather()
+		if err != nil {
+			if len(mfs) == 0 {
+				writeErrorResponseJSON(r.Context(), w, toAdminAPIErr(r.Context(), err), r.URL)
+				return
+			}
+		}
+
+		contentType := expfmt.Negotiate(r.Header)
+		w.Header().Set("Content-Type", string(contentType))
+
+		enc := expfmt.NewEncoder(w, contentType)
+		for _, mf := range mfs {
+			if err := enc.Encode(mf); err != nil {
+				logger.LogIf(r.Context(), err)
+				return
+			}
+		}
+		if closer, ok := enc.(expfmt.Closer); ok {
+			closer.Close()
+		}
+	})
 }
 
 // AuthMiddleware checks if the bearer token is valid and authorized.
 func AuthMiddleware(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tc, ok := r.Context().Value(contextTraceReqKey).(*traceCtxt)
+
 		claims, groups, owner, authErr := metricsRequestAuthenticate(r)
 		if authErr != nil || !claims.VerifyIssuer("prometheus", true) {
-			w.WriteHeader(http.StatusForbidden)
+			if ok {
+				tc.funcName = "handler.MetricsAuth"
+				tc.responseRecorder.LogErrBody = true
+			}
+
+			writeErrorResponseJSON(r.Context(), w, toAdminAPIErr(r.Context(), errAuthentication), r.URL)
 			return
 		}
 		// For authenticated users apply IAM policy.
@@ -688,7 +621,12 @@ func AuthMiddleware(h http.Handler) http.Handler {
 			IsOwner:         owner,
 			Claims:          claims.Map(),
 		}) {
-			w.WriteHeader(http.StatusForbidden)
+			if ok {
+				tc.funcName = "handler.MetricsAuth"
+				tc.responseRecorder.LogErrBody = true
+			}
+
+			writeErrorResponseJSON(r.Context(), w, toAdminAPIErr(r.Context(), errAuthentication), r.URL)
 			return
 		}
 		h.ServeHTTP(w, r)

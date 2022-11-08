@@ -19,13 +19,13 @@ package cmd
 
 import (
 	"bufio"
+	"bytes"
 	"crypto"
 	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -76,7 +76,7 @@ func releaseTimeToReleaseTag(releaseTime time.Time) string {
 // releaseTagToReleaseTime - reverse of `releaseTimeToReleaseTag()`
 func releaseTagToReleaseTime(releaseTag string) (releaseTime time.Time, err error) {
 	fields := strings.Split(releaseTag, ".")
-	if len(fields) < 2 || len(fields) > 3 {
+	if len(fields) < 2 || len(fields) > 4 {
 		return releaseTime, fmt.Errorf("%s is not a valid release tag", releaseTag)
 	}
 	if fields[0] != "RELEASE" {
@@ -95,7 +95,7 @@ func getModTime(path string) (t time.Time, err error) {
 
 	// Version is minio non-standard, we will use minio binary's
 	// ModTime as release time.
-	fi, err := os.Stat(absPath)
+	fi, err := Stat(absPath)
 	if err != nil {
 		return t, fmt.Errorf("Unable to get ModTime of %s. %w", absPath, err)
 	}
@@ -122,43 +122,33 @@ func GetCurrentReleaseTime() (releaseTime time.Time, err error) {
 //
 // https://github.com/moby/moby/blob/master/daemon/initlayer/setup_unix.go#L25
 //
-//     "/.dockerenv":      "file",
-//
+//	"/.dockerenv":      "file",
 func IsDocker() bool {
-	if !globalIsCICD {
-		_, err := os.Stat("/.dockerenv")
-		if osIsNotExist(err) {
-			return false
-		}
-
-		// Log error, as we will not propagate it to caller
-		logger.LogIf(GlobalContext, err)
-
-		return err == nil
+	_, err := os.Stat("/.dockerenv")
+	if osIsNotExist(err) {
+		return false
 	}
-	return false
+
+	// Log error, as we will not propagate it to caller
+	logger.LogIf(GlobalContext, err)
+
+	return err == nil
 }
 
 // IsDCOS returns true if minio is running in DCOS.
 func IsDCOS() bool {
-	if !globalIsCICD {
-		// http://mesos.apache.org/documentation/latest/docker-containerizer/
-		// Mesos docker containerizer sets this value
-		return env.Get("MESOS_CONTAINER_NAME", "") != ""
-	}
-	return false
+	// http://mesos.apache.org/documentation/latest/docker-containerizer/
+	// Mesos docker containerizer sets this value
+	return env.Get("MESOS_CONTAINER_NAME", "") != ""
 }
 
 // IsKubernetes returns true if minio is running in kubernetes.
 func IsKubernetes() bool {
-	if !globalIsCICD {
-		// Kubernetes env used to validate if we are
-		// indeed running inside a kubernetes pod
-		// is KUBERNETES_SERVICE_HOST
-		// https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/kubelet_pods.go#L541
-		return env.Get("KUBERNETES_SERVICE_HOST", "") != ""
-	}
-	return false
+	// Kubernetes env used to validate if we are
+	// indeed running inside a kubernetes pod
+	// is KUBERNETES_SERVICE_HOST
+	// https://github.com/kubernetes/kubernetes/blob/master/pkg/kubelet/kubelet_pods.go#L541
+	return env.Get("KUBERNETES_SERVICE_HOST", "") != ""
 }
 
 // IsBOSH returns true if minio is deployed from a bosh package
@@ -180,7 +170,7 @@ func IsBOSH() bool {
 // Check if this is Helm package installation and report helm chart version
 func getHelmVersion(helmInfoFilePath string) string {
 	// Read the file exists.
-	helmInfoFile, err := os.Open(helmInfoFilePath)
+	helmInfoFile, err := Open(helmInfoFilePath)
 	if err != nil {
 		// Log errors and return "" as MinIO can be deployed
 		// without Helm charts as well.
@@ -219,7 +209,7 @@ func IsPCFTile() bool {
 // DO NOT CHANGE USER AGENT STYLE.
 // The style should be
 //
-//   MinIO (<OS>; <ARCH>[; <MODE>][; dcos][; kubernetes][; docker][; source]) MinIO/<VERSION> MinIO/<RELEASE-TAG> MinIO/<COMMIT-ID> [MinIO/universe-<PACKAGE-NAME>] [MinIO/helm-<HELM-VERSION>]
+//	MinIO (<OS>; <ARCH>[; <MODE>][; dcos][; kubernetes][; docker][; source]) MinIO/<VERSION> MinIO/<RELEASE-TAG> MinIO/<COMMIT-ID> [MinIO/universe-<PACKAGE-NAME>] [MinIO/helm-<HELM-VERSION>]
 //
 // Any change here should be discussed by opening an issue at
 // https://github.com/minio/minio/issues.
@@ -291,63 +281,50 @@ func getUserAgent(mode string) string {
 }
 
 func downloadReleaseURL(u *url.URL, timeout time.Duration, mode string) (content string, err error) {
-	var reader io.ReadCloser
-	if u.Scheme == "https" || u.Scheme == "http" {
-		req, err := http.NewRequest(http.MethodGet, u.String(), nil)
-		if err != nil {
-			return content, AdminError{
-				Code:       AdminUpdateUnexpectedFailure,
-				Message:    err.Error(),
-				StatusCode: http.StatusInternalServerError,
-			}
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return content, AdminError{
+			Code:       AdminUpdateUnexpectedFailure,
+			Message:    err.Error(),
+			StatusCode: http.StatusInternalServerError,
 		}
-		req.Header.Set("User-Agent", getUserAgent(mode))
+	}
+	req.Header.Set("User-Agent", getUserAgent(mode))
 
-		client := &http.Client{Transport: getUpdateTransport(timeout)}
-		resp, err := client.Do(req)
-		if err != nil {
-			if xnet.IsNetworkOrHostDown(err, false) {
-				return content, AdminError{
-					Code:       AdminUpdateURLNotReachable,
-					Message:    err.Error(),
-					StatusCode: http.StatusServiceUnavailable,
-				}
-			}
-			return content, AdminError{
-				Code:       AdminUpdateUnexpectedFailure,
-				Message:    err.Error(),
-				StatusCode: http.StatusInternalServerError,
-			}
-		}
-		if resp == nil {
-			return content, AdminError{
-				Code:       AdminUpdateUnexpectedFailure,
-				Message:    fmt.Sprintf("No response from server to download URL %s", u),
-				StatusCode: http.StatusInternalServerError,
-			}
-		}
-		reader = resp.Body
-		defer xhttp.DrainBody(resp.Body)
-
-		if resp.StatusCode != http.StatusOK {
-			return content, AdminError{
-				Code:       AdminUpdateUnexpectedFailure,
-				Message:    fmt.Sprintf("Error downloading URL %s. Response: %v", u, resp.Status),
-				StatusCode: resp.StatusCode,
-			}
-		}
-	} else {
-		reader, err = os.Open(u.Path)
-		if err != nil {
+	client := &http.Client{Transport: getUpdateTransport(timeout)}
+	resp, err := client.Do(req)
+	if err != nil {
+		if xnet.IsNetworkOrHostDown(err, false) {
 			return content, AdminError{
 				Code:       AdminUpdateURLNotReachable,
 				Message:    err.Error(),
 				StatusCode: http.StatusServiceUnavailable,
 			}
 		}
+		return content, AdminError{
+			Code:       AdminUpdateUnexpectedFailure,
+			Message:    err.Error(),
+			StatusCode: http.StatusInternalServerError,
+		}
+	}
+	if resp == nil {
+		return content, AdminError{
+			Code:       AdminUpdateUnexpectedFailure,
+			Message:    fmt.Sprintf("No response from server to download URL %s", u),
+			StatusCode: http.StatusInternalServerError,
+		}
+	}
+	defer xhttp.DrainBody(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		return content, AdminError{
+			Code:       AdminUpdateUnexpectedFailure,
+			Message:    fmt.Sprintf("Error downloading URL %s. Response: %v", u, resp.Status),
+			StatusCode: resp.StatusCode,
+		}
 	}
 
-	contentBytes, err := ioutil.ReadAll(reader)
+	contentBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return content, AdminError{
 			Code:       AdminUpdateUnexpectedFailure,
@@ -438,10 +415,10 @@ func getLatestReleaseTime(u *url.URL, timeout time.Duration, mode string) (sha25
 
 const (
 	// Kubernetes deployment doc link.
-	kubernetesDeploymentDoc = "https://docs.min.io/docs/deploy-minio-on-kubernetes"
+	kubernetesDeploymentDoc = "https://min.io/docs/minio/kubernetes/upstream/index.html#quickstart-for-kubernetes"
 
 	// Mesos deployment doc link.
-	mesosDeploymentDoc = "https://docs.min.io/docs/deploy-minio-on-dc-os"
+	mesosDeploymentDoc = "https://min.io/docs/minio/kubernetes/upstream/index.html#quickstart-for-kubernetes"
 )
 
 func getDownloadURL(releaseTag string) (downloadURL string) {
@@ -469,18 +446,6 @@ func getDownloadURL(releaseTag string) (downloadURL string) {
 	}
 
 	return minioReleaseURL + "minio"
-}
-
-func getUpdateReaderFromFile(u *url.URL) (io.ReadCloser, error) {
-	r, err := os.Open(u.Path)
-	if err != nil {
-		return nil, AdminError{
-			Code:       AdminUpdateUnexpectedFailure,
-			Message:    err.Error(),
-			StatusCode: http.StatusInternalServerError,
-		}
-	}
-	return r, nil
 }
 
 func getUpdateReaderFromURL(u *url.URL, transport http.RoundTripper, mode string) (io.ReadCloser, error) {
@@ -518,26 +483,35 @@ func getUpdateReaderFromURL(u *url.URL, transport http.RoundTripper, mode string
 
 var updateInProgress uint32
 
-func doUpdate(u *url.URL, lrTime time.Time, sha256Sum []byte, releaseInfo string, mode string) (err error) {
+// Function to get the reader from an architecture
+func downloadBinary(u *url.URL, mode string) (readerReturn []byte, err error) {
+	transport := getUpdateTransport(30 * time.Second)
+	var reader io.ReadCloser
+	if u.Scheme == "https" || u.Scheme == "http" {
+		reader, err = getUpdateReaderFromURL(u, transport, mode)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		return nil, fmt.Errorf("unsupported protocol scheme: %s", u.Scheme)
+	}
+	defer xhttp.DrainBody(reader)
+	// convert a Reader to bytes
+	binaryFile, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	return binaryFile, nil
+}
+
+func verifyBinary(u *url.URL, sha256Sum []byte, releaseInfo string, mode string, reader []byte) (err error) {
 	if !atomic.CompareAndSwapUint32(&updateInProgress, 0, 1) {
 		return errors.New("update already in progress")
 	}
 	defer atomic.StoreUint32(&updateInProgress, 0)
 
 	transport := getUpdateTransport(30 * time.Second)
-	var reader io.ReadCloser
-	if u.Scheme == "https" || u.Scheme == "http" {
-		reader, err = getUpdateReaderFromURL(u, transport, mode)
-		if err != nil {
-			return err
-		}
-	} else {
-		reader, err = getUpdateReaderFromFile(u)
-		if err != nil {
-			return err
-		}
-	}
-
 	opts := selfupdate.Options{
 		Hash:     crypto.SHA256,
 		Checksum: sha256Sum,
@@ -565,7 +539,35 @@ func doUpdate(u *url.URL, lrTime time.Time, sha256Sum []byte, releaseInfo string
 		opts.Verifier = v
 	}
 
-	if err = selfupdate.Apply(reader, opts); err != nil {
+	if err = selfupdate.PrepareAndCheckBinary(bytes.NewReader(reader), opts); err != nil {
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			return AdminError{
+				Code: AdminUpdateApplyFailure,
+				Message: fmt.Sprintf("Unable to update the binary at %s: %v",
+					filepath.Dir(pathErr.Path), pathErr.Err),
+				StatusCode: http.StatusForbidden,
+			}
+		}
+		return AdminError{
+			Code:       AdminUpdateApplyFailure,
+			Message:    err.Error(),
+			StatusCode: http.StatusInternalServerError,
+		}
+	}
+
+	return nil
+}
+
+func commitBinary() (err error) {
+	if !atomic.CompareAndSwapUint32(&updateInProgress, 0, 1) {
+		return errors.New("update already in progress")
+	}
+	defer atomic.StoreUint32(&updateInProgress, 0)
+
+	opts := selfupdate.Options{}
+
+	if err = selfupdate.CommitBinary(opts); err != nil {
 		if rerr := selfupdate.RollbackError(err); rerr != nil {
 			return AdminError{
 				Code:       AdminUpdateApplyFailure,

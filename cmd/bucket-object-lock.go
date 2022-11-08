@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"math"
 	"net/http"
 
@@ -35,22 +36,16 @@ type BucketObjectLockSys struct{}
 
 // Get - Get retention configuration.
 func (sys *BucketObjectLockSys) Get(bucketName string) (r objectlock.Retention, err error) {
-	if globalIsGateway {
-		objAPI := newObjectLayerFn()
-		if objAPI == nil {
-			return r, errServerNotInitialized
-		}
-
-		return r, nil
-	}
-
 	config, _, err := globalBucketMetadataSys.GetObjectLockConfig(bucketName)
 	if err != nil {
-		if _, ok := err.(BucketObjectLockConfigNotFound); ok {
+		if errors.Is(err, BucketObjectLockConfigNotFound{Bucket: bucketName}) {
 			return r, nil
 		}
+		if errors.Is(err, errInvalidArgument) {
+			return r, err
+		}
+		logger.CriticalIf(context.Background(), err)
 		return r, err
-
 	}
 	return config.ToRetention(), nil
 }

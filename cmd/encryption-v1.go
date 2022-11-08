@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/rand"
@@ -37,6 +38,7 @@ import (
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/etag"
 	"github.com/minio/minio/internal/fips"
+	"github.com/minio/minio/internal/hash"
 	"github.com/minio/minio/internal/hash/sha256"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/kms"
@@ -82,7 +84,7 @@ func (o *MultipartInfo) KMSKeyID() string { return kmsKeyIDFromMetadata(o.UserDe
 // metadata, if any. It returns an empty ID if no key ID is
 // present.
 func kmsKeyIDFromMetadata(metadata map[string]string) string {
-	const ARNPrefix = "arn:aws:kms:"
+	const ARNPrefix = crypto.ARNPrefix
 	if len(metadata) == 0 {
 		return ""
 	}
@@ -255,7 +257,7 @@ func ParseSSECustomerHeader(header http.Header) (key []byte, err error) {
 }
 
 // This function rotates old to new key.
-func rotateKey(oldKey []byte, newKeyID string, newKey []byte, bucket, object string, metadata map[string]string, ctx kms.Context) error {
+func rotateKey(ctx context.Context, oldKey []byte, newKeyID string, newKey []byte, bucket, object string, metadata map[string]string, cryptoCtx kms.Context) error {
 	kind, _ := crypto.IsEncrypted(metadata)
 	switch kind {
 	case crypto.S3:
@@ -275,7 +277,7 @@ func rotateKey(oldKey []byte, newKeyID string, newKey []byte, bucket, object str
 			return err
 		}
 
-		newKey, err := GlobalKMS.GenerateKey("", kms.Context{bucket: path.Join(bucket, object)})
+		newKey, err := GlobalKMS.GenerateKey(ctx, "", kms.Context{bucket: path.Join(bucket, object)})
 		if err != nil {
 			return err
 		}
@@ -291,8 +293,8 @@ func rotateKey(oldKey []byte, newKeyID string, newKey []byte, bucket, object str
 			return err
 		}
 
-		if len(ctx) == 0 {
-			_, _, _, ctx, err = crypto.S3KMS.ParseMetadata(metadata)
+		if len(cryptoCtx) == 0 {
+			_, _, _, cryptoCtx, err = crypto.S3KMS.ParseMetadata(metadata)
 			if err != nil {
 				return err
 			}
@@ -305,19 +307,19 @@ func rotateKey(oldKey []byte, newKeyID string, newKey []byte, bucket, object str
 		// of the client provided context and add the bucket
 		// key, if not present.
 		kmsCtx := kms.Context{}
-		for k, v := range ctx {
+		for k, v := range cryptoCtx {
 			kmsCtx[k] = v
 		}
 		if _, ok := kmsCtx[bucket]; !ok {
 			kmsCtx[bucket] = path.Join(bucket, object)
 		}
-		newKey, err := GlobalKMS.GenerateKey(newKeyID, kmsCtx)
+		newKey, err := GlobalKMS.GenerateKey(ctx, newKeyID, kmsCtx)
 		if err != nil {
 			return err
 		}
 
 		sealedKey := objectKey.Seal(newKey.Plaintext, crypto.GenerateIV(rand.Reader), crypto.S3KMS.String(), bucket, object)
-		crypto.S3KMS.CreateMetadata(metadata, newKey.KeyID, newKey.Ciphertext, sealedKey, ctx)
+		crypto.S3KMS.CreateMetadata(metadata, newKey.KeyID, newKey.Ciphertext, sealedKey, cryptoCtx)
 		return nil
 	case crypto.SSEC:
 		sealedKey, err := crypto.SSEC.ParseMetadata(metadata)
@@ -344,14 +346,14 @@ func rotateKey(oldKey []byte, newKeyID string, newKey []byte, bucket, object str
 	}
 }
 
-func newEncryptMetadata(kind crypto.Type, keyID string, key []byte, bucket, object string, metadata map[string]string, ctx kms.Context) (crypto.ObjectKey, error) {
+func newEncryptMetadata(ctx context.Context, kind crypto.Type, keyID string, key []byte, bucket, object string, metadata map[string]string, cryptoCtx kms.Context) (crypto.ObjectKey, error) {
 	var sealedKey crypto.SealedKey
 	switch kind {
 	case crypto.S3:
 		if GlobalKMS == nil {
 			return crypto.ObjectKey{}, errKMSNotConfigured
 		}
-		key, err := GlobalKMS.GenerateKey("", kms.Context{bucket: path.Join(bucket, object)})
+		key, err := GlobalKMS.GenerateKey(ctx, "", kms.Context{bucket: path.Join(bucket, object)})
 		if err != nil {
 			return crypto.ObjectKey{}, err
 		}
@@ -372,13 +374,13 @@ func newEncryptMetadata(kind crypto.Type, keyID string, key []byte, bucket, obje
 		// of the client provided context and add the bucket
 		// key, if not present.
 		kmsCtx := kms.Context{}
-		for k, v := range ctx {
+		for k, v := range cryptoCtx {
 			kmsCtx[k] = v
 		}
 		if _, ok := kmsCtx[bucket]; !ok {
 			kmsCtx[bucket] = path.Join(bucket, object)
 		}
-		key, err := GlobalKMS.GenerateKey(keyID, kmsCtx)
+		key, err := GlobalKMS.GenerateKey(ctx, keyID, kmsCtx)
 		if err != nil {
 			if errors.Is(err, kes.ErrKeyNotFound) {
 				return crypto.ObjectKey{}, errKMSKeyNotFound
@@ -388,7 +390,7 @@ func newEncryptMetadata(kind crypto.Type, keyID string, key []byte, bucket, obje
 
 		objectKey := crypto.GenerateKey(key.Plaintext, rand.Reader)
 		sealedKey = objectKey.Seal(key.Plaintext, crypto.GenerateIV(rand.Reader), crypto.S3KMS.String(), bucket, object)
-		crypto.S3KMS.CreateMetadata(metadata, key.KeyID, key.Ciphertext, sealedKey, ctx)
+		crypto.S3KMS.CreateMetadata(metadata, key.KeyID, key.Ciphertext, sealedKey, cryptoCtx)
 		return objectKey, nil
 	case crypto.SSEC:
 		objectKey := crypto.GenerateKey(key, rand.Reader)
@@ -400,8 +402,8 @@ func newEncryptMetadata(kind crypto.Type, keyID string, key []byte, bucket, obje
 	}
 }
 
-func newEncryptReader(content io.Reader, kind crypto.Type, keyID string, key []byte, bucket, object string, metadata map[string]string, ctx kms.Context) (io.Reader, crypto.ObjectKey, error) {
-	objectEncryptionKey, err := newEncryptMetadata(kind, keyID, key, bucket, object, metadata, ctx)
+func newEncryptReader(ctx context.Context, content io.Reader, kind crypto.Type, keyID string, key []byte, bucket, object string, metadata map[string]string, cryptoCtx kms.Context) (io.Reader, crypto.ObjectKey, error) {
+	objectEncryptionKey, err := newEncryptMetadata(ctx, kind, keyID, key, bucket, object, metadata, cryptoCtx)
 	if err != nil {
 		return nil, crypto.ObjectKey{}, err
 	}
@@ -418,9 +420,9 @@ func newEncryptReader(content io.Reader, kind crypto.Type, keyID string, key []b
 // SSE-S3
 func setEncryptionMetadata(r *http.Request, bucket, object string, metadata map[string]string) (err error) {
 	var (
-		key   []byte
-		keyID string
-		ctx   kms.Context
+		key    []byte
+		keyID  string
+		kmsCtx kms.Context
 	)
 	kind, _ := crypto.IsRequested(r.Header)
 	switch kind {
@@ -430,12 +432,12 @@ func setEncryptionMetadata(r *http.Request, bucket, object string, metadata map[
 			return err
 		}
 	case crypto.S3KMS:
-		keyID, ctx, err = crypto.S3KMS.ParseHTTP(r.Header)
+		keyID, kmsCtx, err = crypto.S3KMS.ParseHTTP(r.Header)
 		if err != nil {
 			return err
 		}
 	}
-	_, err = newEncryptMetadata(kind, keyID, key, bucket, object, metadata, ctx)
+	_, err = newEncryptMetadata(r.Context(), kind, keyID, key, bucket, object, metadata, kmsCtx)
 	return
 }
 
@@ -468,10 +470,10 @@ func EncryptRequest(content io.Reader, r *http.Request, bucket, object string, m
 			return nil, crypto.ObjectKey{}, err
 		}
 	}
-	return newEncryptReader(content, kind, keyID, key, bucket, object, metadata, ctx)
+	return newEncryptReader(r.Context(), content, kind, keyID, key, bucket, object, metadata, ctx)
 }
 
-func decryptObjectInfo(key []byte, bucket, object string, metadata map[string]string) ([]byte, error) {
+func decryptObjectMeta(key []byte, bucket, object string, metadata map[string]string) ([]byte, error) {
 	switch kind, _ := crypto.IsEncrypted(metadata); kind {
 	case crypto.S3:
 		var KMS kms.KMS = GlobalKMS
@@ -542,7 +544,7 @@ func DecryptCopyRequestR(client io.Reader, h http.Header, bucket, object string,
 }
 
 func newDecryptReader(client io.Reader, key []byte, bucket, object string, seqNumber uint32, metadata map[string]string) (io.Reader, error) {
-	objectEncryptionKey, err := decryptObjectInfo(key, bucket, object, metadata)
+	objectEncryptionKey, err := decryptObjectMeta(key, bucket, object, metadata)
 	if err != nil {
 		return nil, err
 	}
@@ -654,7 +656,7 @@ func (d *DecryptBlocksReader) buildDecrypter(partID int) error {
 		return err
 	}
 
-	objectEncryptionKey, err := decryptObjectInfo(key, d.bucket, d.object, m)
+	objectEncryptionKey, err := decryptObjectMeta(key, d.bucket, d.object, m)
 	if err != nil {
 		return err
 	}
@@ -820,7 +822,7 @@ func getDecryptedETag(headers http.Header, objInfo ObjectInfo, copySource bool) 
 		return objInfo.ETag[len(objInfo.ETag)-32:]
 	}
 
-	objectEncryptionKey, err := decryptObjectInfo(key[:], objInfo.Bucket, objInfo.Name, objInfo.UserDefined)
+	objectEncryptionKey, err := decryptObjectMeta(key[:], objInfo.Bucket, objInfo.Name, objInfo.UserDefined)
 	if err != nil {
 		return objInfo.ETag
 	}
@@ -1041,14 +1043,59 @@ func DecryptObjectInfo(info *ObjectInfo, r *http.Request) (encrypted bool, err e
 	return encrypted, nil
 }
 
-// The customer key in the header is used by the gateway for encryption in the case of
-// s3 gateway double encryption. A new client key is derived from the customer provided
-// key to be sent to the s3 backend for encryption at the backend.
-func deriveClientKey(clientKey [32]byte, bucket, object string) [32]byte {
-	var key [32]byte
-	mac := hmac.New(sha256.New, clientKey[:])
-	mac.Write([]byte(crypto.SSEC.String()))
-	mac.Write([]byte(path.Join(bucket, object)))
-	mac.Sum(key[:0])
-	return key
+type (
+	objectMetaEncryptFn func(baseKey string, data []byte) []byte
+	objectMetaDecryptFn func(baseKey string, data []byte) ([]byte, error)
+)
+
+// metadataEncrypter returns a function that will read data from input,
+// encrypt it using the provided key and return the result.
+// 0 sized inputs are passed through.
+func metadataEncrypter(key crypto.ObjectKey) objectMetaEncryptFn {
+	return func(baseKey string, data []byte) []byte {
+		if len(data) == 0 {
+			return data
+		}
+		var buffer bytes.Buffer
+		mac := hmac.New(sha256.New, key[:])
+		mac.Write([]byte(baseKey))
+		if _, err := sio.Encrypt(&buffer, bytes.NewReader(data), sio.Config{Key: mac.Sum(nil), CipherSuites: fips.DARECiphers()}); err != nil {
+			logger.CriticalIf(context.Background(), errors.New("unable to encrypt using object key"))
+		}
+		return buffer.Bytes()
+	}
+}
+
+// metadataDecrypter reverses metadataEncrypter.
+func (o *ObjectInfo) metadataDecrypter() objectMetaDecryptFn {
+	return func(baseKey string, input []byte) ([]byte, error) {
+		if len(input) == 0 {
+			return input, nil
+		}
+
+		key, err := decryptObjectMeta(nil, o.Bucket, o.Name, o.UserDefined)
+		if err != nil {
+			return nil, err
+		}
+		mac := hmac.New(sha256.New, key)
+		mac.Write([]byte(baseKey))
+		return sio.DecryptBuffer(nil, input, sio.Config{Key: mac.Sum(nil), CipherSuites: fips.DARECiphers()})
+	}
+}
+
+// decryptChecksums will attempt to decode checksums and return it/them if set.
+func (o *ObjectInfo) decryptChecksums() map[string]string {
+	data := o.Checksum
+	if len(data) == 0 {
+		return nil
+	}
+	if _, encrypted := crypto.IsEncrypted(o.UserDefined); encrypted {
+		decrypted, err := o.metadataDecrypter()("object-checksum", data)
+		if err != nil {
+			logger.LogIf(GlobalContext, err)
+			return nil
+		}
+		data = decrypted
+	}
+	return hash.ReadCheckSums(data)
 }

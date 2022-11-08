@@ -179,54 +179,13 @@ func listOnlineDisks(disks []StorageAPI, partsMetadata []FileInfo, errs []error)
 	return onlineDisks, modTime
 }
 
-// Returns the latest updated FileInfo files and error in case of failure.
-func getLatestFileInfo(ctx context.Context, partsMetadata []FileInfo, errs []error) (FileInfo, error) {
-	// There should be atleast half correct entries, if not return failure
-	reducedErr := reduceReadQuorumErrs(ctx, errs, objectOpIgnoredErrs, len(partsMetadata)/2)
-	if reducedErr != nil {
-		return FileInfo{}, reducedErr
-	}
-
-	// List all the file commit ids from parts metadata.
-	modTimes := listObjectModtimes(partsMetadata, errs)
-
-	// Count all latest updated FileInfo values
-	var count int
-	var latestFileInfo FileInfo
-
-	// Reduce list of UUIDs to a single common value - i.e. the last updated Time
-	modTime := commonTime(modTimes)
-
-	if modTime.IsZero() || modTime.Equal(timeSentinel) {
-		return FileInfo{}, errErasureReadQuorum
-	}
-
-	// Interate through all the modTimes and count the FileInfo(s) with latest time.
-	for index, t := range modTimes {
-		if partsMetadata[index].IsValid() && t.Equal(modTime) {
-			latestFileInfo = partsMetadata[index]
-			count++
-		}
-	}
-
-	if !latestFileInfo.IsValid() {
-		return FileInfo{}, errErasureReadQuorum
-	}
-
-	if count < latestFileInfo.Erasure.DataBlocks {
-		return FileInfo{}, errErasureReadQuorum
-	}
-
-	return latestFileInfo, nil
-}
-
 // disksWithAllParts - This function needs to be called with
 // []StorageAPI returned by listOnlineDisks. Returns,
 //
 // - disks which have all parts specified in the latest xl.meta.
 //
-// - slice of errors about the state of data files on disk - can have
-//   a not-found error or a hash-mismatch error.
+//   - slice of errors about the state of data files on disk - can have
+//     a not-found error or a hash-mismatch error.
 func disksWithAllParts(ctx context.Context, onlineDisks []StorageAPI, partsMetadata []FileInfo,
 	errs []error, latestMeta FileInfo, bucket, object string,
 	scanMode madmin.HealScanMode) ([]StorageAPI, []error, time.Time,

@@ -287,7 +287,7 @@ func (config *TierConfigMgr) configReader() (*PutObjReader, *ObjectOptions, erro
 
 	// Encrypt json encoded tier configurations
 	metadata := make(map[string]string)
-	encBr, oek, err := newEncryptReader(hr, crypto.S3, "", nil, minioMetaBucket, tierConfigPath, metadata, kms.Context{})
+	encBr, oek, err := newEncryptReader(context.Background(), hr, crypto.S3, "", nil, minioMetaBucket, tierConfigPath, metadata, kms.Context{})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -415,10 +415,5 @@ func (config *TierConfigMgr) Reset() {
 
 // Init initializes tier configuration reading from objAPI
 func (config *TierConfigMgr) Init(ctx context.Context, objAPI ObjectLayer) error {
-	// In gateway mode, we don't support ILM tier configuration.
-	if globalIsGateway {
-		return nil
-	}
-
 	return config.Reload(ctx, objAPI)
 }

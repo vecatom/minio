@@ -29,6 +29,7 @@ import (
 	"sync"
 
 	"github.com/minio/minio/internal/event"
+	"github.com/minio/minio/internal/logger"
 	xnet "github.com/minio/pkg/net"
 	"github.com/streadway/amqp"
 )
@@ -110,12 +111,16 @@ func (a *AMQPArgs) Validate() error {
 
 // AMQPTarget - AMQP target
 type AMQPTarget struct {
+	lazyInit lazyInit
+
 	id         event.TargetID
 	args       AMQPArgs
 	conn       *amqp.Connection
 	connMutex  sync.Mutex
 	store      Store
-	loggerOnce func(ctx context.Context, err error, id interface{}, errKind ...interface{})
+	loggerOnce logger.LogOnce
+
+	quitCh chan struct{}
 }
 
 // ID - returns TargetID.
@@ -125,6 +130,14 @@ func (target *AMQPTarget) ID() event.TargetID {
 
 // IsActive - Return true if target is up and active
 func (target *AMQPTarget) IsActive() (bool, error) {
+	if err := target.init(); err != nil {
+		return false, err
+	}
+
+	return target.isActive()
+}
+
+func (target *AMQPTarget) isActive() (bool, error) {
 	ch, _, err := target.channel()
 	if err != nil {
 		return false, err
@@ -133,11 +146,6 @@ func (target *AMQPTarget) IsActive() (bool, error) {
 		ch.Close()
 	}()
 	return true, nil
-}
-
-// HasQueueStore - Checks if the queueStore has been configured for the target
-func (target *AMQPTarget) HasQueueStore() bool {
-	return target.store != nil
 }
 
 func (target *AMQPTarget) channel() (*amqp.Channel, chan amqp.Confirmation, error) {
@@ -255,6 +263,10 @@ func (target *AMQPTarget) send(eventData event.Event, ch *amqp.Channel, confirms
 
 // Save - saves the events to the store which will be replayed when the amqp connection is active.
 func (target *AMQPTarget) Save(eventData event.Event) error {
+	if err := target.init(); err != nil {
+		return err
+	}
+
 	if target.store != nil {
 		return target.store.Put(eventData)
 	}
@@ -262,24 +274,22 @@ func (target *AMQPTarget) Save(eventData event.Event) error {
 	if err != nil {
 		return err
 	}
-	defer func() {
-		cErr := ch.Close()
-		target.loggerOnce(context.Background(), cErr, target.ID())
-	}()
+	defer ch.Close()
 
 	return target.send(eventData, ch, confirms)
 }
 
 // Send - sends event to AMQP.
 func (target *AMQPTarget) Send(eventKey string) error {
+	if err := target.init(); err != nil {
+		return err
+	}
+
 	ch, confirms, err := target.channel()
 	if err != nil {
 		return err
 	}
-	defer func() {
-		cErr := ch.Close()
-		target.loggerOnce(context.Background(), cErr, target.ID())
-	}()
+	defer ch.Close()
 
 	eventData, eErr := target.store.Get(eventKey)
 	if eErr != nil {
@@ -301,50 +311,51 @@ func (target *AMQPTarget) Send(eventKey string) error {
 
 // Close - does nothing and available for interface compatibility.
 func (target *AMQPTarget) Close() error {
+	close(target.quitCh)
 	if target.conn != nil {
 		return target.conn.Close()
 	}
 	return nil
 }
 
-// NewAMQPTarget - creates new AMQP target.
-func NewAMQPTarget(id string, args AMQPArgs, doneCh <-chan struct{}, loggerOnce func(ctx context.Context, err error, id interface{}, errKind ...interface{}), test bool) (*AMQPTarget, error) {
-	var conn *amqp.Connection
-	var err error
+func (target *AMQPTarget) init() error {
+	return target.lazyInit.Do(target.initAMQP)
+}
 
+func (target *AMQPTarget) initAMQP() error {
+	conn, err := amqp.Dial(target.args.URL.String())
+	if err != nil {
+		if IsConnRefusedErr(err) || IsConnResetErr(err) {
+			target.loggerOnce(context.Background(), err, target.ID().String())
+		}
+		return err
+	}
+	target.conn = conn
+
+	return nil
+}
+
+// NewAMQPTarget - creates new AMQP target.
+func NewAMQPTarget(id string, args AMQPArgs, loggerOnce logger.LogOnce) (*AMQPTarget, error) {
 	var store Store
+	if args.QueueDir != "" {
+		queueDir := filepath.Join(args.QueueDir, storePrefix+"-amqp-"+id)
+		store = NewQueueStore(queueDir, args.QueueLimit)
+		if err := store.Open(); err != nil {
+			return nil, fmt.Errorf("unable to initialize the queue store of AMQP `%s`: %w", id, err)
+		}
+	}
 
 	target := &AMQPTarget{
 		id:         event.TargetID{ID: id, Name: "amqp"},
 		args:       args,
 		loggerOnce: loggerOnce,
+		store:      store,
+		quitCh:     make(chan struct{}),
 	}
 
-	if args.QueueDir != "" {
-		queueDir := filepath.Join(args.QueueDir, storePrefix+"-amqp-"+id)
-		store = NewQueueStore(queueDir, args.QueueLimit)
-		if oErr := store.Open(); oErr != nil {
-			target.loggerOnce(context.Background(), oErr, target.ID())
-			return target, oErr
-		}
-		target.store = store
-	}
-
-	conn, err = amqp.Dial(args.URL.String())
-	if err != nil {
-		if store == nil || !(IsConnRefusedErr(err) || IsConnResetErr(err)) {
-			target.loggerOnce(context.Background(), err, target.ID())
-			return target, err
-		}
-	}
-	target.conn = conn
-
-	if target.store != nil && !test {
-		// Replays the events from the store.
-		eventKeyCh := replayEvents(target.store, doneCh, target.loggerOnce, target.ID())
-
-		// Start replaying events from the store.
-		go sendEvents(target, eventKeyCh, doneCh, target.loggerOnce)
+	if target.store != nil {
+		streamEventsFromStore(target.store, target, target.quitCh, target.loggerOnce)
 	}
 
 	return target, nil

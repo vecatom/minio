@@ -105,10 +105,8 @@ type BucketMetadata struct {
 
 // newBucketMetadata creates BucketMetadata with the supplied name and Created to Now.
 func newBucketMetadata(name string) BucketMetadata {
-	now := UTCNow()
 	return BucketMetadata{
-		Name:    name,
-		Created: now,
+		Name: name,
 		notificationConfig: &event.Config{
 			XMLNS: "http://s3.amazonaws.com/doc/2006-03-01/",
 		},
@@ -118,6 +116,17 @@ func newBucketMetadata(name string) BucketMetadata {
 		},
 		bucketTargetConfig:     &madmin.BucketTargets{},
 		bucketTargetConfigMeta: make(map[string]string),
+	}
+}
+
+// SetCreatedAt preserves the CreatedAt time for bucket across sites in site replication. It defaults to
+// creation time of bucket on this cluster in all other cases.
+func (b *BucketMetadata) SetCreatedAt(createdAt time.Time) {
+	if b.Created.IsZero() {
+		b.Created = UTCNow()
+	}
+	if !createdAt.IsZero() {
+		b.Created = createdAt.UTC()
 	}
 }
 
@@ -153,25 +162,45 @@ func (b *BucketMetadata) Load(ctx context.Context, api ObjectLayer, name string)
 	return err
 }
 
-// loadBucketMetadata loads and migrates to bucket metadata.
-func loadBucketMetadata(ctx context.Context, objectAPI ObjectLayer, bucket string) (BucketMetadata, error) {
+func loadBucketMetadataParse(ctx context.Context, objectAPI ObjectLayer, bucket string, parse bool) (BucketMetadata, error) {
 	b := newBucketMetadata(bucket)
 	err := b.Load(ctx, objectAPI, b.Name)
 	if err != nil && !errors.Is(err, errConfigNotFound) {
 		return b, err
 	}
+	if err == nil {
+		b.defaultTimestamps()
+	}
 
-	// Old bucket without bucket metadata. Hence we migrate existing settings.
-	if err := b.convertLegacyConfigs(ctx, objectAPI); err != nil {
+	configs, err := b.getAllLegacyConfigs(ctx, objectAPI)
+	if err != nil {
+		return b, err
+	}
+
+	if len(configs) == 0 {
+		if parse {
+			// nothing to update, parse and proceed.
+			err = b.parseAllConfigs(ctx, objectAPI)
+		}
+	} else {
+		// Old bucket without bucket metadata. Hence we migrate existing settings.
+		err = b.convertLegacyConfigs(ctx, objectAPI, configs)
+	}
+	if err != nil {
 		return b, err
 	}
 
 	// migrate unencrypted remote targets
-	if err = b.migrateTargetConfig(ctx, objectAPI); err != nil {
+	if err := b.migrateTargetConfig(ctx, objectAPI); err != nil {
 		return b, err
 	}
-	b.defaultTimestamps()
+
 	return b, nil
+}
+
+// loadBucketMetadata loads and migrates to bucket metadata.
+func loadBucketMetadata(ctx context.Context, objectAPI ObjectLayer, bucket string) (BucketMetadata, error) {
+	return loadBucketMetadataParse(ctx, objectAPI, bucket, true)
 }
 
 // parseAllConfigs will parse all configs and populate the private fields.
@@ -266,7 +295,7 @@ func (b *BucketMetadata) parseAllConfigs(ctx context.Context, objectAPI ObjectLa
 	return nil
 }
 
-func (b *BucketMetadata) convertLegacyConfigs(ctx context.Context, objectAPI ObjectLayer) error {
+func (b *BucketMetadata) getAllLegacyConfigs(ctx context.Context, objectAPI ObjectLayer) (map[string][]byte, error) {
 	legacyConfigs := []string{
 		legacyBucketObjectLockEnabledConfigFile,
 		bucketPolicyConfig,
@@ -280,7 +309,7 @@ func (b *BucketMetadata) convertLegacyConfigs(ctx context.Context, objectAPI Obj
 		objectLockConfig,
 	}
 
-	configs := make(map[string][]byte)
+	configs := make(map[string][]byte, len(legacyConfigs))
 
 	// Handle migration from lockEnabled to newer format.
 	if b.LockEnabled {
@@ -305,16 +334,15 @@ func (b *BucketMetadata) convertLegacyConfigs(ctx context.Context, objectAPI Obj
 				continue
 			}
 
-			return err
+			return nil, err
 		}
 		configs[legacyFile] = configData
 	}
 
-	if len(configs) == 0 {
-		// nothing to update, return right away.
-		return b.parseAllConfigs(ctx, objectAPI)
-	}
+	return configs, nil
+}
 
+func (b *BucketMetadata) convertLegacyConfigs(ctx context.Context, objectAPI ObjectLayer, configs map[string][]byte) error {
 	for legacyFile, configData := range configs {
 		switch legacyFile {
 		case legacyBucketObjectLockEnabledConfigFile:
@@ -345,6 +373,7 @@ func (b *BucketMetadata) convertLegacyConfigs(ctx context.Context, objectAPI Obj
 			b.BucketTargetsConfigJSON = configData
 		}
 	}
+	b.defaultTimestamps()
 
 	if err := b.Save(ctx, objectAPI); err != nil {
 		return err
@@ -413,23 +442,6 @@ func (b *BucketMetadata) Save(ctx context.Context, api ObjectLayer) error {
 	return saveConfig(ctx, api, configFile, data)
 }
 
-// deleteBucketMetadata deletes bucket metadata
-// If config does not exist no error is returned.
-func deleteBucketMetadata(ctx context.Context, obj objectDeleter, bucket string) error {
-	metadataFiles := []string{
-		dataUsageCacheName,
-		bucketMetadataFile,
-		path.Join(replicationDir, resyncFileName),
-	}
-	for _, metaFile := range metadataFiles {
-		configFile := path.Join(bucketMetaPrefix, bucket, metaFile)
-		if err := deleteConfig(ctx, obj, configFile); err != nil && err != errConfigNotFound {
-			return err
-		}
-	}
-	return nil
-}
-
 // migrate config for remote targets by encrypting data if currently unencrypted and kms is configured.
 func (b *BucketMetadata) migrateTargetConfig(ctx context.Context, objectAPI ObjectLayer) error {
 	var err error
@@ -438,7 +450,7 @@ func (b *BucketMetadata) migrateTargetConfig(ctx context.Context, objectAPI Obje
 		return nil
 	}
 
-	encBytes, metaBytes, err := encryptBucketMetadata(b.Name, b.BucketTargetsConfigJSON, kms.Context{b.Name: b.Name, bucketTargetsFile: bucketTargetsFile})
+	encBytes, metaBytes, err := encryptBucketMetadata(ctx, b.Name, b.BucketTargetsConfigJSON, kms.Context{b.Name: b.Name, bucketTargetsFile: bucketTargetsFile})
 	if err != nil {
 		return err
 	}
@@ -449,14 +461,14 @@ func (b *BucketMetadata) migrateTargetConfig(ctx context.Context, objectAPI Obje
 }
 
 // encrypt bucket metadata if kms is configured.
-func encryptBucketMetadata(bucket string, input []byte, kmsContext kms.Context) (output, metabytes []byte, err error) {
+func encryptBucketMetadata(ctx context.Context, bucket string, input []byte, kmsContext kms.Context) (output, metabytes []byte, err error) {
 	if GlobalKMS == nil {
 		output = input
 		return
 	}
 
 	metadata := make(map[string]string)
-	key, err := GlobalKMS.GenerateKey("", kmsContext)
+	key, err := GlobalKMS.GenerateKey(ctx, "", kmsContext)
 	if err != nil {
 		return
 	}

@@ -26,7 +26,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
@@ -47,18 +46,22 @@ import (
 	"github.com/felixge/fgprof"
 	"github.com/gorilla/mux"
 	"github.com/minio/madmin-go"
+	"github.com/minio/minio-go/v7"
 	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
 	"github.com/minio/minio/internal/config"
 	"github.com/minio/minio/internal/config/api"
 	xtls "github.com/minio/minio/internal/config/identity/tls"
+	"github.com/minio/minio/internal/deadlineconn"
 	"github.com/minio/minio/internal/fips"
 	"github.com/minio/minio/internal/handlers"
+	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
+	ioutilx "github.com/minio/minio/internal/ioutil"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/logger/message/audit"
-	"github.com/minio/minio/internal/rest"
 	"github.com/minio/pkg/certs"
 	"github.com/minio/pkg/env"
+	xnet "github.com/minio/pkg/net"
 	"golang.org/x/oauth2"
 )
 
@@ -86,6 +89,79 @@ func IsErr(err error, errs ...error) bool {
 		}
 	}
 	return false
+}
+
+// ErrorRespToObjectError converts MinIO errors to minio object layer errors.
+func ErrorRespToObjectError(err error, params ...string) error {
+	if err == nil {
+		return nil
+	}
+
+	bucket := ""
+	object := ""
+	if len(params) >= 1 {
+		bucket = params[0]
+	}
+	if len(params) == 2 {
+		object = params[1]
+	}
+
+	if xnet.IsNetworkOrHostDown(err, false) {
+		return BackendDown{Err: err.Error()}
+	}
+
+	minioErr, ok := err.(minio.ErrorResponse)
+	if !ok {
+		// We don't interpret non MinIO errors. As minio errors will
+		// have StatusCode to help to convert to object errors.
+		return err
+	}
+
+	switch minioErr.Code {
+	case "PreconditionFailed":
+		err = PreConditionFailed{}
+	case "InvalidRange":
+		err = InvalidRange{}
+	case "BucketAlreadyOwnedByYou":
+		err = BucketAlreadyOwnedByYou{}
+	case "BucketNotEmpty":
+		err = BucketNotEmpty{}
+	case "NoSuchBucketPolicy":
+		err = BucketPolicyNotFound{}
+	case "NoSuchLifecycleConfiguration":
+		err = BucketLifecycleNotFound{}
+	case "InvalidBucketName":
+		err = BucketNameInvalid{Bucket: bucket}
+	case "InvalidPart":
+		err = InvalidPart{}
+	case "NoSuchBucket":
+		err = BucketNotFound{Bucket: bucket}
+	case "NoSuchKey":
+		if object != "" {
+			err = ObjectNotFound{Bucket: bucket, Object: object}
+		} else {
+			err = BucketNotFound{Bucket: bucket}
+		}
+	case "XMinioInvalidObjectName":
+		err = ObjectNameInvalid{}
+	case "AccessDenied":
+		err = PrefixAccessDenied{
+			Bucket: bucket,
+			Object: object,
+		}
+	case "XAmzContentSHA256Mismatch":
+		err = hash.SHA256Mismatch{}
+	case "NoSuchUpload":
+		err = InvalidUploadID{}
+	case "EntityTooSmall":
+		err = PartTooSmall{}
+	}
+
+	switch minioErr.StatusCode {
+	case http.StatusMethodNotAllowed:
+		err = toObjectErr(errMethodNotAllowed, bucket, object)
+	}
+	return err
 }
 
 // returns 'true' if either string has space in the
@@ -120,18 +196,6 @@ func path2BucketObjectWithBasePath(basePath, path string) (bucket, prefix string
 func path2BucketObject(s string) (bucket, prefix string) {
 	return path2BucketObjectWithBasePath("", s)
 }
-
-func getWriteQuorum(drive int) int {
-	parity := getDefaultParityBlocks(drive)
-	quorum := drive - parity
-	if quorum == parity {
-		quorum++
-	}
-	return quorum
-}
-
-// CloneMSS is an exposed function of cloneMSS for gateway usage.
-var CloneMSS = cloneMSS
 
 // cloneMSS will clone a map[string]string.
 // If input is nil an empty map is returned, not nil.
@@ -192,9 +256,6 @@ const (
 	// Maximum Part ID for multipart upload is 10000
 	// (Acceptable values range from 1 to 10000 inclusive)
 	globalMaxPartID = 10000
-
-	// Default values used while communicating for gateway communication
-	defaultDialTimeout = 5 * time.Second
 )
 
 // isMaxObjectSize - verify if max object size
@@ -309,12 +370,12 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 	// library creates to store profiling data.
 	switch madmin.ProfilerType(profilerType) {
 	case madmin.ProfilerCPU:
-		dirPath, err := ioutil.TempDir("", "profile")
+		dirPath, err := os.MkdirTemp("", "profile")
 		if err != nil {
 			return nil, err
 		}
 		fn := filepath.Join(dirPath, "cpu.out")
-		f, err := os.Create(fn)
+		f, err := Create(fn)
 		if err != nil {
 			return nil, err
 		}
@@ -328,8 +389,8 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			if err != nil {
 				return nil, err
 			}
-			defer os.RemoveAll(dirPath)
-			return ioutil.ReadFile(fn)
+			defer RemoveAll(dirPath)
+			return ioutilx.ReadFile(fn)
 		}
 	case madmin.ProfilerCPUIO:
 		// at 10k or more goroutines fgprof is likely to become
@@ -339,12 +400,12 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 		if n := runtime.NumGoroutine(); n > 10000 && !globalIsCICD {
 			return nil, fmt.Errorf("unable to perform CPU IO profile with %d goroutines", n)
 		}
-		dirPath, err := ioutil.TempDir("", "profile")
+		dirPath, err := os.MkdirTemp("", "profile")
 		if err != nil {
 			return nil, err
 		}
 		fn := filepath.Join(dirPath, "cpuio.out")
-		f, err := os.Create(fn)
+		f, err := Create(fn)
 		if err != nil {
 			return nil, err
 		}
@@ -358,8 +419,8 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			if err != nil {
 				return nil, err
 			}
-			defer os.RemoveAll(dirPath)
-			return ioutil.ReadFile(fn)
+			defer RemoveAll(dirPath)
+			return ioutilx.ReadFile(fn)
 		}
 	case madmin.ProfilerMEM:
 		runtime.GC()
@@ -404,12 +465,12 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			return buf.Bytes(), err
 		}
 	case madmin.ProfilerTrace:
-		dirPath, err := ioutil.TempDir("", "profile")
+		dirPath, err := os.MkdirTemp("", "profile")
 		if err != nil {
 			return nil, err
 		}
 		fn := filepath.Join(dirPath, "trace.out")
-		f, err := os.Create(fn)
+		f, err := Create(fn)
 		if err != nil {
 			return nil, err
 		}
@@ -424,8 +485,8 @@ func startProfiler(profilerType string) (minioProfiler, error) {
 			if err != nil {
 				return nil, err
 			}
-			defer os.RemoveAll(dirPath)
-			return ioutil.ReadFile(fn)
+			defer RemoveAll(dirPath)
+			return ioutilx.ReadFile(fn)
 		}
 	default:
 		return nil, errors.New("profiler type unknown")
@@ -625,10 +686,10 @@ func newCustomHTTPTransport(tlsConfig *tls.Config, dialTimeout time.Duration) fu
 	}
 }
 
-// NewGatewayHTTPTransportWithClientCerts returns a new http configuration
+// NewHTTPTransportWithClientCerts returns a new http configuration
 // used while communicating with the cloud backends.
-func NewGatewayHTTPTransportWithClientCerts(clientCert, clientKey string) *http.Transport {
-	transport := newGatewayHTTPTransport(1 * time.Minute)
+func NewHTTPTransportWithClientCerts(clientCert, clientKey string) *http.Transport {
+	transport := newHTTPTransport(1 * time.Minute)
 	if clientCert != "" && clientKey != "" {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
@@ -646,21 +707,47 @@ func NewGatewayHTTPTransportWithClientCerts(clientCert, clientKey string) *http.
 	return transport
 }
 
-// NewGatewayHTTPTransport returns a new http configuration
+// NewHTTPTransport returns a new http configuration
 // used while communicating with the cloud backends.
-func NewGatewayHTTPTransport() *http.Transport {
-	return newGatewayHTTPTransport(1 * time.Minute)
+func NewHTTPTransport() *http.Transport {
+	return newHTTPTransport(1 * time.Minute)
 }
 
-func newGatewayHTTPTransport(timeout time.Duration) *http.Transport {
+// Default values for dial timeout
+const defaultDialTimeout = 5 * time.Second
+
+func newHTTPTransport(timeout time.Duration) *http.Transport {
 	tr := newCustomHTTPTransport(&tls.Config{
 		RootCAs:            globalRootCAs,
 		ClientSessionCache: tls.NewLRUClientSessionCache(tlsClientSessionCacheSize),
 	}, defaultDialTimeout)()
 
-	// Customize response header timeout for gateway transport.
+	// Customize response header timeout
 	tr.ResponseHeaderTimeout = timeout
 	return tr
+}
+
+type dialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+
+// newCustomDialContext setups a custom dialer for any external communication and proxies.
+func newCustomDialContext() dialContext {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialer := &net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}
+
+		conn, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+
+		dconn := deadlineconn.New(conn).
+			WithReadDeadline(globalConnReadDeadline).
+			WithWriteDeadline(globalConnWriteDeadline)
+
+		return dconn, nil
+	}
 }
 
 // NewRemoteTargetHTTPTransport returns a new http configuration
@@ -669,11 +756,8 @@ func NewRemoteTargetHTTPTransport() func() *http.Transport {
 	// For more details about various values used here refer
 	// https://golang.org/pkg/net/http/#Transport documentation
 	tr := &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   15 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           newCustomDialContext(),
 		MaxIdleConnsPerHost:   1024,
 		WriteBufferSize:       32 << 10, // 32KiB moving up from 4KiB default
 		ReadBufferSize:        32 << 10, // 32KiB moving up from 4KiB default
@@ -745,6 +829,20 @@ func ceilFrac(numerator, denominator int64) (ceil int64) {
 	return
 }
 
+// cleanMinioInternalMetadataKeys removes X-Amz-Meta- prefix from minio internal
+// encryption metadata.
+func cleanMinioInternalMetadataKeys(metadata map[string]string) map[string]string {
+	newMeta := make(map[string]string, len(metadata))
+	for k, v := range metadata {
+		if strings.HasPrefix(k, "X-Amz-Meta-X-Minio-Internal-") {
+			newMeta[strings.TrimPrefix(k, "X-Amz-Meta-")] = v
+		} else {
+			newMeta[k] = v
+		}
+	}
+	return newMeta
+}
+
 // pathClean is like path.Clean but does not return "." for
 // empty inputs, instead returns "empty" as is.
 func pathClean(p string) string {
@@ -801,6 +899,8 @@ func likelyUnescapeGeneric(p string, escapeFn func(string) (string, error)) stri
 func updateReqContext(ctx context.Context, objects ...ObjectV) context.Context {
 	req := logger.GetReqInfo(ctx)
 	if req != nil {
+		req.Lock()
+		defer req.Unlock()
 		req.Objects = make([]logger.ObjectVersion, 0, len(objects))
 		for _, ov := range objects {
 			req.Objects = append(req.Objects, logger.ObjectVersion{
@@ -818,10 +918,6 @@ func newContext(r *http.Request, w http.ResponseWriter, api string) context.Cont
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
 	object := likelyUnescapeGeneric(vars["object"], url.PathUnescape)
-	prefix := likelyUnescapeGeneric(vars["prefix"], url.QueryUnescape)
-	if prefix != "" {
-		object = prefix
-	}
 	reqInfo := &logger.ReqInfo{
 		DeploymentID: globalDeploymentID,
 		RequestID:    w.Header().Get(xhttp.AmzRequestID),
@@ -905,8 +1001,6 @@ func getMinioMode() string {
 		mode = globalMinioModeDistErasure
 	} else if globalIsErasure {
 		mode = globalMinioModeErasure
-	} else if globalIsGateway {
-		mode = globalMinioModeGatewayPrefix + globalGatewayName
 	} else if globalIsErasureSD {
 		mode = globalMinioModeErasureSD
 	}
@@ -937,6 +1031,10 @@ type timedValue struct {
 	// Should be set before calling Get().
 	TTL time.Duration
 
+	// When set to true, return the last cached value
+	// even if updating the value errors out
+	Relax bool
+
 	// Once can be used to initialize values for lazy initialization.
 	// Should be set before calling Get().
 	Once sync.Once
@@ -950,13 +1048,23 @@ type timedValue struct {
 // Get will return a cached value or fetch a new one.
 // If the Update function returns an error the value is forwarded as is and not cached.
 func (t *timedValue) Get() (interface{}, error) {
-	v := t.get()
+	v := t.get(t.ttl())
 	if v != nil {
 		return v, nil
 	}
 
 	v, err := t.Update()
 	if err != nil {
+		if t.Relax {
+			// if update fails, return current
+			// cached value along with error.
+			//
+			// Let the caller decide if they want
+			// to use the returned value based
+			// on error.
+			v = t.get(0)
+			return v, err
+		}
 		return v, err
 	}
 
@@ -964,14 +1072,21 @@ func (t *timedValue) Get() (interface{}, error) {
 	return v, nil
 }
 
-func (t *timedValue) get() (v interface{}) {
+func (t *timedValue) ttl() time.Duration {
 	ttl := t.TTL
 	if ttl <= 0 {
 		ttl = time.Second
 	}
+	return ttl
+}
+
+func (t *timedValue) get(ttl time.Duration) (v interface{}) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	v = t.value
+	if ttl <= 0 {
+		return v
+	}
 	if time.Since(t.lastUpdate) < ttl {
 		return v
 	}
@@ -1002,13 +1117,6 @@ func decodeDirObject(object string) string {
 	return object
 }
 
-// This is used by metrics to show the number of failed RPC calls
-// between internodes
-func loadAndResetRPCNetworkErrsCounter() uint64 {
-	defer rest.ResetNetworkErrsCounter()
-	return rest.GetNetworkErrsCounter()
-}
-
 // Helper method to return total number of nodes in cluster
 func totalNodeCount() uint64 {
 	peers, _ := globalEndpoints.peers()
@@ -1021,30 +1129,41 @@ func totalNodeCount() uint64 {
 
 // AuditLogOptions takes options for audit logging subsystem activity
 type AuditLogOptions struct {
-	Trigger   string
+	Event     string
 	APIName   string
 	Status    string
+	Bucket    string
+	Object    string
 	VersionID string
 	Error     string
+	Tags      map[string]interface{}
 }
 
 // sends audit logs for internal subsystem activity
-func auditLogInternal(ctx context.Context, bucket, object string, opts AuditLogOptions) {
+func auditLogInternal(ctx context.Context, opts AuditLogOptions) {
+	if len(logger.AuditTargets()) == 0 {
+		return
+	}
 	entry := audit.NewEntry(globalDeploymentID)
-	entry.Trigger = opts.Trigger
+	entry.Trigger = opts.Event
+	entry.Event = opts.Event
 	entry.Error = opts.Error
 	entry.API.Name = opts.APIName
-	entry.API.Bucket = bucket
-	entry.API.Object = object
-	if opts.VersionID != "" {
-		entry.ReqQuery = make(map[string]string)
-		entry.ReqQuery[xhttp.VersionID] = opts.VersionID
-	}
+	entry.API.Bucket = opts.Bucket
+	entry.API.Objects = []audit.ObjectVersion{{ObjectName: opts.Object, VersionID: opts.VersionID}}
 	entry.API.Status = opts.Status
+	entry.Tags = opts.Tags
 	// Merge tag information if found - this is currently needed for tags
 	// set during decommissioning.
 	if reqInfo := logger.GetReqInfo(ctx); reqInfo != nil {
-		entry.Tags = reqInfo.GetTagsMap()
+		if tags := reqInfo.GetTagsMap(); len(tags) > 0 {
+			if entry.Tags == nil {
+				entry.Tags = make(map[string]interface{}, len(tags))
+			}
+			for k, v := range tags {
+				entry.Tags[k] = v
+			}
+		}
 	}
 	ctx = logger.SetAuditEntry(ctx, &entry)
 	logger.AuditLog(ctx, nil, nil, nil)
@@ -1168,7 +1287,7 @@ func MockOpenIDTestUserInteraction(ctx context.Context, pro OpenIDClientAppParam
 		return "", fmt.Errorf("request err: %v", err)
 	}
 	// {
-	// 	bodyBuf, err := ioutil.ReadAll(resp.Body)
+	// 	bodyBuf, err := io.ReadAll(resp.Body)
 	// 	if err != nil {
 	// 		return "", fmt.Errorf("Error reading body: %v", err)
 	// 	}
@@ -1190,7 +1309,7 @@ func MockOpenIDTestUserInteraction(ctx context.Context, pro OpenIDClientAppParam
 		return "", fmt.Errorf("post form err: %v", err)
 	}
 	// fmt.Printf("resp: %#v %#v\n", resp.StatusCode, resp.Header)
-	// bodyBuf, err := ioutil.ReadAll(resp.Body)
+	// bodyBuf, err := io.ReadAll(resp.Body)
 	// if err != nil {
 	// 	return "", fmt.Errorf("Error reading body: %v", err)
 	// }

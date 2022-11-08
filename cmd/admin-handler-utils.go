@@ -30,6 +30,10 @@ import (
 	iampolicy "github.com/minio/pkg/iam/policy"
 )
 
+// validateAdminReq will validate request against and return whether it is allowed.
+// If any of the supplied actions are allowed it will be successful.
+// If nil ObjectLayer is returned, the operation is not permitted.
+// When nil ObjectLayer has been returned an error has always been sent to w.
 func validateAdminReq(ctx context.Context, w http.ResponseWriter, r *http.Request, actions ...iampolicy.AdminAction) (ObjectLayer, auth.Credentials) {
 	// Get current object layer instance.
 	objectAPI := newObjectLayerFn()
@@ -41,11 +45,16 @@ func validateAdminReq(ctx context.Context, w http.ResponseWriter, r *http.Reques
 	for _, action := range actions {
 		// Validate request signature.
 		cred, adminAPIErr := checkAdminRequestAuth(ctx, r, action, "")
-		if adminAPIErr != ErrNone {
+		switch adminAPIErr {
+		case ErrNone:
+			return objectAPI, cred
+		case ErrAccessDenied:
+			// Try another
+			continue
+		default:
 			writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(adminAPIErr), r.URL)
 			return nil, cred
 		}
-		return objectAPI, cred
 	}
 	writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
 	return nil, auth.Credentials{}
@@ -112,6 +121,18 @@ func toAdminAPIErr(ctx context.Context, err error) APIError {
 		case errors.Is(err, errDecommissionComplete):
 			apiErr = APIError{
 				Code:           "XMinioDecommissionNotAllowed",
+				Description:    err.Error(),
+				HTTPStatusCode: http.StatusBadRequest,
+			}
+		case errors.Is(err, errDecommissionRebalanceAlreadyRunning):
+			apiErr = APIError{
+				Code:           "XMinioDecommissionNotAllowed",
+				Description:    err.Error(),
+				HTTPStatusCode: http.StatusBadRequest,
+			}
+		case errors.Is(err, errRebalanceDecommissionAlreadyRunning):
+			apiErr = APIError{
+				Code:           "XMinioRebalanceNotAllowed",
 				Description:    err.Error(),
 				HTTPStatusCode: http.StatusBadRequest,
 			}
@@ -239,4 +260,12 @@ func importError(ctx context.Context, err error, fname, entity string) APIError 
 		return toAPIError(ctx, fmt.Errorf("error importing %s with: %w", fname, err))
 	}
 	return toAPIError(ctx, fmt.Errorf("error importing %s from %s with: %w", entity, fname, err))
+}
+
+// wraps import error for more context
+func importErrorWithAPIErr(ctx context.Context, apiErr APIErrorCode, err error, fname, entity string) APIError {
+	if entity == "" {
+		return errorCodes.ToAPIErrWithErr(apiErr, fmt.Errorf("error importing %s with: %w", fname, err))
+	}
+	return errorCodes.ToAPIErrWithErr(apiErr, fmt.Errorf("error importing %s from %s with: %w", entity, fname, err))
 }

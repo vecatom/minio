@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2022 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -21,14 +21,17 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/dustin/go-humanize"
 	"github.com/minio/madmin-go"
 	"github.com/minio/minio/internal/color"
 	"github.com/minio/minio/internal/config/storageclass"
+	"github.com/minio/minio/internal/jobtokens"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/console"
+	"github.com/minio/pkg/env"
 	"github.com/minio/pkg/wildcard"
 )
 
@@ -161,6 +164,8 @@ func mustGetHealSequence(ctx context.Context) *healSequence {
 	}
 }
 
+const envHealWorkers = "_MINIO_HEAL_WORKERS"
+
 // healErasureSet lists and heals all objects in a specific erasure set
 func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, tracker *healingTracker) error {
 	bgSeq := mustGetHealSequence(ctx)
@@ -181,6 +186,16 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 		}
 	}
 
+	// numHealers - number of concurrent heal jobs, defaults to 1
+	numHealers, err := strconv.Atoi(env.Get(envHealWorkers, "1"))
+	if err != nil {
+		logger.LogIf(ctx, fmt.Errorf("invalid %s value %v, defaulting to 1", envHealWorkers, err))
+	}
+	if numHealers < 1 {
+		numHealers = 1
+	}
+	// jt will never be nil since we ensure that numHealers > 0
+	jt, _ := jobtokens.New(numHealers)
 	var retErr error
 	// Heal all buckets with all objects
 	for _, bucket := range healBuckets {
@@ -209,7 +224,7 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 		}
 
 		if serverDebugLog {
-			console.Debugf(color.Green("healDisk:")+" healing bucket %s content on %s erasure set\n",
+			console.Debugf(color.Green("healDrive:")+" healing bucket %s content on %s erasure set\n",
 				bucket, humanize.Ordinal(tracker.SetIndex+1))
 		}
 
@@ -228,7 +243,56 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 			disks = disks[:3]
 		}
 
+		type healEntryResult struct {
+			bytes     uint64
+			success   bool
+			entryDone bool
+			name      string
+		}
+		healEntryDone := func(name string) healEntryResult {
+			return healEntryResult{
+				entryDone: true,
+				name:      name,
+			}
+		}
+		healEntrySuccess := func(sz uint64) healEntryResult {
+			return healEntryResult{
+				bytes:   sz,
+				success: true,
+			}
+		}
+		healEntryFailure := func(sz uint64) healEntryResult {
+			return healEntryResult{
+				bytes: sz,
+			}
+		}
+
+		// Collect updates to tracker from concurrent healEntry calls
+		results := make(chan healEntryResult)
+		go func() {
+			for res := range results {
+				if res.entryDone {
+					tracker.Object = res.name
+					if time.Since(tracker.LastUpdate) > time.Minute {
+						logger.LogIf(ctx, tracker.update(ctx))
+					}
+					continue
+				}
+
+				if res.success {
+					tracker.ItemsHealed++
+					tracker.BytesDone += res.bytes
+				} else {
+					tracker.ItemsFailed++
+					tracker.BytesFailed += res.bytes
+				}
+			}
+		}()
+
+		// Note: updates from healEntry to tracker must be sent on results channel.
 		healEntry := func(entry metaCacheEntry) {
+			defer jt.Give()
+
 			if entry.name == "" && len(entry.metadata) == 0 {
 				// ignore entries that don't have metadata.
 				return
@@ -252,6 +316,7 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 				}
 			}
 
+			var result healEntryResult
 			fivs, err := entry.fileInfoVersions(bucket)
 			if err != nil {
 				err := bgSeq.queueHealTask(healSource{
@@ -260,38 +325,52 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 					versionID: "",
 				}, madmin.HealItemObject)
 				if err != nil {
-					tracker.ItemsFailed++
+					result = healEntryFailure(0)
 					logger.LogIf(ctx, fmt.Errorf("unable to heal object %s/%s: %w", bucket, entry.name, err))
 				} else {
-					tracker.ItemsHealed++
+					result = healEntrySuccess(0)
 				}
-				bgSeq.logHeal(madmin.HealItemObject)
+
+				select {
+				case <-ctx.Done():
+					return
+				case results <- result:
+				}
+
 				return
 			}
 
+			// erasureObjects layer needs object names to be encoded
+			encodedEntryName := encodeDirObject(entry.name)
+
 			for _, version := range fivs.Versions {
-				if _, err := er.HealObject(ctx, bucket, version.Name,
+				if _, err := er.HealObject(ctx, bucket, encodedEntryName,
 					version.VersionID, madmin.HealOpts{
 						ScanMode: scanMode,
 						Remove:   healDeleteDangling,
 					}); err != nil {
 					// If not deleted, assume they failed.
-					tracker.ItemsFailed++
-					tracker.BytesFailed += uint64(version.Size)
+					result = healEntryFailure(uint64(version.Size))
 					if version.VersionID != "" {
 						logger.LogIf(ctx, fmt.Errorf("unable to heal object %s/%s-v(%s): %w", bucket, version.Name, version.VersionID, err))
 					} else {
 						logger.LogIf(ctx, fmt.Errorf("unable to heal object %s/%s: %w", bucket, version.Name, err))
 					}
 				} else {
-					tracker.ItemsHealed++
-					tracker.BytesDone += uint64(version.Size)
+					result = healEntrySuccess(uint64(version.Size))
 				}
 				bgSeq.logHeal(madmin.HealItemObject)
+
+				select {
+				case <-ctx.Done():
+					return
+				case results <- result:
+				}
 			}
-			tracker.Object = entry.name
-			if time.Since(tracker.LastUpdate) > time.Minute {
-				logger.LogIf(ctx, tracker.update(ctx))
+			select {
+			case <-ctx.Done():
+				return
+			case results <- healEntryDone(entry.name):
 			}
 
 			// Wait and proceed if there are active requests
@@ -305,25 +384,31 @@ func (er *erasureObjects) healErasureSet(ctx context.Context, buckets []string, 
 			bucket:    bucket,
 		}
 
-		err := listPathRaw(ctx, listPathRawOptions{
+		err = listPathRaw(ctx, listPathRawOptions{
 			disks:          disks,
 			bucket:         bucket,
 			recursive:      true,
 			forwardTo:      forwardTo,
 			minDisks:       1,
 			reportNotFound: false,
-			agreed:         healEntry,
-			partial: func(entries metaCacheEntries, nAgreed int, errs []error) {
+			agreed: func(entry metaCacheEntry) {
+				jt.Take()
+				go healEntry(entry)
+			},
+			partial: func(entries metaCacheEntries, _ []error) {
 				entry, ok := entries.resolve(&resolver)
 				if !ok {
 					// check if we can get one entry atleast
 					// proceed to heal nonetheless.
 					entry, _ = entries.firstFound()
 				}
-				healEntry(*entry)
+				jt.Take()
+				go healEntry(*entry)
 			},
 			finished: nil,
 		})
+		jt.Wait() // synchronize all the concurrent heal jobs
+		close(results)
 		if err != nil {
 			// Set this such that when we return this function
 			// we let the caller retry this disk again for the

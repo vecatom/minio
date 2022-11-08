@@ -97,7 +97,8 @@ func bgFormatErasureCleanupTmp(diskPath string) {
 			err))
 	}
 
-	go removeAll(tmpOld)
+	// Remove the entire folder in case there are leftovers that didn't get cleaned up before restart.
+	go removeAll(pathJoin(diskPath, minioMetaTmpBucket+"-old"))
 	// Renames and schedules for purging all bucket metacache.
 	go renameAllBucketMetacache(diskPath)
 }
@@ -146,7 +147,7 @@ func isServerResolvable(endpoint Endpoint, timeout time.Duration) error {
 // time. additionally make sure to close all the disks used in this attempt.
 func connectLoadInitFormats(verboseLogging bool, firstDisk bool, endpoints Endpoints, poolCount, setCount, setDriveCount int, deploymentID, distributionAlgo string) (storageDisks []StorageAPI, format *formatErasureV3, err error) {
 	// Initialize all storage disks
-	storageDisks, errs := initStorageDisksWithErrors(endpoints)
+	storageDisks, errs := initStorageDisksWithErrors(endpoints, true)
 
 	defer func(storageDisks []StorageAPI) {
 		if err != nil {
@@ -157,9 +158,17 @@ func connectLoadInitFormats(verboseLogging bool, firstDisk bool, endpoints Endpo
 	for i, err := range errs {
 		if err != nil && !errors.Is(err, errXLBackend) {
 			if errors.Is(err, errDiskNotFound) && verboseLogging {
-				logger.Error("Unable to connect to %s: %v", endpoints[i], isServerResolvable(endpoints[i], time.Second))
+				if globalEndpoints.NEndpoints() > 1 {
+					logger.Error("Unable to connect to %s: %v", endpoints[i], isServerResolvable(endpoints[i], time.Second))
+				} else {
+					logger.Fatal(err, "Unable to connect to %s: %v", endpoints[i], isServerResolvable(endpoints[i], time.Second))
+				}
 			} else {
-				logger.Error("Unable to use the drive %s: %v", endpoints[i], err)
+				if globalEndpoints.NEndpoints() > 1 {
+					logger.Error("Unable to use the drive %s: %v", endpoints[i], err)
+				} else {
+					logger.Fatal(errInvalidArgument, "Unable to use the drive %s: %v", endpoints[i], err)
+				}
 			}
 		}
 	}
@@ -305,20 +314,20 @@ func waitForFormatErasure(firstDisk bool, endpoints Endpoints, poolCount, setCou
 				switch err {
 				case errNotFirstDisk:
 					// Fresh setup, wait for first server to be up.
-					logger.Info("Waiting for the first server to format the disks (elapsed %s)\n", getElapsedTime())
+					logger.Info("Waiting for the first server to format the drives (elapsed %s)\n", getElapsedTime())
 					continue
 				case errFirstDiskWait:
 					// Fresh setup, wait for other servers to come up.
-					logger.Info("Waiting for all other servers to be online to format the disks (elapses %s)\n", getElapsedTime())
+					logger.Info("Waiting for all other servers to be online to format the drives (elapses %s)\n", getElapsedTime())
 					continue
 				case errErasureReadQuorum:
 					// no quorum available continue to wait for minimum number of servers.
-					logger.Info("Waiting for a minimum of %d disks to come online (elapsed %s)\n",
+					logger.Info("Waiting for a minimum of %d drives to come online (elapsed %s)\n",
 						len(endpoints)/2, getElapsedTime())
 					continue
 				case errErasureWriteQuorum:
 					// no quorum available continue to wait for minimum number of servers.
-					logger.Info("Waiting for a minimum of %d disks to come online (elapsed %s)\n",
+					logger.Info("Waiting for a minimum of %d drives to come online (elapsed %s)\n",
 						(len(endpoints)/2)+1, getElapsedTime())
 					continue
 				case errErasureV3ThisEmpty:

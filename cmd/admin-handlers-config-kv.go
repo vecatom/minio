@@ -81,12 +81,19 @@ func (a adminAPIHandlers) DelConfigKVHandler(w http.ResponseWriter, r *http.Requ
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
+
 	if err = validateConfig(cfg, subSys); err != nil {
 		writeCustomErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrAdminConfigBadJSON), err.Error(), r.URL)
 		return
 	}
 
 	if err = saveServerConfig(ctx, objectAPI, cfg); err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+
+	// freshly retrieve the config so that default values are loaded for reset config
+	if cfg, err = getValidConfig(objectAPI); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
@@ -173,10 +180,16 @@ func (a adminAPIHandlers) SetConfigKVHandler(w http.ResponseWriter, r *http.Requ
 	if dynamic {
 		applyDynamic(ctx, objectAPI, cfg, subSys, r, w)
 	}
+
 	writeSuccessResponseHeadersOnly(w)
 }
 
 // GetConfigKVHandler - GET /minio/admin/v3/get-config-kv?key={key}
+//
+// `key` can be one of three forms:
+// 1. `subsys:target` -> request for config of a single subsystem and target pair.
+// 2. `subsys:` -> request for config of a single subsystem and the default target.
+// 3. `subsys` -> request for config of all targets for the given subsystem.
 func (a adminAPIHandlers) GetConfigKVHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "GetConfigKV")
 
@@ -189,15 +202,34 @@ func (a adminAPIHandlers) GetConfigKVHandler(w http.ResponseWriter, r *http.Requ
 
 	cfg := globalServerConfig.Clone()
 	vars := mux.Vars(r)
-	buf := &bytes.Buffer{}
-	cw := config.NewConfigWriteTo(cfg, vars["key"])
-	if _, err := cw.WriteTo(buf); err != nil {
+	key := vars["key"]
+
+	var subSys, target string
+	{
+		ws := strings.SplitN(key, madmin.SubSystemSeparator, 2)
+		subSys = ws[0]
+		if len(ws) == 2 {
+			if ws[1] == "" {
+				target = madmin.Default
+			} else {
+				target = ws[1]
+			}
+		}
+	}
+
+	subSysConfigs, err := cfg.GetSubsysInfo(subSys, target)
+	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
 
+	var s strings.Builder
+	for _, subSysConfig := range subSysConfigs {
+		subSysConfig.WriteTo(&s, false)
+	}
+
 	password := cred.SecretKey
-	econfigData, err := madmin.EncryptData(password, buf.Bytes())
+	econfigData, err := madmin.EncryptData(password, []byte(s.String()))
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
@@ -422,47 +454,31 @@ func (a adminAPIHandlers) GetConfigHandler(w http.ResponseWriter, r *http.Reques
 
 	var s strings.Builder
 	hkvs := config.HelpSubSysMap[""]
-	var count int
 	for _, hkv := range hkvs {
-		count += len(cfg[hkv.Key])
-	}
-	for _, hkv := range hkvs {
-		v := cfg[hkv.Key]
-		for target, kv := range v {
-			off := kv.Get(config.Enable) == config.EnableOff
+		// We ignore the error below, as we cannot get one.
+		cfgSubsysItems, _ := cfg.GetSubsysInfo(hkv.Key, "")
+
+		for _, item := range cfgSubsysItems {
+			off := item.Config.Get(config.Enable) == config.EnableOff
 			switch hkv.Key {
 			case config.EtcdSubSys:
-				off = !etcd.Enabled(kv)
+				off = !etcd.Enabled(item.Config)
 			case config.CacheSubSys:
-				off = !cache.Enabled(kv)
+				off = !cache.Enabled(item.Config)
 			case config.StorageClassSubSys:
-				off = !storageclass.Enabled(kv)
+				off = !storageclass.Enabled(item.Config)
 			case config.PolicyPluginSubSys:
-				off = !polplugin.Enabled(kv)
+				off = !polplugin.Enabled(item.Config)
 			case config.IdentityOpenIDSubSys:
-				off = !openid.Enabled(kv)
+				off = !openid.Enabled(item.Config)
 			case config.IdentityLDAPSubSys:
-				off = !xldap.Enabled(kv)
+				off = !xldap.Enabled(item.Config)
 			case config.IdentityTLSSubSys:
 				off = !globalSTSTLSConfig.Enabled
 			case config.IdentityPluginSubSys:
-				off = !idplugin.Enabled(kv)
+				off = !idplugin.Enabled(item.Config)
 			}
-			if off {
-				s.WriteString(config.KvComment)
-				s.WriteString(config.KvSpaceSeparator)
-			}
-			s.WriteString(hkv.Key)
-			if target != config.Default {
-				s.WriteString(config.SubSystemSeparator)
-				s.WriteString(target)
-			}
-			s.WriteString(config.KvSpaceSeparator)
-			s.WriteString(kv.String())
-			count--
-			if count > 0 {
-				s.WriteString(config.KvNewline)
-			}
+			item.WriteTo(&s, off)
 		}
 	}
 

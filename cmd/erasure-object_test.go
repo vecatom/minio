@@ -25,13 +25,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 
-	humanize "github.com/dustin/go-humanize"
+	"github.com/dustin/go-humanize"
 	"github.com/minio/minio/internal/config/storageclass"
 )
 
@@ -53,23 +53,23 @@ func TestRepeatPutObjectPart(t *testing.T) {
 	defer objLayer.Shutdown(context.Background())
 	defer removeRoots(disks)
 
-	err = objLayer.MakeBucketWithLocation(ctx, "bucket1", BucketOptions{})
+	err = objLayer.MakeBucketWithLocation(ctx, "bucket1", MakeBucketOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	uploadID, err := objLayer.NewMultipartUpload(ctx, "bucket1", "mpartObj1", opts)
+	res, err := objLayer.NewMultipartUpload(ctx, "bucket1", "mpartObj1", opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	fiveMBBytes := bytes.Repeat([]byte("a"), 5*humanize.MiByte)
 	md5Hex := getMD5Hash(fiveMBBytes)
-	_, err = objLayer.PutObjectPart(ctx, "bucket1", "mpartObj1", uploadID, 1, mustGetPutObjReader(t, bytes.NewReader(fiveMBBytes), 5*humanize.MiByte, md5Hex, ""), opts)
+	_, err = objLayer.PutObjectPart(ctx, "bucket1", "mpartObj1", res.UploadID, 1, mustGetPutObjReader(t, bytes.NewReader(fiveMBBytes), 5*humanize.MiByte, md5Hex, ""), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// PutObjectPart should succeed even if part already exists. ref: https://github.com/minio/minio/issues/1930
-	_, err = objLayer.PutObjectPart(ctx, "bucket1", "mpartObj1", uploadID, 1, mustGetPutObjReader(t, bytes.NewReader(fiveMBBytes), 5*humanize.MiByte, md5Hex, ""), opts)
+	_, err = objLayer.PutObjectPart(ctx, "bucket1", "mpartObj1", res.UploadID, 1, mustGetPutObjReader(t, bytes.NewReader(fiveMBBytes), 5*humanize.MiByte, md5Hex, ""), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestErasureDeleteObjectBasic(t *testing.T) {
 	}
 	defer xl.Shutdown(context.Background())
 
-	err = xl.MakeBucketWithLocation(ctx, "bucket", BucketOptions{})
+	err = xl.MakeBucketWithLocation(ctx, "bucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestDeleteObjectsVersioned(t *testing.T) {
 		{bucketName, "dir/obj1"},
 	}
 
-	err = obj.MakeBucketWithLocation(ctx, bucketName, BucketOptions{
+	err = obj.MakeBucketWithLocation(ctx, bucketName, MakeBucketOptions{
 		VersioningEnabled: true,
 	})
 	if err != nil {
@@ -206,7 +206,7 @@ func TestDeleteObjectsVersioned(t *testing.T) {
 		}
 	}
 
-	if _, err = ioutil.ReadFile(pathJoin(fsDirs[0], bucketName, "dir/obj1", "xl.meta")); err == nil {
+	if _, err = os.ReadFile(pathJoin(fsDirs[0], bucketName, "dir/obj1", "xl.meta")); err == nil {
 		t.Fatalf("xl.meta still present after removal")
 	}
 }
@@ -244,7 +244,7 @@ func TestErasureDeleteObjectsErasureSet(t *testing.T) {
 		{bucketName, "obj_4"},
 	}
 
-	err := erasureSets.MakeBucketWithLocation(ctx, bucketName, BucketOptions{})
+	err := erasureSets.MakeBucketWithLocation(ctx, bucketName, MakeBucketOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +305,7 @@ func TestErasureDeleteObjectDiskNotFound(t *testing.T) {
 	xl := z.serverPools[0].sets[0]
 
 	// Create "bucket"
-	err = obj.MakeBucketWithLocation(ctx, "bucket", BucketOptions{})
+	err = obj.MakeBucketWithLocation(ctx, "bucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +374,7 @@ func TestErasureDeleteObjectDiskNotFoundErasure4(t *testing.T) {
 	xl := z.serverPools[0].sets[0]
 
 	// Create "bucket"
-	err = obj.MakeBucketWithLocation(ctx, "bucket", BucketOptions{})
+	err = obj.MakeBucketWithLocation(ctx, "bucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -434,7 +434,7 @@ func TestErasureDeleteObjectDiskNotFoundErr(t *testing.T) {
 	xl := z.serverPools[0].sets[0]
 
 	// Create "bucket"
-	err = obj.MakeBucketWithLocation(ctx, "bucket", BucketOptions{})
+	err = obj.MakeBucketWithLocation(ctx, "bucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -505,7 +505,7 @@ func TestGetObjectNoQuorum(t *testing.T) {
 	xl := z.serverPools[0].sets[0]
 
 	// Create "bucket"
-	err = obj.MakeBucketWithLocation(ctx, "bucket", BucketOptions{})
+	err = obj.MakeBucketWithLocation(ctx, "bucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -528,7 +528,10 @@ func TestGetObjectNoQuorum(t *testing.T) {
 		files, _ := disk.ListDir(ctx, bucket, object, -1)
 		for _, file := range files {
 			if file != "xl.meta" {
-				disk.Delete(ctx, bucket, pathJoin(object, file), true)
+				disk.Delete(ctx, bucket, pathJoin(object, file), DeleteOptions{
+					Recursive: true,
+					Force:     false,
+				})
 			}
 		}
 	}
@@ -540,7 +543,7 @@ func TestGetObjectNoQuorum(t *testing.T) {
 		}
 	}
 	if gr != nil {
-		_, err = io.Copy(ioutil.Discard, gr)
+		_, err = io.Copy(io.Discard, gr)
 		if err != toObjectErr(errErasureReadQuorum, bucket, object) {
 			t.Errorf("Expected GetObject to fail with %v, but failed with %v", toObjectErr(errErasureReadQuorum, bucket, object), err)
 		}
@@ -585,7 +588,7 @@ func TestGetObjectNoQuorum(t *testing.T) {
 			}
 		}
 		if gr != nil {
-			_, err = io.Copy(ioutil.Discard, gr)
+			_, err = io.Copy(io.Discard, gr)
 			if err != toObjectErr(errErasureReadQuorum, bucket, object) {
 				t.Errorf("Expected GetObject to fail with %v, but failed with %v", toObjectErr(errErasureReadQuorum, bucket, object), err)
 			}
@@ -611,7 +614,7 @@ func TestHeadObjectNoQuorum(t *testing.T) {
 	xl := z.serverPools[0].sets[0]
 
 	// Create "bucket"
-	err = obj.MakeBucketWithLocation(ctx, "bucket", BucketOptions{})
+	err = obj.MakeBucketWithLocation(ctx, "bucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -629,7 +632,10 @@ func TestHeadObjectNoQuorum(t *testing.T) {
 		files, _ := disk.ListDir(ctx, bucket, object, -1)
 		for _, file := range files {
 			if file != "xl.meta" {
-				disk.Delete(ctx, bucket, pathJoin(object, file), true)
+				disk.Delete(ctx, bucket, pathJoin(object, file), DeleteOptions{
+					Recursive: true,
+					Force:     false,
+				})
 			}
 		}
 	}
@@ -686,7 +692,7 @@ func TestPutObjectNoQuorum(t *testing.T) {
 	xl := z.serverPools[0].sets[0]
 
 	// Create "bucket"
-	err = obj.MakeBucketWithLocation(ctx, "bucket", BucketOptions{})
+	err = obj.MakeBucketWithLocation(ctx, "bucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -749,7 +755,7 @@ func TestPutObjectNoQuorumSmall(t *testing.T) {
 	xl := z.serverPools[0].sets[0]
 
 	// Create "bucket"
-	err = obj.MakeBucketWithLocation(ctx, "bucket", BucketOptions{})
+	err = obj.MakeBucketWithLocation(ctx, "bucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -818,7 +824,7 @@ func TestPutObjectSmallInlineData(t *testing.T) {
 	object := "object"
 
 	// Create "bucket"
-	err = obj.MakeBucketWithLocation(ctx, bucket, BucketOptions{})
+	err = obj.MakeBucketWithLocation(ctx, bucket, MakeBucketOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -886,13 +892,21 @@ func testObjectQuorumFromMeta(obj ObjectLayer, instanceType string, dirs []strin
 	ctx, cancel := context.WithCancel(GlobalContext)
 	defer cancel()
 
-	err := obj.MakeBucketWithLocation(ctx, bucket, BucketOptions{})
+	err := obj.MakeBucketWithLocation(ctx, bucket, MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("Failed to make a bucket %v", err)
 	}
 
 	// Object for test case 1 - No StorageClass defined, no MetaData in PutObject
 	object1 := "object1"
+	globalStorageClass = storageclass.Config{
+		RRS: storageclass.StorageClass{
+			Parity: 2,
+		},
+		Standard: storageclass.StorageClass{
+			Parity: 4,
+		},
+	}
 	_, err = obj.PutObject(ctx, bucket, object1, mustGetPutObjReader(t, bytes.NewReader(data), int64(len(data)), "", ""), opts)
 	if err != nil {
 		t.Fatalf("Failed to putObject %v", err)
@@ -964,17 +978,16 @@ func testObjectQuorumFromMeta(obj ObjectLayer, instanceType string, dirs []strin
 	}
 
 	parts5, errs5 := readAllFileInfo(ctx, erasureDisks, bucket, object5, "", false)
-	parts5SC := storageclass.Config{
-		RRS: storageclass.StorageClass{
-			Parity: 2,
-		},
-	}
+	parts5SC := globalStorageClass
 
 	// Object for test case 6 - RRS StorageClass defined as Parity 2, MetaData in PutObject requesting Standard Storage Class
 	object6 := "object6"
 	metadata6 := make(map[string]string)
 	metadata6["x-amz-storage-class"] = storageclass.STANDARD
 	globalStorageClass = storageclass.Config{
+		Standard: storageclass.StorageClass{
+			Parity: 4,
+		},
 		RRS: storageclass.StorageClass{
 			Parity: 2,
 		},
@@ -1035,7 +1048,7 @@ func testObjectQuorumFromMeta(obj ObjectLayer, instanceType string, dirs []strin
 		tt := tt
 		t.(*testing.T).Run("", func(t *testing.T) {
 			globalStorageClass = tt.storageClassCfg
-			actualReadQuorum, actualWriteQuorum, err := objectQuorumFromMeta(ctx, tt.parts, tt.errs, getDefaultParityBlocks(len(erasureDisks)))
+			actualReadQuorum, actualWriteQuorum, err := objectQuorumFromMeta(ctx, tt.parts, tt.errs, storageclass.DefaultParityBlocks(len(erasureDisks)))
 			if tt.expectedError != nil && err == nil {
 				t.Errorf("Expected %s, got %s", tt.expectedError, err)
 			}
@@ -1060,10 +1073,7 @@ func TestGetObjectInlineNotInline(t *testing.T) {
 	// Create a backend with 4 disks named disk{1...4}, this name convention
 	// because we will unzip some object data from a sample archive.
 	const numDisks = 4
-	path, err := ioutil.TempDir(globalTestTmpDir, "minio-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	path := t.TempDir()
 
 	var fsDirs []string
 	for i := 1; i <= numDisks; i++ {
@@ -1081,7 +1091,7 @@ func TestGetObjectInlineNotInline(t *testing.T) {
 	defer removeRoots(fsDirs)
 
 	// Create a testbucket
-	err = objLayer.MakeBucketWithLocation(ctx, "testbucket", BucketOptions{})
+	err = objLayer.MakeBucketWithLocation(ctx, "testbucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1114,6 +1124,10 @@ func TestGetObjectInlineNotInline(t *testing.T) {
 
 // Test reading an object with some outdated data in some disks
 func TestGetObjectWithOutdatedDisks(t *testing.T) {
+	if runtime.GOOS == globalWindowsOSName {
+		t.Skip()
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -1147,7 +1161,7 @@ func TestGetObjectWithOutdatedDisks(t *testing.T) {
 
 	for i, testCase := range testCases {
 		// Step 1: create a bucket
-		err = z.MakeBucketWithLocation(ctx, testCase.bucket, BucketOptions{VersioningEnabled: testCase.versioned})
+		err = z.MakeBucketWithLocation(ctx, testCase.bucket, MakeBucketOptions{VersioningEnabled: testCase.versioned})
 		if err != nil {
 			t.Fatalf("Test %d: Failed to create a bucket: %v", i+1, err)
 		}
@@ -1173,7 +1187,7 @@ func TestGetObjectWithOutdatedDisks(t *testing.T) {
 			return disks
 		}
 		sets.erasureDisksMu.Unlock()
-		_, err = z.PutObject(ctx, testCase.bucket, testCase.object, mustGetPutObjReader(t, bytes.NewReader(testCase.content), int64(len(testCase.content)), "", ""),
+		got, err := z.PutObject(ctx, testCase.bucket, testCase.object, mustGetPutObjReader(t, bytes.NewReader(testCase.content), int64(len(testCase.content)), "", ""),
 			ObjectOptions{Versioned: testCase.versioned})
 		if err != nil {
 			t.Fatalf("Test %d: Failed to upload the final object: %v", i+1, err)
@@ -1183,7 +1197,7 @@ func TestGetObjectWithOutdatedDisks(t *testing.T) {
 		sets.erasureDisksMu.Lock()
 		xl.getDisks = func() []StorageAPI { return origErasureDisks }
 		sets.erasureDisksMu.Unlock()
-		gr, err := z.GetObjectNInfo(ctx, testCase.bucket, testCase.object, nil, nil, readLock, ObjectOptions{})
+		gr, err := z.GetObjectNInfo(ctx, testCase.bucket, testCase.object, nil, nil, readLock, ObjectOptions{VersionID: got.VersionID})
 		if err != nil {
 			t.Fatalf("Expected GetObject to succeed, but failed with %v", err)
 		}

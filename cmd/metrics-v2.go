@@ -27,12 +27,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/minio/kes"
 	"github.com/minio/madmin-go"
 	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/logger"
+	"github.com/minio/minio/internal/rest"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
 	"github.com/prometheus/procfs"
 )
 
@@ -49,6 +51,7 @@ func init() {
 		getNodeHealthMetrics(),
 		getClusterStorageMetrics(),
 		getClusterTierMetrics(),
+		getKMSMetrics(),
 	}
 
 	peerMetricsGroups = []*MetricsGroup{
@@ -63,6 +66,7 @@ func init() {
 		getILMNodeMetrics(),
 		getScannerNodeMetrics(),
 		getIAMNodeMetrics(),
+		getKMSNodeMetrics(),
 	}
 
 	allMetricsGroups := func() (allMetrics []*MetricsGroup) {
@@ -80,7 +84,6 @@ func init() {
 		getMinioVersionMetrics(),
 		getS3TTFBMetric(),
 	})
-
 	clusterCollector = newMinioClusterCollector(allMetricsGroups)
 }
 
@@ -123,6 +126,7 @@ const (
 	ilmSubsystem              MetricSubsystem = "ilm"
 	scannerSubsystem          MetricSubsystem = "scanner"
 	iamSubsystem              MetricSubsystem = "iam"
+	kmsSubsystem              MetricSubsystem = "kms"
 )
 
 // MetricName are the individual names for the metric.
@@ -164,7 +168,8 @@ const (
 	writeBytes      MetricName = "write_bytes"
 	wcharBytes      MetricName = "wchar_bytes"
 
-	apiLatencyMicroSec MetricName = "latency_us"
+	latencyMicroSec MetricName = "latency_us"
+	latencyNanoSec  MetricName = "latency_ns"
 
 	usagePercent MetricName = "update_percent"
 
@@ -188,6 +193,12 @@ const (
 	transitionedBytes    MetricName = "transitioned_bytes"
 	transitionedObjects  MetricName = "transitioned_objects"
 	transitionedVersions MetricName = "transitioned_versions"
+
+	kmsOnline          = "online"
+	kmsRequestsSuccess = "request_success"
+	kmsRequestsError   = "request_error"
+	kmsRequestsFail    = "request_failure"
+	kmsUptime          = "uptime"
 )
 
 const (
@@ -232,6 +243,7 @@ type MetricsGroup struct {
 // to populate new values upon cache invalidation.
 func (g *MetricsGroup) RegisterRead(read func(ctx context.Context) []Metric) {
 	g.metricsCache.Once.Do(func() {
+		g.metricsCache.Relax = true
 		g.metricsCache.TTL = g.cacheInterval
 		g.metricsCache.Update = func() (interface{}, error) {
 			return read(GlobalContext), nil
@@ -264,18 +276,7 @@ func (m *Metric) copyMetric() Metric {
 // once the TTL expires "read()" registered function is called
 // to return the new values and updated.
 func (g *MetricsGroup) Get() (metrics []Metric) {
-	var c interface{}
-	var err error
-	if g.cacheInterval <= 0 {
-		c, err = g.metricsCache.Update()
-	} else {
-		c, err = g.metricsCache.Get()
-	}
-
-	if err != nil {
-		return []Metric{}
-	}
-
+	c, _ := g.metricsCache.Get()
 	m, ok := c.([]Metric)
 	if !ok {
 		return []Metric{}
@@ -332,8 +333,8 @@ func getNodeDiskAPILatencyMD() MetricDescription {
 	return MetricDescription{
 		Namespace: nodeMetricNamespace,
 		Subsystem: diskSubsystem,
-		Name:      apiLatencyMicroSec,
-		Help:      "Average last minute latency in µs for disk API storage operations",
+		Name:      latencyMicroSec,
+		Help:      "Average last minute latency in µs for drive API storage operations",
 		Type:      gaugeMetric,
 	}
 }
@@ -343,7 +344,7 @@ func getNodeDiskUsedBytesMD() MetricDescription {
 		Namespace: nodeMetricNamespace,
 		Subsystem: diskSubsystem,
 		Name:      usedBytes,
-		Help:      "Total storage used on a disk",
+		Help:      "Total storage used on a drive",
 		Type:      gaugeMetric,
 	}
 }
@@ -353,7 +354,7 @@ func getNodeDiskFreeBytesMD() MetricDescription {
 		Namespace: nodeMetricNamespace,
 		Subsystem: diskSubsystem,
 		Name:      freeBytes,
-		Help:      "Total storage available on a disk",
+		Help:      "Total storage available on a drive",
 		Type:      gaugeMetric,
 	}
 }
@@ -363,7 +364,7 @@ func getClusterDisksOfflineTotalMD() MetricDescription {
 		Namespace: clusterMetricNamespace,
 		Subsystem: diskSubsystem,
 		Name:      offlineTotal,
-		Help:      "Total disks offline",
+		Help:      "Total drives offline",
 		Type:      gaugeMetric,
 	}
 }
@@ -373,7 +374,7 @@ func getClusterDisksOnlineTotalMD() MetricDescription {
 		Namespace: clusterMetricNamespace,
 		Subsystem: diskSubsystem,
 		Name:      onlineTotal,
-		Help:      "Total disks online",
+		Help:      "Total drives online",
 		Type:      gaugeMetric,
 	}
 }
@@ -383,7 +384,7 @@ func getClusterDisksTotalMD() MetricDescription {
 		Namespace: clusterMetricNamespace,
 		Subsystem: diskSubsystem,
 		Name:      total,
-		Help:      "Total disks",
+		Help:      "Total drives",
 		Type:      gaugeMetric,
 	}
 }
@@ -403,7 +404,7 @@ func getNodeDiskTotalBytesMD() MetricDescription {
 		Namespace: nodeMetricNamespace,
 		Subsystem: diskSubsystem,
 		Name:      totalBytes,
-		Help:      "Total storage on a disk",
+		Help:      "Total storage on a drive",
 		Type:      gaugeMetric,
 	}
 }
@@ -535,6 +536,26 @@ func getInternodeFailedRequests() MetricDescription {
 		Name:      errorsTotal,
 		Help:      "Total number of failed internode calls",
 		Type:      counterMetric,
+	}
+}
+
+func getInternodeTCPDialTimeout() MetricDescription {
+	return MetricDescription{
+		Namespace: interNodeMetricNamespace,
+		Subsystem: trafficSubsystem,
+		Name:      "dial_errors",
+		Help:      "Total number of internode TCP dial timeouts and errors",
+		Type:      counterMetric,
+	}
+}
+
+func getInternodeTCPAvgDuration() MetricDescription {
+	return MetricDescription{
+		Namespace: interNodeMetricNamespace,
+		Subsystem: trafficSubsystem,
+		Name:      "dial_avg_time",
+		Help:      "Average time of internodes TCP dial calls",
+		Type:      gaugeMetric,
 	}
 }
 
@@ -703,7 +724,7 @@ func getCacheHitsTotalMD() MetricDescription {
 		Namespace: minioNamespace,
 		Subsystem: cacheSubsystem,
 		Name:      hitsTotal,
-		Help:      "Total number of disk cache hits",
+		Help:      "Total number of drive cache hits",
 		Type:      counterMetric,
 	}
 }
@@ -713,7 +734,7 @@ func getCacheHitsMissedTotalMD() MetricDescription {
 		Namespace: minioNamespace,
 		Subsystem: cacheSubsystem,
 		Name:      missedTotal,
-		Help:      "Total number of disk cache misses",
+		Help:      "Total number of drive cache misses",
 		Type:      counterMetric,
 	}
 }
@@ -753,7 +774,7 @@ func getCacheTotalBytesMD() MetricDescription {
 		Namespace: minioNamespace,
 		Subsystem: cacheSubsystem,
 		Name:      totalBytes,
-		Help:      "Total size of cache disk in bytes",
+		Help:      "Total size of cache drive in bytes",
 		Type:      gaugeMetric,
 	}
 }
@@ -997,7 +1018,7 @@ func getMinioProcMetrics() *MetricsGroup {
 		metrics = make([]Metric, 0, 20)
 		p, err := procfs.Self()
 		if err != nil {
-			logger.LogOnceIf(ctx, err, nodeMetricNamespace)
+			logger.LogOnceIf(ctx, err, string(nodeMetricNamespace))
 			return
 		}
 
@@ -1233,7 +1254,7 @@ func getScannerNodeMetrics() *MetricsGroup {
 					Help:      "Total number of unique objects scanned since server start",
 					Type:      counterMetric,
 				},
-				Value: float64(atomic.LoadUint64(&globalScannerStats.accTotalObjects)),
+				Value: float64(globalScannerMetrics.lifetime(scannerMetricScanObject)),
 			},
 			{
 				Description: MetricDescription{
@@ -1243,7 +1264,7 @@ func getScannerNodeMetrics() *MetricsGroup {
 					Help:      "Total number of object versions scanned since server start",
 					Type:      counterMetric,
 				},
-				Value: float64(atomic.LoadUint64(&globalScannerStats.accTotalVersions)),
+				Value: float64(globalScannerMetrics.lifetime(scannerMetricApplyVersion)),
 			},
 			{
 				Description: MetricDescription{
@@ -1253,7 +1274,7 @@ func getScannerNodeMetrics() *MetricsGroup {
 					Help:      "Total number of directories scanned since server start",
 					Type:      counterMetric,
 				},
-				Value: float64(atomic.LoadUint64(&globalScannerStats.accFolders)),
+				Value: float64(globalScannerMetrics.lifetime(scannerMetricScanFolder)),
 			},
 			{
 				Description: MetricDescription{
@@ -1263,7 +1284,7 @@ func getScannerNodeMetrics() *MetricsGroup {
 					Help:      "Total number of bucket scans started since server start",
 					Type:      counterMetric,
 				},
-				Value: float64(atomic.LoadUint64(&globalScannerStats.bucketsStarted)),
+				Value: float64(globalScannerMetrics.lifetime(scannerMetricScanBucketDisk) + uint64(globalScannerMetrics.activeDisks())),
 			},
 			{
 				Description: MetricDescription{
@@ -1273,7 +1294,7 @@ func getScannerNodeMetrics() *MetricsGroup {
 					Help:      "Total number of bucket scans finished since server start",
 					Type:      counterMetric,
 				},
-				Value: float64(atomic.LoadUint64(&globalScannerStats.bucketsFinished)),
+				Value: float64(globalScannerMetrics.lifetime(scannerMetricScanBucketDisk)),
 			},
 			{
 				Description: MetricDescription{
@@ -1283,12 +1304,12 @@ func getScannerNodeMetrics() *MetricsGroup {
 					Help:      "Total number of object versions checked for ilm actions since server start",
 					Type:      counterMetric,
 				},
-				Value: float64(atomic.LoadUint64(&globalScannerStats.ilmChecks)),
+				Value: float64(globalScannerMetrics.lifetime(scannerMetricILM)),
 			},
 		}
-		for i := range globalScannerStats.actions {
+		for i := range globalScannerMetrics.actions {
 			action := lifecycle.Action(i)
-			v := atomic.LoadUint64(&globalScannerStats.actions[action])
+			v := globalScannerMetrics.lifetimeActions(action)
 			if v == 0 {
 				continue
 			}
@@ -1383,9 +1404,6 @@ func getMinioVersionMetrics() *MetricsGroup {
 func getNodeHealthMetrics() *MetricsGroup {
 	mg := &MetricsGroup{}
 	mg.RegisterRead(func(_ context.Context) (metrics []Metric) {
-		if globalIsGateway {
-			return
-		}
 		metrics = make([]Metric, 0, 16)
 		nodesUp, nodesDown := globalNotificationSys.GetPeerOnlineCount()
 		metrics = append(metrics, Metric{
@@ -1405,9 +1423,6 @@ func getMinioHealingMetrics() *MetricsGroup {
 	mg := &MetricsGroup{}
 	mg.RegisterRead(func(_ context.Context) (metrics []Metric) {
 		metrics = make([]Metric, 0, 5)
-		if globalIsGateway {
-			return
-		}
 		bgSeq, exists := globalBackgroundHealState.getHealSequenceByToken(bgHealingUUID)
 		if !exists {
 			return
@@ -1608,10 +1623,19 @@ func getNetworkMetrics() *MetricsGroup {
 	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
 		metrics = make([]Metric, 0, 10)
 		connStats := globalConnStats.toServerConnStats()
+		rpcStats := rest.GetRPCStats()
 		if globalIsDistErasure {
 			metrics = append(metrics, Metric{
 				Description: getInternodeFailedRequests(),
-				Value:       float64(loadAndResetRPCNetworkErrsCounter()),
+				Value:       float64(rpcStats.Errs),
+			})
+			metrics = append(metrics, Metric{
+				Description: getInternodeTCPDialTimeout(),
+				Value:       float64(rpcStats.DialErrs),
+			})
+			metrics = append(metrics, Metric{
+				Description: getInternodeTCPAvgDuration(),
+				Value:       float64(rpcStats.DialAvgDuration),
 			})
 			metrics = append(metrics, Metric{
 				Description: getInterNodeSentBytesMD(),
@@ -1642,7 +1666,7 @@ func getBucketUsageMetrics() *MetricsGroup {
 	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
 		objLayer := newObjectLayerFn()
 		// Service not initialized yet
-		if objLayer == nil || globalIsGateway {
+		if objLayer == nil {
 			return
 		}
 
@@ -1662,7 +1686,7 @@ func getBucketUsageMetrics() *MetricsGroup {
 			Value:       float64(time.Since(dataUsageInfo.LastUpdate)),
 		})
 
-		bucketReplStats := getAllLatestReplicationStats(dataUsageInfo.BucketsUsage)
+		bucketReplStats := globalReplicationStats.getAllLatest(dataUsageInfo.BucketsUsage)
 		for bucket, usage := range dataUsageInfo.BucketsUsage {
 			stats := bucketReplStats[bucket]
 
@@ -1787,7 +1811,7 @@ func getClusterTierMetrics() *MetricsGroup {
 	}
 	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
 		objLayer := newObjectLayerFn()
-		if objLayer == nil || globalIsGateway {
+		if objLayer == nil {
 			return
 		}
 		if globalTierConfigMgr.Empty() {
@@ -1815,7 +1839,7 @@ func getLocalStorageMetrics() *MetricsGroup {
 	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
 		objLayer := newObjectLayerFn()
 		// Service not initialized yet
-		if objLayer == nil || globalIsGateway {
+		if objLayer == nil {
 			return
 		}
 
@@ -1859,7 +1883,7 @@ func getLocalDiskStorageMetrics() *MetricsGroup {
 	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
 		objLayer := newObjectLayerFn()
 		// Service not initialized yet
-		if objLayer == nil || globalIsGateway {
+		if objLayer == nil {
 			return
 		}
 
@@ -1872,11 +1896,10 @@ func getLocalDiskStorageMetrics() *MetricsGroup {
 			if disk.Metrics == nil {
 				continue
 			}
-			for apiName, latency := range disk.Metrics.APILatencies {
-				val := latency.(uint64)
+			for apiName, latency := range disk.Metrics.LastMinute {
 				metrics = append(metrics, Metric{
 					Description:    getNodeDiskAPILatencyMD(),
-					Value:          float64(val / 1000),
+					Value:          float64(latency.Avg().Microseconds()),
 					VariableLabels: map[string]string{"disk": disk.DrivePath, "api": "storage." + apiName},
 				})
 			}
@@ -1893,7 +1916,7 @@ func getClusterStorageMetrics() *MetricsGroup {
 	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
 		objLayer := newObjectLayerFn()
 		// Service not initialized yet
-		if objLayer == nil || globalIsGateway {
+		if objLayer == nil {
 			return
 		}
 
@@ -1915,12 +1938,12 @@ func getClusterStorageMetrics() *MetricsGroup {
 
 		metrics = append(metrics, Metric{
 			Description: getClusterCapacityUsageBytesMD(),
-			Value:       GetTotalUsableCapacity(storageInfo.Disks, storageInfo),
+			Value:       float64(GetTotalUsableCapacity(storageInfo.Disks, storageInfo)),
 		})
 
 		metrics = append(metrics, Metric{
 			Description: getClusterCapacityUsageFreeBytesMD(),
-			Value:       GetTotalUsableCapacityFree(storageInfo.Disks, storageInfo),
+			Value:       float64(GetTotalUsableCapacityFree(storageInfo.Disks, storageInfo)),
 		})
 
 		metrics = append(metrics, Metric{
@@ -1938,6 +1961,107 @@ func getClusterStorageMetrics() *MetricsGroup {
 			Value:       float64(totalDisks.Sum()),
 		})
 		return
+	})
+	return mg
+}
+
+func getKMSNodeMetrics() *MetricsGroup {
+	mg := &MetricsGroup{
+		cacheInterval: 10 * time.Second,
+	}
+
+	mg.RegisterRead(func(ctx context.Context) (metrics []Metric) {
+		objLayer := newObjectLayerFn()
+		// Service not initialized yet
+		if objLayer == nil || GlobalKMS == nil {
+			return
+		}
+
+		const (
+			Online  = 1
+			Offline = 0
+		)
+		desc := MetricDescription{
+			Namespace: clusterMetricNamespace,
+			Subsystem: kmsSubsystem,
+			Name:      kmsOnline,
+			Help:      "Reports whether the KMS is online (1) or offline (0)",
+			Type:      gaugeMetric,
+		}
+		_, err := GlobalKMS.Metrics(ctx)
+		if _, ok := kes.IsConnError(err); ok {
+			return []Metric{{
+				Description: desc,
+				Value:       float64(Offline),
+			}}
+		}
+		return []Metric{{
+			Description: desc,
+			Value:       float64(Online),
+		}}
+	})
+	return mg
+}
+
+func getKMSMetrics() *MetricsGroup {
+	mg := &MetricsGroup{
+		cacheInterval: 10 * time.Second,
+	}
+
+	mg.RegisterRead(func(ctx context.Context) []Metric {
+		objLayer := newObjectLayerFn()
+		// Service not initialized yet
+		if objLayer == nil || GlobalKMS == nil {
+			return []Metric{}
+		}
+
+		metrics := make([]Metric, 0, 4)
+		metric, err := GlobalKMS.Metrics(ctx)
+		if err != nil {
+			return metrics
+		}
+		metrics = append(metrics, Metric{
+			Description: MetricDescription{
+				Namespace: clusterMetricNamespace,
+				Subsystem: kmsSubsystem,
+				Name:      kmsRequestsSuccess,
+				Help:      "Number of KMS requests that succeeded",
+				Type:      counterMetric,
+			},
+			Value: float64(metric.RequestOK),
+		})
+		metrics = append(metrics, Metric{
+			Description: MetricDescription{
+				Namespace: clusterMetricNamespace,
+				Subsystem: kmsSubsystem,
+				Name:      kmsRequestsError,
+				Help:      "Number of KMS requests that failed due to some error. (HTTP 4xx status code)",
+				Type:      counterMetric,
+			},
+			Value: float64(metric.RequestErr),
+		})
+		metrics = append(metrics, Metric{
+			Description: MetricDescription{
+				Namespace: clusterMetricNamespace,
+				Subsystem: kmsSubsystem,
+				Name:      kmsRequestsFail,
+				Help:      "Number of KMS requests that failed due to some internal failure. (HTTP 5xx status code)",
+				Type:      counterMetric,
+			},
+			Value: float64(metric.RequestFail),
+		})
+		metrics = append(metrics, Metric{
+			Description: MetricDescription{
+				Namespace: clusterMetricNamespace,
+				Subsystem: kmsSubsystem,
+				Name:      kmsUptime,
+				Help:      "The time the KMS has been up and running in seconds.",
+				Type:      counterMetric,
+			},
+			Value: metric.UpTime.Seconds(),
+		})
+
+		return metrics
 	})
 	return mg
 }
@@ -2141,55 +2265,89 @@ func metricsServerHandler() http.Handler {
 	registry := prometheus.NewRegistry()
 
 	// Report all other metrics
-	err := registry.Register(clusterCollector)
-	if err != nil {
-		logger.CriticalIf(GlobalContext, err)
-	}
+	logger.CriticalIf(GlobalContext, registry.Register(clusterCollector))
 
 	// DefaultGatherers include golang metrics and process metrics.
 	gatherers := prometheus.Gatherers{
 		registry,
 	}
 
-	// Delegate http serving to Prometheus client library, which will call collector.Collect.
-	return promhttp.InstrumentMetricHandler(
-		registry,
-		promhttp.HandlerFor(gatherers,
-			promhttp.HandlerOpts{
-				ErrorHandling: promhttp.ContinueOnError,
-			}),
-	)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tc, ok := r.Context().Value(contextTraceReqKey).(*traceCtxt)
+		if ok {
+			tc.funcName = "handler.MetricsCluster"
+			tc.responseRecorder.LogErrBody = true
+		}
+
+		mfs, err := gatherers.Gather()
+		if err != nil {
+			if len(mfs) == 0 {
+				writeErrorResponseJSON(r.Context(), w, toAdminAPIErr(r.Context(), err), r.URL)
+				return
+			}
+		}
+
+		contentType := expfmt.Negotiate(r.Header)
+		w.Header().Set("Content-Type", string(contentType))
+
+		enc := expfmt.NewEncoder(w, contentType)
+		for _, mf := range mfs {
+			if err := enc.Encode(mf); err != nil {
+				logger.LogIf(r.Context(), err)
+				return
+			}
+		}
+		if closer, ok := enc.(expfmt.Closer); ok {
+			closer.Close()
+		}
+	})
 }
 
 func metricsNodeHandler() http.Handler {
 	registry := prometheus.NewRegistry()
 
-	err := registry.Register(nodeCollector)
-	if err != nil {
-		logger.CriticalIf(GlobalContext, err)
-	}
-	err = registry.Register(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{
+	logger.CriticalIf(GlobalContext, registry.Register(nodeCollector))
+	if err := registry.Register(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{
 		Namespace:    minioNamespace,
 		ReportErrors: true,
-	}))
-	if err != nil {
+	})); err != nil {
 		logger.CriticalIf(GlobalContext, err)
 	}
-	err = registry.Register(prometheus.NewGoCollector())
-	if err != nil {
+	if err := registry.Register(prometheus.NewGoCollector()); err != nil {
 		logger.CriticalIf(GlobalContext, err)
 	}
 	gatherers := prometheus.Gatherers{
 		registry,
 	}
-	// Delegate http serving to Prometheus client library, which will call collector.Collect.
-	return promhttp.InstrumentMetricHandler(
-		registry,
-		promhttp.HandlerFor(gatherers,
-			promhttp.HandlerOpts{
-				ErrorHandling: promhttp.ContinueOnError,
-			}),
-	)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tc, ok := r.Context().Value(contextTraceReqKey).(*traceCtxt)
+		if ok {
+			tc.funcName = "handler.MetricsNode"
+			tc.responseRecorder.LogErrBody = true
+		}
+
+		mfs, err := gatherers.Gather()
+		if err != nil {
+			if len(mfs) == 0 {
+				writeErrorResponseJSON(r.Context(), w, toAdminAPIErr(r.Context(), err), r.URL)
+				return
+			}
+		}
+
+		contentType := expfmt.Negotiate(r.Header)
+		w.Header().Set("Content-Type", string(contentType))
+
+		enc := expfmt.NewEncoder(w, contentType)
+		for _, mf := range mfs {
+			if err := enc.Encode(mf); err != nil {
+				logger.LogIf(r.Context(), err)
+				return
+			}
+		}
+		if closer, ok := enc.(expfmt.Closer); ok {
+			closer.Close()
+		}
+	})
 }
 
 func toSnake(camel string) (snake string) {

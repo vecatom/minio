@@ -1,6 +1,7 @@
 {{- if eq .Values.mode "distributed" }}
 {{ $poolCount := .Values.pools | int }}
 {{ $nodeCount := .Values.replicas | int }}
+{{ $replicas := mul $poolCount $nodeCount }}
 {{ $drivesPerNode := .Values.drivesPerNode | int }}
 {{ $scheme := "http" }}
 {{- if .Values.tls.enabled }}
@@ -30,6 +31,7 @@ spec:
     - name: {{ $scheme }}
       port: {{ .Values.service.port }}
       protocol: TCP
+      targetPort: {{ .Values.minioAPIPort }}
   selector:
     app: {{ template "minio.name" . }}
     release: {{ .Release.Name }}
@@ -56,7 +58,7 @@ spec:
     type: {{ .Values.StatefulSetUpdate.updateStrategy }}
   podManagementPolicy: "Parallel"
   serviceName: {{ template "minio.fullname" . }}-svc
-  replicas: {{ mul $poolCount $nodeCount }}
+  replicas: {{ $replicas }}
   selector:
     matchLabels:
       app: {{ template "minio.name" . }}
@@ -81,6 +83,9 @@ spec:
     spec:
       {{- if .Values.priorityClassName }}
       priorityClassName: "{{ .Values.priorityClassName }}"
+      {{- end }}
+      {{- if .Values.runtimeClassName }}
+      runtimeClassName: "{{ .Values.runtimeClassName }}"
       {{- end }}
 {{- if and .Values.securityContext.enabled .Values.persistence.enabled }}
       securityContext:
@@ -125,6 +130,9 @@ spec:
               mountPath: "/tmp/minio-config-env"
             {{- end }}
             {{- include "minio.tlsKeysVolumeMount" . | indent 12 }}
+            {{- if .Values.extraVolumeMounts }}
+              {{- toYaml .Values.extraVolumeMounts | nindent 12 }}
+            {{- end }}
           ports:
             - name: {{ $scheme }}
               containerPort: {{ .Values.minioAPIPort }}
@@ -149,6 +157,24 @@ spec:
             - name: MINIO_PROMETHEUS_AUTH_TYPE
               value: "public"
             {{- end}}
+            {{- if .Values.oidc.enabled }}
+            - name: MINIO_IDENTITY_OPENID_CONFIG_URL
+              value: {{ .Values.oidc.configUrl }}
+            - name: MINIO_IDENTITY_OPENID_CLIENT_ID
+              value: {{ .Values.oidc.clientId }}
+            - name: MINIO_IDENTITY_OPENID_CLIENT_SECRET
+              value: {{ .Values.oidc.clientSecret }}
+            - name: MINIO_IDENTITY_OPENID_CLAIM_NAME
+              value: {{ .Values.oidc.claimName }}
+            - name: MINIO_IDENTITY_OPENID_CLAIM_PREFIX
+              value: {{ .Values.oidc.claimPrefix }}
+            - name: MINIO_IDENTITY_OPENID_SCOPES
+              value: {{ .Values.oidc.scopes }}
+            - name: MINIO_IDENTITY_OPENID_REDIRECT_URI
+              value: {{ .Values.oidc.redirectUri }}
+            - name: MINIO_IDENTITY_OPENID_COMMENT
+              value: {{ .Values.oidc.comment }}
+            {{- end}}
             {{- range $key, $val := .Values.environment }}
             - name: {{ $key }}
               value: {{ $val | quote }}
@@ -168,6 +194,12 @@ spec:
       tolerations:
 {{ toYaml . | indent 8 }}
     {{- end }}
+    {{- if and (gt $replicas 1) (ge .Capabilities.KubeVersion.Major "1") (ge .Capabilities.KubeVersion.Minor "19") }}
+    {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+{{ toYaml . | indent 8 }}
+    {{- end }}
+    {{- end }}
       volumes:
         - name: minio-user
           secret:
@@ -178,6 +210,9 @@ spec:
             secretName: {{ .Values.extraSecret }}
         {{- end }}
         {{- include "minio.tlsKeysVolume" . | indent 8 }}
+        {{- if .Values.extraVolumes }}
+          {{ toYaml .Values.extraVolumes | nindent 8 }}
+        {{- end }}
 {{- if .Values.persistence.enabled }}
   volumeClaimTemplates:
   {{- if gt $drivesPerNode 1 }}

@@ -20,7 +20,9 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
+	"path"
 	"sort"
 	"strings"
 
@@ -84,6 +86,12 @@ func (e *metaCacheEntry) matches(other *metaCacheEntry, strict bool) (prefer *me
 		return other, false
 	}
 
+	if other.isDir() || e.isDir() {
+		if e.isDir() {
+			return e, other.isDir() == e.isDir()
+		}
+		return other, other.isDir() == e.isDir()
+	}
 	eVers, eErr := e.xlmeta()
 	oVers, oErr := other.xlmeta()
 	if eErr != nil || oErr != nil {
@@ -330,7 +338,9 @@ func (m metaCacheEntries) resolve(r *metadataResolutionParams) (selected *metaCa
 		// shallow decode.
 		xl, err := entry.xlmeta()
 		if err != nil {
-			logger.LogIf(GlobalContext, err)
+			if !errors.Is(err, errFileNotFound) {
+				logger.LogIf(GlobalContext, err)
+			}
 			continue
 		}
 		objsValid++
@@ -611,7 +621,7 @@ func (m *metaCacheEntriesSorted) forwardPast(s string) {
 // The entry not chosen will be discarded.
 // If the context is canceled the function will return the error,
 // otherwise the function will return nil.
-func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<- metaCacheEntry, compareMeta func(existing, other *metaCacheEntry) (replace bool)) error {
+func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<- metaCacheEntry, readQuorum int) error {
 	defer close(out)
 	top := make([]*metaCacheEntry, len(in))
 	nDone := 0
@@ -657,6 +667,7 @@ func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<
 		}
 	}
 	last := ""
+	var toMerge []int
 
 	// Choose the best to return.
 	for {
@@ -665,6 +676,7 @@ func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<
 		}
 		best := top[0]
 		bestIdx := 0
+		toMerge = toMerge[:0]
 		for i, other := range top[1:] {
 			otherIdx := i + 1
 			if other == nil {
@@ -675,24 +687,71 @@ func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<
 				bestIdx = otherIdx
 				continue
 			}
-			if best.name == other.name {
-				if compareMeta(best, other) {
-					// Replace "best"
-					if err := selectFrom(bestIdx); err != nil {
-						return err
-					}
-					best = other
-					bestIdx = otherIdx
-				} else if err := selectFrom(otherIdx); err != nil {
-					// Keep best, replace "other"
-					return err
-				}
+			// We should make sure to avoid objects and directories
+			// of this fashion such as
+			//  - foo-1
+			//  - foo-1/
+			// we should avoid this situation by making sure that
+			// we compare the `foo-1/` after path.Clean() to
+			// de-dup the entries.
+			if path.Clean(best.name) == path.Clean(other.name) {
+				toMerge = append(toMerge, otherIdx)
 				continue
 			}
 			if best.name > other.name {
+				toMerge = toMerge[:0]
 				best = other
 				bestIdx = otherIdx
 			}
+		}
+
+		// Merge any unmerged
+		if len(toMerge) > 0 {
+			versions := make([]xlMetaV2ShallowVersion, 0, len(toMerge)+1)
+			xl, err := best.xlmeta()
+			if err == nil {
+				versions = append(versions, xl.versions...)
+			}
+			for _, idx := range toMerge {
+				other := top[idx]
+				if other == nil {
+					continue
+				}
+				xl2, err := other.xlmeta()
+				if err != nil {
+					if err := selectFrom(idx); err != nil {
+						return err
+					}
+					continue
+				}
+				if xl == nil {
+					// Discard current "best"
+					if err := selectFrom(bestIdx); err != nil {
+						return err
+					}
+					bestIdx = idx
+					best = other
+					xl = xl2
+				} else {
+					// Mark read, unless we added it as new "best".
+					if err := selectFrom(idx); err != nil {
+						return err
+					}
+				}
+				versions = append(versions, xl2.versions...)
+			}
+			if xl != nil && len(versions) > 0 {
+				// Merge all versions. 'strict' doesn't matter since we only need one.
+				xl.versions = mergeXLV2Versions(readQuorum, true, 0, versions)
+				if meta, err := xl.AppendTo(metaDataPoolGet()); err == nil {
+					if best.reusable {
+						metaDataPoolPut(best.metadata)
+					}
+					best.metadata = meta
+					best.cached = xl
+				}
+			}
+			toMerge = toMerge[:0]
 		}
 		if best.name > last {
 			select {

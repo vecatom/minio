@@ -27,7 +27,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
@@ -48,6 +47,7 @@ import (
 	"github.com/inconshreveable/mousetrap"
 	dns2 "github.com/miekg/dns"
 	"github.com/minio/cli"
+	consoleoauth2 "github.com/minio/console/pkg/auth/idp/oauth2"
 	consoleCerts "github.com/minio/console/pkg/certs"
 	"github.com/minio/console/restapi"
 	"github.com/minio/console/restapi/operations"
@@ -102,6 +102,11 @@ func init() {
 		PersistOnFailure: false,
 	}
 
+	t, _ := minioVersionToReleaseTime(Version)
+	if !t.IsZero() {
+		globalVersionUnix = uint64(t.Unix())
+	}
+
 	globalIsCICD = env.Get("MINIO_CI_CD", "") != "" || env.Get("CI", "") != ""
 
 	containers := IsKubernetes() || IsDocker() || IsBOSH() || IsDCOS() || IsPCFTile()
@@ -129,7 +134,7 @@ func init() {
 
 	globalForwarder = handlers.NewForwarder(&handlers.Forwarder{
 		PassHost:     true,
-		RoundTripper: newGatewayHTTPTransport(1 * time.Hour),
+		RoundTripper: newHTTPTransport(1 * time.Hour),
 		Logger: func(err error) {
 			if err != nil && !errors.Is(err, context.Canceled) {
 				logger.LogIf(GlobalContext, err)
@@ -146,7 +151,7 @@ func init() {
 	defaultAWSCredProvider = []credentials.Provider{
 		&credentials.IAM{
 			Client: &http.Client{
-				Transport: NewGatewayHTTPTransport(),
+				Transport: NewHTTPTransport(),
 			},
 		},
 	}
@@ -170,7 +175,9 @@ func minioConfigToConsoleFeatures() {
 	if globalMinioEndpoint != "" {
 		os.Setenv("CONSOLE_MINIO_SERVER", globalMinioEndpoint)
 	} else {
-		os.Setenv("CONSOLE_MINIO_SERVER", getAPIEndpoints()[0])
+		// Explicitly set 127.0.0.1 so Console will automatically bypass TLS verification to the local S3 API.
+		// This will save users from providing a certificate with IP or FQDN SAN that points to the local host.
+		os.Setenv("CONSOLE_MINIO_SERVER", fmt.Sprintf("%s://127.0.0.1:%s", getURLScheme(globalIsTLS), globalMinioPort))
 	}
 	if value := env.Get("MINIO_LOG_QUERY_URL", ""); value != "" {
 		os.Setenv("CONSOLE_LOG_QUERY_URL", value)
@@ -197,42 +204,37 @@ func minioConfigToConsoleFeatures() {
 		}
 	}
 	// Enable if LDAP is enabled.
-	if globalLDAPConfig.Enabled {
+	if globalLDAPConfig.Enabled() {
 		os.Setenv("CONSOLE_LDAP_ENABLED", config.EnableOn)
-	}
-	// if IDP is enabled, set IDP environment variables
-	if globalOpenIDConfig.ProviderCfgs[config.Default] != nil {
-		os.Setenv("CONSOLE_IDP_URL", globalOpenIDConfig.ProviderCfgs[config.Default].URL.String())
-		os.Setenv("CONSOLE_IDP_CLIENT_ID", globalOpenIDConfig.ProviderCfgs[config.Default].ClientID)
-		os.Setenv("CONSOLE_IDP_SECRET", globalOpenIDConfig.ProviderCfgs[config.Default].ClientSecret)
-		os.Setenv("CONSOLE_IDP_HMAC_SALT", globalDeploymentID)
-		os.Setenv("CONSOLE_IDP_HMAC_PASSPHRASE", globalOpenIDConfig.ProviderCfgs[config.Default].ClientID)
-		os.Setenv("CONSOLE_IDP_SCOPES", strings.Join(globalOpenIDConfig.ProviderCfgs[config.Default].DiscoveryDoc.ScopesSupported, ","))
-		if globalOpenIDConfig.ProviderCfgs[config.Default].ClaimUserinfo {
-			os.Setenv("CONSOLE_IDP_USERINFO", config.EnableOn)
-		}
-		if globalOpenIDConfig.ProviderCfgs[config.Default].RedirectURIDynamic {
-			// Enable dynamic redirect-uri's based on incoming 'host' header,
-			// Overrides any other callback URL.
-			os.Setenv("CONSOLE_IDP_CALLBACK_DYNAMIC", config.EnableOn)
-		}
-		if globalOpenIDConfig.ProviderCfgs[config.Default].RedirectURI != "" {
-			os.Setenv("CONSOLE_IDP_CALLBACK", globalOpenIDConfig.ProviderCfgs[config.Default].RedirectURI)
-		} else {
-			os.Setenv("CONSOLE_IDP_CALLBACK", getConsoleEndpoints()[0]+"/oauth_callback")
-		}
 	}
 	os.Setenv("CONSOLE_MINIO_REGION", globalSite.Region)
 	os.Setenv("CONSOLE_CERT_PASSWD", env.Get("MINIO_CERT_PASSWD", ""))
-	if globalSubnetConfig.License != "" {
-		os.Setenv("CONSOLE_SUBNET_LICENSE", globalSubnetConfig.License)
+
+	globalSubnetConfig.ApplyEnv()
+}
+
+func buildOpenIDConsoleConfig() consoleoauth2.OpenIDPCfg {
+	m := make(map[string]consoleoauth2.ProviderConfig, len(globalOpenIDConfig.ProviderCfgs))
+	for name, cfg := range globalOpenIDConfig.ProviderCfgs {
+		callback := getConsoleEndpoints()[0] + "/oauth_callback"
+		if cfg.RedirectURI != "" {
+			callback = cfg.RedirectURI
+		}
+		m[name] = consoleoauth2.ProviderConfig{
+			URL:                     cfg.URL.String(),
+			DisplayName:             cfg.DisplayName,
+			ClientID:                cfg.ClientID,
+			ClientSecret:            cfg.ClientSecret,
+			HMACSalt:                globalDeploymentID,
+			HMACPassphrase:          cfg.ClientID,
+			Scopes:                  strings.Join(cfg.DiscoveryDoc.ScopesSupported, ","),
+			Userinfo:                cfg.ClaimUserinfo,
+			RedirectCallbackDynamic: cfg.RedirectURIDynamic,
+			RedirectCallback:        callback,
+			RoleArn:                 cfg.GetRoleArn(),
+		}
 	}
-	if globalSubnetConfig.APIKey != "" {
-		os.Setenv("CONSOLE_SUBNET_API_KEY", globalSubnetConfig.APIKey)
-	}
-	if globalSubnetConfig.ProxyURL != nil {
-		os.Setenv("CONSOLE_SUBNET_PROXY", globalSubnetConfig.ProxyURL.String())
-	}
+	return m
 }
 
 func initConsoleServer() (*restapi.Server, error) {
@@ -268,6 +270,12 @@ func initConsoleServer() (*restapi.Server, error) {
 		api.Logger = noLog
 	}
 
+	// Pass in console application config. This needs to happen before the
+	// ConfigureAPI() call.
+	restapi.GlobalMinIOConfig = restapi.MinIOConfig{
+		OpenIDProviders: buildOpenIDConsoleConfig(),
+	}
+
 	server := restapi.NewServer(api)
 	// register all APIs
 	server.ConfigureAPI()
@@ -291,22 +299,6 @@ func initConsoleServer() (*restapi.Server, error) {
 	}
 
 	return server, nil
-}
-
-func verifyObjectLayerFeatures(name string, objAPI ObjectLayer) {
-	if strings.HasPrefix(name, "gateway") {
-		if GlobalGatewaySSE.IsSet() && GlobalKMS == nil {
-			uiErr := config.ErrInvalidGWSSEEnvValue(nil).Msg("MINIO_GATEWAY_SSE set but KMS is not configured")
-			logger.Fatal(uiErr, "Unable to start gateway with SSE")
-		}
-	}
-
-	globalCompressConfigMu.Lock()
-	if globalCompressConfig.Enabled && !objAPI.IsCompressionSupported() {
-		logger.Fatal(errInvalidArgument,
-			"Compression support is requested but '%s' does not support compression", name)
-	}
-	globalCompressConfigMu.Unlock()
 }
 
 // Check for updates and print a notification message
@@ -425,7 +417,6 @@ func handleCommonCmdArgs(ctx *cli.Context) {
 		if err != nil {
 			logger.FatalIf(err, "Unable to get free port for console on the host")
 		}
-		globalMinioConsolePortAuto = true
 		consoleAddr = net.JoinHostPort("", p.String())
 	}
 
@@ -496,8 +487,7 @@ func parsEnvEntry(envEntry string) (envKV, error) {
 			Skip: true,
 		}, nil
 	}
-	const envSeparator = "="
-	envTokens := strings.SplitN(strings.TrimSpace(strings.TrimPrefix(envEntry, "export")), envSeparator, 2)
+	envTokens := strings.SplitN(strings.TrimSpace(strings.TrimPrefix(envEntry, "export")), config.EnvSeparator, 2)
 	if len(envTokens) != 2 {
 		return envKV{}, fmt.Errorf("envEntry malformed; %s, expected to be of form 'KEY=value'", envEntry)
 	}
@@ -523,7 +513,7 @@ func parsEnvEntry(envEntry string) (envKV, error) {
 // the environment values from a file, in the form "key, value".
 // in a structured form.
 func minioEnvironFromFile(envConfigFile string) ([]envKV, error) {
-	f, err := os.Open(envConfigFile)
+	f, err := Open(envConfigFile)
 	if err != nil {
 		return nil, err
 	}
@@ -553,7 +543,7 @@ func readFromSecret(sp string) (string, error) {
 	if isFile(pathJoin("/run/secrets/", sp)) {
 		sp = pathJoin("/run/secrets/", sp)
 	}
-	credBuf, err := ioutil.ReadFile(sp)
+	credBuf, err := os.ReadFile(sp)
 	if err != nil {
 		if os.IsNotExist(err) { // ignore if file doesn't exist.
 			return "", nil
@@ -818,43 +808,56 @@ func handleKMSConfig() {
 				endpoints = append(endpoints, strings.Join(lbls, ""))
 			}
 		}
-		// Manually load the certificate and private key into memory.
-		// We need to check whether the private key is encrypted, and
-		// if so, decrypt it using the user-provided password.
-		certBytes, err := os.ReadFile(env.Get(config.EnvKESClientCert, ""))
-		if err != nil {
-			logger.Fatal(err, "Unable to load KES client certificate as specified by the shell environment")
-		}
-		keyBytes, err := os.ReadFile(env.Get(config.EnvKESClientKey, ""))
-		if err != nil {
-			logger.Fatal(err, "Unable to load KES client private key as specified by the shell environment")
-		}
-		privateKeyPEM, rest := pem.Decode(bytes.TrimSpace(keyBytes))
-		if len(rest) != 0 {
-			logger.Fatal(errors.New("private key contains additional data"), "Unable to load KES client private key as specified by the shell environment")
-		}
-		if x509.IsEncryptedPEMBlock(privateKeyPEM) {
-			keyBytes, err = x509.DecryptPEMBlock(privateKeyPEM, []byte(env.Get(config.EnvKESClientPassword, "")))
-			if err != nil {
-				logger.Fatal(err, "Unable to decrypt KES client private key as specified by the shell environment")
-			}
-			keyBytes = pem.EncodeToMemory(&pem.Block{Type: privateKeyPEM.Type, Bytes: keyBytes})
-		}
-		certificate, err := tls.X509KeyPair(certBytes, keyBytes)
-		if err != nil {
-			logger.Fatal(err, "Unable to load KES client certificate as specified by the shell environment")
-		}
 		rootCAs, err := certs.GetRootCAs(env.Get(config.EnvKESServerCA, globalCertsCADir.Get()))
 		if err != nil {
 			logger.Fatal(err, fmt.Sprintf("Unable to load X.509 root CAs for KES from %q", env.Get(config.EnvKESServerCA, globalCertsCADir.Get())))
 		}
 
+		loadX509KeyPair := func(certFile, keyFile string) (tls.Certificate, error) {
+			// Manually load the certificate and private key into memory.
+			// We need to check whether the private key is encrypted, and
+			// if so, decrypt it using the user-provided password.
+			certBytes, err := os.ReadFile(certFile)
+			if err != nil {
+				return tls.Certificate{}, fmt.Errorf("Unable to load KES client certificate as specified by the shell environment: %v", err)
+			}
+			keyBytes, err := os.ReadFile(keyFile)
+			if err != nil {
+				return tls.Certificate{}, fmt.Errorf("Unable to load KES client private key as specified by the shell environment: %v", err)
+			}
+			privateKeyPEM, rest := pem.Decode(bytes.TrimSpace(keyBytes))
+			if len(rest) != 0 {
+				return tls.Certificate{}, errors.New("Unable to load KES client private key as specified by the shell environment: private key contains additional data")
+			}
+			if x509.IsEncryptedPEMBlock(privateKeyPEM) {
+				keyBytes, err = x509.DecryptPEMBlock(privateKeyPEM, []byte(env.Get(config.EnvKESClientPassword, "")))
+				if err != nil {
+					return tls.Certificate{}, fmt.Errorf("Unable to decrypt KES client private key as specified by the shell environment: %v", err)
+				}
+				keyBytes = pem.EncodeToMemory(&pem.Block{Type: privateKeyPEM.Type, Bytes: keyBytes})
+			}
+			certificate, err := tls.X509KeyPair(certBytes, keyBytes)
+			if err != nil {
+				return tls.Certificate{}, fmt.Errorf("Unable to load KES client certificate as specified by the shell environment: %v", err)
+			}
+			return certificate, nil
+		}
+
+		reloadCertEvents := make(chan tls.Certificate, 1)
+		certificate, err := certs.NewCertificate(env.Get(config.EnvKESClientCert, ""), env.Get(config.EnvKESClientKey, ""), loadX509KeyPair)
+		if err != nil {
+			logger.Fatal(err, "Failed to load KES client certificate")
+		}
+		certificate.Watch(context.Background(), 15*time.Minute, syscall.SIGHUP)
+		certificate.Notify(reloadCertEvents)
+
 		defaultKeyID := env.Get(config.EnvKESKeyName, "")
 		KMS, err := kms.NewWithConfig(kms.Config{
-			Endpoints:    endpoints,
-			DefaultKeyID: defaultKeyID,
-			Certificate:  certificate,
-			RootCAs:      rootCAs,
+			Endpoints:        endpoints,
+			DefaultKeyID:     defaultKeyID,
+			Certificate:      certificate,
+			ReloadCertEvents: reloadCertEvents,
+			RootCAs:          rootCAs,
 		})
 		if err != nil {
 			logger.Fatal(err, "Unable to initialize a connection to KES as specified by the shell environment")
@@ -864,7 +867,7 @@ func handleKMSConfig() {
 		// This implicitly checks that we can communicate to KES. We don't treat
 		// a policy error as failure condition since MinIO may not have the permission
 		// to create keys - just to generate/decrypt data encryption keys.
-		if err = KMS.CreateKey(defaultKeyID); err != nil && !errors.Is(err, kes.ErrKeyExists) && !errors.Is(err, kes.ErrNotAllowed) {
+		if err = KMS.CreateKey(context.Background(), defaultKeyID); err != nil && !errors.Is(err, kes.ErrKeyExists) && !errors.Is(err, kes.ErrNotAllowed) {
 			logger.Fatal(err, "Unable to initialize a connection to KES as specified by the shell environment")
 		}
 		GlobalKMS = KMS
@@ -904,7 +907,7 @@ func getTLSConfig() (x509Certs []*x509.Certificate, manager *certs.Manager, secu
 	// Therefore, we read all filenames in the cert directory and check
 	// for each directory whether it contains a public.crt and private.key.
 	// If so, we try to add it to certificate manager.
-	root, err := os.Open(globalCertsDir.Get())
+	root, err := Open(globalCertsDir.Get())
 	if err != nil {
 		return nil, nil, false, err
 	}
@@ -923,7 +926,7 @@ func getTLSConfig() (x509Certs []*x509.Certificate, manager *certs.Manager, secu
 			continue
 		}
 		if file.Mode()&os.ModeSymlink == os.ModeSymlink {
-			file, err = os.Stat(filepath.Join(root.Name(), file.Name()))
+			file, err = Stat(filepath.Join(root.Name(), file.Name()))
 			if err != nil {
 				// not accessible ignore
 				continue

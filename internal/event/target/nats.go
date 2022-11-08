@@ -23,11 +23,13 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
 
 	"github.com/minio/minio/internal/event"
+	"github.com/minio/minio/internal/logger"
 	xnet "github.com/minio/pkg/net"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/stan.go"
@@ -49,11 +51,14 @@ const (
 	NATSClientCert    = "client_cert"
 	NATSClientKey     = "client_key"
 
-	// Streaming constants
+	// Streaming constants - deprecated
 	NATSStreaming                   = "streaming"
 	NATSStreamingClusterID          = "streaming_cluster_id"
 	NATSStreamingAsync              = "streaming_async"
 	NATSStreamingMaxPubAcksInFlight = "streaming_max_pub_acks_in_flight"
+
+	// JetStream constants
+	NATSJetStream = "jetstream"
 
 	EnvNATSEnable        = "MINIO_NOTIFY_NATS_ENABLE"
 	EnvNATSAddress       = "MINIO_NOTIFY_NATS_ADDRESS"
@@ -70,11 +75,14 @@ const (
 	EnvNATSClientCert    = "MINIO_NOTIFY_NATS_CLIENT_CERT"
 	EnvNATSClientKey     = "MINIO_NOTIFY_NATS_CLIENT_KEY"
 
-	// Streaming constants
+	// Streaming constants - deprecated
 	EnvNATSStreaming                   = "MINIO_NOTIFY_NATS_STREAMING"
 	EnvNATSStreamingClusterID          = "MINIO_NOTIFY_NATS_STREAMING_CLUSTER_ID"
 	EnvNATSStreamingAsync              = "MINIO_NOTIFY_NATS_STREAMING_ASYNC"
 	EnvNATSStreamingMaxPubAcksInFlight = "MINIO_NOTIFY_NATS_STREAMING_MAX_PUB_ACKS_IN_FLIGHT"
+
+	// Jetstream constants
+	EnvNATSJetStream = "MINIO_NOTIFY_NATS_JETSTREAM"
 )
 
 // NATSArgs - NATS target arguments.
@@ -94,7 +102,10 @@ type NATSArgs struct {
 	PingInterval  int64     `json:"pingInterval"`
 	QueueDir      string    `json:"queueDir"`
 	QueueLimit    uint64    `json:"queueLimit"`
-	Streaming     struct {
+	JetStream     struct {
+		Enable bool `json:"enable"`
+	} `json:"jetStream"`
+	Streaming struct {
 		Enable             bool   `json:"enable"`
 		ClusterID          string `json:"clusterID"`
 		Async              bool   `json:"async"`
@@ -129,6 +140,12 @@ func (n NATSArgs) Validate() error {
 	if n.Streaming.Enable {
 		if n.Streaming.ClusterID == "" {
 			return errors.New("empty cluster id")
+		}
+	}
+
+	if n.JetStream.Enable {
+		if n.Subject == "" {
+			return errors.New("empty subject")
 		}
 	}
 
@@ -196,12 +213,16 @@ func (n NATSArgs) connectStan() (stan.Conn, error) {
 
 // NATSTarget - NATS target.
 type NATSTarget struct {
+	lazyInit lazyInit
+
 	id         event.TargetID
 	args       NATSArgs
 	natsConn   *nats.Conn
 	stanConn   stan.Conn
+	jstream    nats.JetStream
 	store      Store
-	loggerOnce func(ctx context.Context, err error, id interface{}, errKind ...interface{})
+	loggerOnce logger.LogOnce
+	quitCh     chan struct{}
 }
 
 // ID - returns target ID.
@@ -209,13 +230,15 @@ func (target *NATSTarget) ID() event.TargetID {
 	return target.id
 }
 
-// HasQueueStore - Checks if the queueStore has been configured for the target
-func (target *NATSTarget) HasQueueStore() bool {
-	return target.store != nil
-}
-
 // IsActive - Return true if target is up and active
 func (target *NATSTarget) IsActive() (bool, error) {
+	if err := target.init(); err != nil {
+		return false, err
+	}
+	return target.isActive()
+}
+
+func (target *NATSTarget) isActive() (bool, error) {
 	var connErr error
 	if target.args.Streaming.Enable {
 		if target.stanConn == nil || target.stanConn.NatsConn() == nil {
@@ -238,15 +261,29 @@ func (target *NATSTarget) IsActive() (bool, error) {
 		return false, connErr
 	}
 
+	if target.natsConn != nil && target.args.JetStream.Enable {
+		target.jstream, connErr = target.natsConn.JetStream()
+		if connErr != nil {
+			if connErr.Error() == nats.ErrNoServers.Error() {
+				return false, errNotConnected
+			}
+			return false, connErr
+		}
+	}
+
 	return true, nil
 }
 
 // Save - saves the events to the store which will be replayed when the Nats connection is active.
 func (target *NATSTarget) Save(eventData event.Event) error {
+	if err := target.init(); err != nil {
+		return err
+	}
+
 	if target.store != nil {
 		return target.store.Put(eventData)
 	}
-	_, err := target.IsActive()
+	_, err := target.isActive()
 	if err != nil {
 		return err
 	}
@@ -273,14 +310,22 @@ func (target *NATSTarget) send(eventData event.Event) error {
 			err = target.stanConn.Publish(target.args.Subject, data)
 		}
 	} else {
-		err = target.natsConn.Publish(target.args.Subject, data)
+		if target.jstream != nil {
+			_, err = target.jstream.Publish(target.args.Subject, data)
+		} else {
+			err = target.natsConn.Publish(target.args.Subject, data)
+		}
 	}
 	return err
 }
 
 // Send - sends event to Nats.
 func (target *NATSTarget) Send(eventKey string) error {
-	_, err := target.IsActive()
+	if err := target.init(); err != nil {
+		return err
+	}
+
+	_, err := target.isActive()
 	if err != nil {
 		return err
 	}
@@ -304,66 +349,91 @@ func (target *NATSTarget) Send(eventKey string) error {
 
 // Close - closes underneath connections to NATS server.
 func (target *NATSTarget) Close() (err error) {
+	close(target.quitCh)
 	if target.stanConn != nil {
 		// closing the streaming connection does not close the provided NATS connection.
 		if target.stanConn.NatsConn() != nil {
 			target.stanConn.NatsConn().Close()
 		}
-		err = target.stanConn.Close()
+		return target.stanConn.Close()
 	}
 
 	if target.natsConn != nil {
 		target.natsConn.Close()
 	}
 
-	return err
+	return nil
+}
+
+func (target *NATSTarget) init() error {
+	return target.lazyInit.Do(target.initNATS)
+}
+
+func (target *NATSTarget) initNATS() error {
+	args := target.args
+
+	var err error
+	if args.Streaming.Enable {
+		target.loggerOnce(context.Background(), errors.New("NATS Streaming is deprecated please migrate to JetStream"), target.ID().String())
+		var stanConn stan.Conn
+		stanConn, err = args.connectStan()
+		target.stanConn = stanConn
+	} else {
+		var natsConn *nats.Conn
+		natsConn, err = args.connectNats()
+		target.natsConn = natsConn
+	}
+	if err != nil {
+		if err.Error() != nats.ErrNoServers.Error() {
+			target.loggerOnce(context.Background(), err, target.ID().String())
+		}
+		return err
+	}
+
+	if target.natsConn != nil && args.JetStream.Enable {
+		var jstream nats.JetStream
+		jstream, err = target.natsConn.JetStream()
+		if err != nil {
+			if err.Error() != nats.ErrNoServers.Error() {
+				target.loggerOnce(context.Background(), err, target.ID().String())
+			}
+			return err
+		}
+		target.jstream = jstream
+	}
+
+	yes, err := target.isActive()
+	if err != nil {
+		return err
+	}
+	if !yes {
+		return errNotConnected
+	}
+
+	return nil
 }
 
 // NewNATSTarget - creates new NATS target.
-func NewNATSTarget(id string, args NATSArgs, doneCh <-chan struct{}, loggerOnce func(ctx context.Context, err error, id interface{}, kind ...interface{}), test bool) (*NATSTarget, error) {
-	var natsConn *nats.Conn
-	var stanConn stan.Conn
-
-	var err error
-
+func NewNATSTarget(id string, args NATSArgs, loggerOnce logger.LogOnce) (*NATSTarget, error) {
 	var store Store
+	if args.QueueDir != "" {
+		queueDir := filepath.Join(args.QueueDir, storePrefix+"-nats-"+id)
+		store = NewQueueStore(queueDir, args.QueueLimit)
+		if err := store.Open(); err != nil {
+			return nil, fmt.Errorf("unable to initialize the queue store of NATS `%s`: %w", id, err)
+		}
+	}
 
 	target := &NATSTarget{
 		id:         event.TargetID{ID: id, Name: "nats"},
 		args:       args,
 		loggerOnce: loggerOnce,
+		store:      store,
+		quitCh:     make(chan struct{}),
 	}
 
-	if args.QueueDir != "" {
-		queueDir := filepath.Join(args.QueueDir, storePrefix+"-nats-"+id)
-		store = NewQueueStore(queueDir, args.QueueLimit)
-		if oErr := store.Open(); oErr != nil {
-			target.loggerOnce(context.Background(), oErr, target.ID())
-			return target, oErr
-		}
-		target.store = store
-	}
-
-	if args.Streaming.Enable {
-		stanConn, err = args.connectStan()
-		target.stanConn = stanConn
-	} else {
-		natsConn, err = args.connectNats()
-		target.natsConn = natsConn
-	}
-
-	if err != nil {
-		if store == nil || err.Error() != nats.ErrNoServers.Error() {
-			target.loggerOnce(context.Background(), err, target.ID())
-			return target, err
-		}
-	}
-
-	if target.store != nil && !test {
-		// Replays the events from the store.
-		eventKeyCh := replayEvents(target.store, doneCh, target.loggerOnce, target.ID())
-		// Start replaying events from the store.
-		go sendEvents(target, eventKeyCh, doneCh, target.loggerOnce)
+	if target.store != nil {
+		streamEventsFromStore(target.store, target, target.quitCh, target.loggerOnce)
 	}
 
 	return target, nil

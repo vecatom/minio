@@ -26,7 +26,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os/user"
 	"path"
@@ -49,7 +48,7 @@ import (
 	xnet "github.com/minio/pkg/net"
 )
 
-var errDiskStale = errors.New("disk stale")
+var errDiskStale = errors.New("drive stale")
 
 // To abstract a disk over network.
 type storageRESTServer struct {
@@ -652,8 +651,15 @@ func (s *storageRESTServer) DeleteFileHandler(w http.ResponseWriter, r *http.Req
 		s.writeErrorResponse(w, err)
 		return
 	}
-
-	err = s.storage.Delete(r.Context(), volume, filePath, recursive)
+	force, err := strconv.ParseBool(r.Form.Get(storageRESTForceDelete))
+	if err != nil {
+		s.writeErrorResponse(w, err)
+		return
+	}
+	err = s.storage.Delete(r.Context(), volume, filePath, DeleteOptions{
+		Recursive: recursive,
+		Force:     force,
+	})
 	if err != nil {
 		s.writeErrorResponse(w, err)
 	}
@@ -703,6 +709,12 @@ func (s *storageRESTServer) DeleteVersionsHandler(w http.ResponseWriter, r *http
 	encoder.Encode(dErrsResp)
 }
 
+// RenameDataResp - RenameData()'s response.
+type RenameDataResp struct {
+	Signature uint64
+	Err       error
+}
+
 // RenameDataHandler - renames a meta object and data dir to destination.
 func (s *storageRESTServer) RenameDataHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.IsValid(w, r) {
@@ -725,10 +737,20 @@ func (s *storageRESTServer) RenameDataHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	err := s.storage.RenameData(r.Context(), srcVolume, srcFilePath, fi, dstVolume, dstFilePath)
-	if err != nil {
-		s.writeErrorResponse(w, err)
+	setEventStreamHeaders(w)
+	encoder := gob.NewEncoder(w)
+	done := keepHTTPResponseAlive(w)
+
+	sign, err := s.storage.RenameData(r.Context(), srcVolume, srcFilePath, fi, dstVolume, dstFilePath)
+	done(nil)
+
+	resp := &RenameDataResp{
+		Signature: sign,
 	}
+	if err != nil {
+		resp.Err = StorageErr(err.Error())
+	}
+	encoder.Encode(resp)
 }
 
 // RenameFileHandler - rename a file.
@@ -920,7 +942,7 @@ func waitForHTTPResponse(respBody io.Reader) (io.Reader, error) {
 		case 0:
 			return reader, nil
 		case 1:
-			errorText, err := ioutil.ReadAll(reader)
+			errorText, err := io.ReadAll(reader)
 			if err != nil {
 				return nil, err
 			}
@@ -940,7 +962,7 @@ type httpStreamResponse struct {
 	err   error
 }
 
-// Write part of the the streaming response.
+// Write part of the streaming response.
 // Note that upstream errors are currently not forwarded, but may be in the future.
 func (h *httpStreamResponse) Write(b []byte) (int, error) {
 	if len(b) == 0 || h.err != nil {
@@ -1030,6 +1052,13 @@ var poolBuf8k = sync.Pool{
 	},
 }
 
+var poolBuf128k = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 128<<10)
+		return b
+	},
+}
+
 // waitForHTTPStream will wait for responses where
 // streamHTTPResponse has been used.
 // The returned reader contains the payload and must be closed if no error is returned.
@@ -1054,7 +1083,7 @@ func waitForHTTPStream(respBody io.ReadCloser, w io.Writer) error {
 			}
 			return err
 		case 1:
-			errorText, err := ioutil.ReadAll(respBody)
+			errorText, err := io.ReadAll(respBody)
 			if err != nil {
 				return err
 			}
@@ -1164,17 +1193,17 @@ func logFatalErrs(err error, endpoint Endpoint, exit bool) {
 	case errors.Is(err, errUnsupportedDisk):
 		var hint string
 		if endpoint.URL != nil {
-			hint = fmt.Sprintf("Disk '%s' does not support O_DIRECT flags, MinIO erasure coding requires filesystems with O_DIRECT support", endpoint.Path)
+			hint = fmt.Sprintf("Drive '%s' does not support O_DIRECT flags, MinIO erasure coding requires filesystems with O_DIRECT support", endpoint.Path)
 		} else {
-			hint = "Disks do not support O_DIRECT flags, MinIO erasure coding requires filesystems with O_DIRECT support"
+			hint = "Drives do not support O_DIRECT flags, MinIO erasure coding requires filesystems with O_DIRECT support"
 		}
 		logger.Fatal(config.ErrUnsupportedBackend(err).Hint(hint), "Unable to initialize backend")
 	case errors.Is(err, errDiskNotDir):
 		var hint string
 		if endpoint.URL != nil {
-			hint = fmt.Sprintf("Disk '%s' is not a directory, MinIO erasure coding needs a directory", endpoint.Path)
+			hint = fmt.Sprintf("Drive '%s' is not a directory, MinIO erasure coding needs a directory", endpoint.Path)
 		} else {
-			hint = "Disks are not directories, MinIO erasure coding needs directories"
+			hint = "Drives are not directories, MinIO erasure coding needs directories"
 		}
 		logger.Fatal(config.ErrUnableToWriteInBackend(err).Hint(hint), "Unable to initialize backend")
 	case errors.Is(err, errDiskAccessDenied):
@@ -1193,25 +1222,25 @@ func logFatalErrs(err error, endpoint Endpoint, exit bool) {
 			hint = fmt.Sprintf("Run the following command to add write permissions: `sudo chown -R %s. <path> && sudo chmod u+rxw <path>`", username)
 		}
 		if !exit {
-			logger.LogIf(GlobalContext, fmt.Errorf("disk is not writable %s, %s", endpoint, hint))
+			logger.LogIf(GlobalContext, fmt.Errorf("Drive is not writable %s, %s", endpoint, hint))
 		} else {
 			logger.Fatal(config.ErrUnableToWriteInBackend(err).Hint(hint), "Unable to initialize backend")
 		}
 	case errors.Is(err, errFaultyDisk):
 		if !exit {
-			logger.LogIf(GlobalContext, fmt.Errorf("disk is faulty at %s, please replace the drive - disk will be offline", endpoint))
+			logger.LogIf(GlobalContext, fmt.Errorf("Drive is faulty at %s, please replace the drive - drive will be offline", endpoint))
 		} else {
 			logger.Fatal(err, "Unable to initialize backend")
 		}
 	case errors.Is(err, errDiskFull):
 		if !exit {
-			logger.LogIf(GlobalContext, fmt.Errorf("disk is already full at %s, incoming I/O will fail - disk will be offline", endpoint))
+			logger.LogIf(GlobalContext, fmt.Errorf("Drive is already full at %s, incoming I/O will fail - drive will be offline", endpoint))
 		} else {
 			logger.Fatal(err, "Unable to initialize backend")
 		}
 	default:
 		if !exit {
-			logger.LogIf(GlobalContext, fmt.Errorf("disk returned an unexpected error at %s, please investigate - disk will be offline (%w)", endpoint, err))
+			logger.LogIf(GlobalContext, fmt.Errorf("Drive returned an unexpected error at %s, please investigate - drive will be offline (%w)", endpoint, err))
 		} else {
 			logger.Fatal(err, "Unable to initialize backend")
 		}
@@ -1237,6 +1266,47 @@ func (s *storageRESTServer) StatInfoFile(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+// ReadMultiple returns multiple files
+func (s *storageRESTServer) ReadMultiple(w http.ResponseWriter, r *http.Request) {
+	if !s.IsValid(w, r) {
+		return
+	}
+	rw := streamHTTPResponse(w)
+	defer func() {
+		if r := recover(); r != nil {
+			debug.PrintStack()
+			rw.CloseWithError(fmt.Errorf("panic: %v", r))
+		}
+	}()
+
+	var req ReadMultipleReq
+	mr := msgpNewReader(r.Body)
+	err := req.DecodeMsg(mr)
+	if err != nil {
+		rw.CloseWithError(err)
+		return
+	}
+
+	mw := msgp.NewWriter(rw)
+	responses := make(chan ReadMultipleResp, len(req.Files))
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for resp := range responses {
+			err := resp.EncodeMsg(mw)
+			if err != nil {
+				rw.CloseWithError(err)
+				return
+			}
+			mw.Flush()
+		}
+	}()
+	err = s.storage.ReadMultiple(r.Context(), req, responses)
+	wg.Wait()
+	rw.CloseWithError(err)
+}
+
 // registerStorageRPCRouter - register storage rpc router.
 func registerStorageRESTHandlers(router *mux.Router, endpointServerPools EndpointServerPools) {
 	storageDisks := make([][]*xlStorage, len(endpointServerPools))
@@ -1253,7 +1323,7 @@ func registerStorageRESTHandlers(router *mux.Router, endpointServerPools Endpoin
 			go func(poolIdx, setIdx int, endpoint Endpoint) {
 				defer wg.Done()
 				var err error
-				storageDisks[poolIdx][setIdx], err = newXLStorage(endpoint)
+				storageDisks[poolIdx][setIdx], err = newXLStorage(endpoint, false)
 				if err != nil {
 					// if supported errors don't fail, we proceed to
 					// printing message and moving forward.
@@ -1308,6 +1378,7 @@ func registerStorageRESTHandlers(router *mux.Router, endpointServerPools Endpoin
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodVerifyFile).HandlerFunc(httpTraceHdrs(server.VerifyFileHandler))
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodWalkDir).HandlerFunc(httpTraceHdrs(server.WalkDirHandler))
 			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodStatInfoFile).HandlerFunc(httpTraceHdrs(server.StatInfoFile))
+			subrouter.Methods(http.MethodPost).Path(storageRESTVersionPrefix + storageRESTMethodReadMultiple).HandlerFunc(httpTraceHdrs(server.ReadMultiple))
 		}
 	}
 }

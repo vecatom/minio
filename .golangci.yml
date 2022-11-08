@@ -1,6 +1,6 @@
 linters-settings:
-  golint:
-    min-confidence: 0
+  gofumpt:
+    lang-version: "1.18"
 
   misspell:
     locale: US
@@ -14,27 +14,14 @@ linters:
     - govet
     - revive
     - ineffassign
-    - gosimple
-    - deadcode
-    - structcheck
     - gomodguard
     - gofmt
-    - unused
-    - structcheck
     - unconvert
-    - varcheck
+    - unused
     - gocritic
     - gofumpt
     - tenv
     - durationcheck
-
-linters-settings:
-  gofumpt:
-    lang-version: "1.17"
-
-    # Choose whether or not to use the extra rules that are disabled
-    # by default
-    extra-rules: false
 
 issues:
   exclude-use-default: false

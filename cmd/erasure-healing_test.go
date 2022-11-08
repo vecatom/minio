@@ -230,13 +230,20 @@ func TestHealing(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer obj.Shutdown(context.Background())
+
+	// initialize the server and obtain the credentials and root.
+	// credentials are necessary to sign the HTTP request.
+	if err = newTestConfig(globalMinioDefaultRegion, obj); err != nil {
+		t.Fatalf("Unable to initialize server config. %s", err)
+	}
+
 	defer removeRoots(fsDirs)
 
 	z := obj.(*erasureServerPools)
 	er := z.serverPools[0].sets[0]
 
 	// Create "bucket"
-	err = obj.MakeBucketWithLocation(ctx, "bucket", BucketOptions{})
+	err = obj.MakeBucketWithLocation(ctx, "bucket", MakeBucketOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +366,7 @@ func TestHealingDanglingObject(t *testing.T) {
 	object := getRandomObjectName()
 	data := bytes.Repeat([]byte("a"), 128*1024)
 
-	err = objLayer.MakeBucketWithLocation(ctx, bucket, BucketOptions{})
+	err = objLayer.MakeBucketWithLocation(ctx, bucket, MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("Failed to make a bucket - %v", err)
 	}
@@ -554,21 +561,21 @@ func TestHealCorrectQuorum(t *testing.T) {
 	data := bytes.Repeat([]byte("a"), 5*1024*1024)
 	var opts ObjectOptions
 
-	err = objLayer.MakeBucketWithLocation(ctx, bucket, BucketOptions{})
+	err = objLayer.MakeBucketWithLocation(ctx, bucket, MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("Failed to make a bucket - %v", err)
 	}
 
 	// Create an object with multiple parts uploaded in decreasing
 	// part number.
-	uploadID, err := objLayer.NewMultipartUpload(ctx, bucket, object, opts)
+	res, err := objLayer.NewMultipartUpload(ctx, bucket, object, opts)
 	if err != nil {
 		t.Fatalf("Failed to create a multipart upload - %v", err)
 	}
 
 	var uploadedParts []CompletePart
 	for _, partID := range []int{2, 1} {
-		pInfo, err1 := objLayer.PutObjectPart(ctx, bucket, object, uploadID, partID, mustGetPutObjReader(t, bytes.NewReader(data), int64(len(data)), "", ""), opts)
+		pInfo, err1 := objLayer.PutObjectPart(ctx, bucket, object, res.UploadID, partID, mustGetPutObjReader(t, bytes.NewReader(data), int64(len(data)), "", ""), opts)
 		if err1 != nil {
 			t.Fatalf("Failed to upload a part - %v", err1)
 		}
@@ -578,9 +585,9 @@ func TestHealCorrectQuorum(t *testing.T) {
 		})
 	}
 
-	_, err = objLayer.CompleteMultipartUpload(ctx, bucket, object, uploadID, uploadedParts, ObjectOptions{})
+	_, err = objLayer.CompleteMultipartUpload(ctx, bucket, object, res.UploadID, uploadedParts, ObjectOptions{})
 	if err != nil {
-		t.Fatalf("Failed to complete multipart upload - %v", err)
+		t.Fatalf("Failed to complete multipart upload - got: %v", err)
 	}
 
 	cfgFile := pathJoin(bucketMetaPrefix, bucket, ".test.bin")
@@ -601,7 +608,7 @@ func TestHealCorrectQuorum(t *testing.T) {
 		erasureDisks := er.getDisks()
 
 		fileInfos, errs := readAllFileInfo(ctx, erasureDisks, bucket, object, "", false)
-		nfi, err := getLatestFileInfo(ctx, fileInfos, errs)
+		nfi, err := getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 		if errors.Is(err, errFileNotFound) {
 			continue
 		}
@@ -610,7 +617,10 @@ func TestHealCorrectQuorum(t *testing.T) {
 		}
 
 		for i := 0; i < nfi.Erasure.ParityBlocks; i++ {
-			erasureDisks[i].Delete(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), false)
+			erasureDisks[i].Delete(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), DeleteOptions{
+				Recursive: false,
+				Force:     false,
+			})
 		}
 
 		// Try healing now, it should heal the content properly.
@@ -625,7 +635,7 @@ func TestHealCorrectQuorum(t *testing.T) {
 		}
 
 		fileInfos, errs = readAllFileInfo(ctx, erasureDisks, minioMetaBucket, cfgFile, "", false)
-		nfi, err = getLatestFileInfo(ctx, fileInfos, errs)
+		nfi, err = getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 		if errors.Is(err, errFileNotFound) {
 			continue
 		}
@@ -634,7 +644,10 @@ func TestHealCorrectQuorum(t *testing.T) {
 		}
 
 		for i := 0; i < nfi.Erasure.ParityBlocks; i++ {
-			erasureDisks[i].Delete(context.Background(), minioMetaBucket, pathJoin(cfgFile, xlStorageFormatFile), false)
+			erasureDisks[i].Delete(context.Background(), minioMetaBucket, pathJoin(cfgFile, xlStorageFormatFile), DeleteOptions{
+				Recursive: false,
+				Force:     false,
+			})
 		}
 
 		// Try healing now, it should heal the content properly.
@@ -679,7 +692,7 @@ func TestHealObjectCorruptedPools(t *testing.T) {
 	data := bytes.Repeat([]byte("a"), 5*1024*1024)
 	var opts ObjectOptions
 
-	err = objLayer.MakeBucketWithLocation(ctx, bucket, BucketOptions{})
+	err = objLayer.MakeBucketWithLocation(ctx, bucket, MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("Failed to make a bucket - %v", err)
 	}
@@ -688,10 +701,11 @@ func TestHealObjectCorruptedPools(t *testing.T) {
 	z := objLayer.(*erasureServerPools)
 	set := z.serverPools[1]
 
-	uploadID, err := set.NewMultipartUpload(ctx, bucket, object, opts)
+	res, err := set.NewMultipartUpload(ctx, bucket, object, opts)
 	if err != nil {
 		t.Fatalf("Failed to create a multipart upload - %v", err)
 	}
+	uploadID := res.UploadID
 
 	var uploadedParts []CompletePart
 	for _, partID := range []int{2, 1} {
@@ -714,7 +728,10 @@ func TestHealObjectCorruptedPools(t *testing.T) {
 	er := set.sets[0]
 	erasureDisks := er.getDisks()
 	firstDisk := erasureDisks[0]
-	err = firstDisk.Delete(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), false)
+	err = firstDisk.Delete(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), DeleteOptions{
+		Recursive: false,
+		Force:     false,
+	})
 	if err != nil {
 		t.Fatalf("Failed to delete a file - %v", err)
 	}
@@ -725,7 +742,7 @@ func TestHealObjectCorruptedPools(t *testing.T) {
 	}
 
 	fileInfos, errs := readAllFileInfo(ctx, erasureDisks, bucket, object, "", false)
-	fi, err := getLatestFileInfo(ctx, fileInfos, errs)
+	fi, err := getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 	if err != nil {
 		t.Fatalf("Failed to getLatestFileInfo - %v", err)
 	}
@@ -734,7 +751,10 @@ func TestHealObjectCorruptedPools(t *testing.T) {
 		t.Errorf("Expected xl.meta file to be present but stat failed - %v", err)
 	}
 
-	err = firstDisk.Delete(context.Background(), bucket, pathJoin(object, fi.DataDir, "part.1"), false)
+	err = firstDisk.Delete(context.Background(), bucket, pathJoin(object, fi.DataDir, "part.1"), DeleteOptions{
+		Recursive: false,
+		Force:     false,
+	})
 	if err != nil {
 		t.Errorf("Failure during deleting part.1 - %v", err)
 	}
@@ -750,7 +770,7 @@ func TestHealObjectCorruptedPools(t *testing.T) {
 	}
 
 	fileInfos, errs = readAllFileInfo(ctx, erasureDisks, bucket, object, "", false)
-	nfi, err := getLatestFileInfo(ctx, fileInfos, errs)
+	nfi, err := getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 	if err != nil {
 		t.Fatalf("Failed to getLatestFileInfo - %v", err)
 	}
@@ -761,7 +781,10 @@ func TestHealObjectCorruptedPools(t *testing.T) {
 		t.Fatalf("FileInfo not equal after healing: %v != %v", fi, nfi)
 	}
 
-	err = firstDisk.Delete(context.Background(), bucket, pathJoin(object, fi.DataDir, "part.1"), false)
+	err = firstDisk.Delete(context.Background(), bucket, pathJoin(object, fi.DataDir, "part.1"), DeleteOptions{
+		Recursive: false,
+		Force:     false,
+	})
 	if err != nil {
 		t.Errorf("Failure during deleting part.1 - %v", err)
 	}
@@ -778,7 +801,7 @@ func TestHealObjectCorruptedPools(t *testing.T) {
 	}
 
 	fileInfos, errs = readAllFileInfo(ctx, erasureDisks, bucket, object, "", false)
-	nfi, err = getLatestFileInfo(ctx, fileInfos, errs)
+	nfi, err = getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 	if err != nil {
 		t.Fatalf("Failed to getLatestFileInfo - %v", err)
 	}
@@ -792,7 +815,10 @@ func TestHealObjectCorruptedPools(t *testing.T) {
 	// Test 4: checks if HealObject returns an error when xl.meta is not found
 	// in more than read quorum number of disks, to create a corrupted situation.
 	for i := 0; i <= nfi.Erasure.DataBlocks; i++ {
-		erasureDisks[i].Delete(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), false)
+		erasureDisks[i].Delete(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), DeleteOptions{
+			Recursive: false,
+			Force:     false,
+		})
 	}
 
 	// Try healing now, expect to receive errFileNotFound.
@@ -843,21 +869,21 @@ func TestHealObjectCorruptedXLMeta(t *testing.T) {
 	data := bytes.Repeat([]byte("a"), 5*1024*1024)
 	var opts ObjectOptions
 
-	err = objLayer.MakeBucketWithLocation(ctx, bucket, BucketOptions{})
+	err = objLayer.MakeBucketWithLocation(ctx, bucket, MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("Failed to make a bucket - %v", err)
 	}
 
 	// Create an object with multiple parts uploaded in decreasing
 	// part number.
-	uploadID, err := objLayer.NewMultipartUpload(ctx, bucket, object, opts)
+	res, err := objLayer.NewMultipartUpload(ctx, bucket, object, opts)
 	if err != nil {
 		t.Fatalf("Failed to create a multipart upload - %v", err)
 	}
 
 	var uploadedParts []CompletePart
 	for _, partID := range []int{2, 1} {
-		pInfo, err1 := objLayer.PutObjectPart(ctx, bucket, object, uploadID, partID, mustGetPutObjReader(t, bytes.NewReader(data), int64(len(data)), "", ""), opts)
+		pInfo, err1 := objLayer.PutObjectPart(ctx, bucket, object, res.UploadID, partID, mustGetPutObjReader(t, bytes.NewReader(data), int64(len(data)), "", ""), opts)
 		if err1 != nil {
 			t.Fatalf("Failed to upload a part - %v", err1)
 		}
@@ -867,7 +893,7 @@ func TestHealObjectCorruptedXLMeta(t *testing.T) {
 		})
 	}
 
-	_, err = objLayer.CompleteMultipartUpload(ctx, bucket, object, uploadID, uploadedParts, ObjectOptions{})
+	_, err = objLayer.CompleteMultipartUpload(ctx, bucket, object, res.UploadID, uploadedParts, ObjectOptions{})
 	if err != nil {
 		t.Fatalf("Failed to complete multipart upload - %v", err)
 	}
@@ -879,12 +905,15 @@ func TestHealObjectCorruptedXLMeta(t *testing.T) {
 
 	// Test 1: Remove the object backend files from the first disk.
 	fileInfos, errs := readAllFileInfo(ctx, erasureDisks, bucket, object, "", false)
-	fi, err := getLatestFileInfo(ctx, fileInfos, errs)
+	fi, err := getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 	if err != nil {
 		t.Fatalf("Failed to getLatestFileInfo - %v", err)
 	}
 
-	err = firstDisk.Delete(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), false)
+	err = firstDisk.Delete(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), DeleteOptions{
+		Recursive: false,
+		Force:     false,
+	})
 	if err != nil {
 		t.Fatalf("Failed to delete a file - %v", err)
 	}
@@ -899,7 +928,7 @@ func TestHealObjectCorruptedXLMeta(t *testing.T) {
 	}
 
 	fileInfos, errs = readAllFileInfo(ctx, erasureDisks, bucket, object, "", false)
-	nfi1, err := getLatestFileInfo(ctx, fileInfos, errs)
+	nfi1, err := getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 	if err != nil {
 		t.Fatalf("Failed to getLatestFileInfo - %v", err)
 	}
@@ -922,7 +951,7 @@ func TestHealObjectCorruptedXLMeta(t *testing.T) {
 	}
 
 	fileInfos, errs = readAllFileInfo(ctx, erasureDisks, bucket, object, "", false)
-	nfi2, err := getLatestFileInfo(ctx, fileInfos, errs)
+	nfi2, err := getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 	if err != nil {
 		t.Fatalf("Failed to getLatestFileInfo - %v", err)
 	}
@@ -936,7 +965,10 @@ func TestHealObjectCorruptedXLMeta(t *testing.T) {
 	// Test 3: checks if HealObject returns an error when xl.meta is not found
 	// in more than read quorum number of disks, to create a corrupted situation.
 	for i := 0; i <= nfi2.Erasure.DataBlocks; i++ {
-		erasureDisks[i].Delete(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), false)
+		erasureDisks[i].Delete(context.Background(), bucket, pathJoin(object, xlStorageFormatFile), DeleteOptions{
+			Recursive: false,
+			Force:     false,
+		})
 	}
 
 	// Try healing now, expect to receive errFileNotFound.
@@ -980,21 +1012,21 @@ func TestHealObjectCorruptedParts(t *testing.T) {
 	data := bytes.Repeat([]byte("a"), 5*1024*1024)
 	var opts ObjectOptions
 
-	err = objLayer.MakeBucketWithLocation(ctx, bucket, BucketOptions{})
+	err = objLayer.MakeBucketWithLocation(ctx, bucket, MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("Failed to make a bucket - %v", err)
 	}
 
 	// Create an object with multiple parts uploaded in decreasing
 	// part number.
-	uploadID, err := objLayer.NewMultipartUpload(ctx, bucket, object, opts)
+	res, err := objLayer.NewMultipartUpload(ctx, bucket, object, opts)
 	if err != nil {
 		t.Fatalf("Failed to create a multipart upload - %v", err)
 	}
 
 	var uploadedParts []CompletePart
 	for _, partID := range []int{2, 1} {
-		pInfo, err1 := objLayer.PutObjectPart(ctx, bucket, object, uploadID, partID, mustGetPutObjReader(t, bytes.NewReader(data), int64(len(data)), "", ""), opts)
+		pInfo, err1 := objLayer.PutObjectPart(ctx, bucket, object, res.UploadID, partID, mustGetPutObjReader(t, bytes.NewReader(data), int64(len(data)), "", ""), opts)
 		if err1 != nil {
 			t.Fatalf("Failed to upload a part - %v", err1)
 		}
@@ -1004,7 +1036,7 @@ func TestHealObjectCorruptedParts(t *testing.T) {
 		})
 	}
 
-	_, err = objLayer.CompleteMultipartUpload(ctx, bucket, object, uploadID, uploadedParts, ObjectOptions{})
+	_, err = objLayer.CompleteMultipartUpload(ctx, bucket, object, res.UploadID, uploadedParts, ObjectOptions{})
 	if err != nil {
 		t.Fatalf("Failed to complete multipart upload - %v", err)
 	}
@@ -1017,7 +1049,7 @@ func TestHealObjectCorruptedParts(t *testing.T) {
 	secondDisk := erasureDisks[1]
 
 	fileInfos, errs := readAllFileInfo(ctx, erasureDisks, bucket, object, "", false)
-	fi, err := getLatestFileInfo(ctx, fileInfos, errs)
+	fi, err := getLatestFileInfo(ctx, fileInfos, er.defaultParityCount, errs)
 	if err != nil {
 		t.Fatalf("Failed to getLatestFileInfo - %v", err)
 	}
@@ -1033,7 +1065,10 @@ func TestHealObjectCorruptedParts(t *testing.T) {
 	}
 
 	// Test 1, remove part.1
-	err = firstDisk.Delete(context.Background(), bucket, pathJoin(object, fi.DataDir, "part.1"), false)
+	err = firstDisk.Delete(context.Background(), bucket, pathJoin(object, fi.DataDir, "part.1"), DeleteOptions{
+		Recursive: false,
+		Force:     false,
+	})
 	if err != nil {
 		t.Fatalf("Failed to delete a file - %v", err)
 	}
@@ -1078,7 +1113,10 @@ func TestHealObjectCorruptedParts(t *testing.T) {
 		t.Fatalf("Failed to write a file - %v", err)
 	}
 
-	err = secondDisk.Delete(context.Background(), bucket, object, true)
+	err = secondDisk.Delete(context.Background(), bucket, object, DeleteOptions{
+		Recursive: true,
+		Force:     false,
+	})
 	if err != nil {
 		t.Fatalf("Failed to delete a file - %v", err)
 	}
@@ -1131,21 +1169,21 @@ func TestHealObjectErasure(t *testing.T) {
 	data := bytes.Repeat([]byte("a"), 5*1024*1024)
 	var opts ObjectOptions
 
-	err = obj.MakeBucketWithLocation(ctx, bucket, BucketOptions{})
+	err = obj.MakeBucketWithLocation(ctx, bucket, MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("Failed to make a bucket - %v", err)
 	}
 
 	// Create an object with multiple parts uploaded in decreasing
 	// part number.
-	uploadID, err := obj.NewMultipartUpload(ctx, bucket, object, opts)
+	res, err := obj.NewMultipartUpload(ctx, bucket, object, opts)
 	if err != nil {
 		t.Fatalf("Failed to create a multipart upload - %v", err)
 	}
 
 	var uploadedParts []CompletePart
 	for _, partID := range []int{2, 1} {
-		pInfo, err1 := obj.PutObjectPart(ctx, bucket, object, uploadID, partID, mustGetPutObjReader(t, bytes.NewReader(data), int64(len(data)), "", ""), opts)
+		pInfo, err1 := obj.PutObjectPart(ctx, bucket, object, res.UploadID, partID, mustGetPutObjReader(t, bytes.NewReader(data), int64(len(data)), "", ""), opts)
 		if err1 != nil {
 			t.Fatalf("Failed to upload a part - %v", err1)
 		}
@@ -1160,13 +1198,16 @@ func TestHealObjectErasure(t *testing.T) {
 	er := z.serverPools[0].sets[0]
 	firstDisk := er.getDisks()[0]
 
-	_, err = obj.CompleteMultipartUpload(ctx, bucket, object, uploadID, uploadedParts, ObjectOptions{})
+	_, err = obj.CompleteMultipartUpload(ctx, bucket, object, res.UploadID, uploadedParts, ObjectOptions{})
 	if err != nil {
 		t.Fatalf("Failed to complete multipart upload - %v", err)
 	}
 
 	// Delete the whole object folder
-	err = firstDisk.Delete(context.Background(), bucket, object, true)
+	err = firstDisk.Delete(context.Background(), bucket, object, DeleteOptions{
+		Recursive: true,
+		Force:     false,
+	})
 	if err != nil {
 		t.Fatalf("Failed to delete a file - %v", err)
 	}
@@ -1225,7 +1266,7 @@ func TestHealEmptyDirectoryErasure(t *testing.T) {
 	object := "empty-dir/"
 	var opts ObjectOptions
 
-	err = obj.MakeBucketWithLocation(ctx, bucket, BucketOptions{})
+	err = obj.MakeBucketWithLocation(ctx, bucket, MakeBucketOptions{})
 	if err != nil {
 		t.Fatalf("Failed to make a bucket - %v", err)
 	}
@@ -1326,7 +1367,7 @@ func TestHealLastDataShard(t *testing.T) {
 			}
 			var opts ObjectOptions
 
-			err = obj.MakeBucketWithLocation(ctx, bucket, BucketOptions{})
+			err = obj.MakeBucketWithLocation(ctx, bucket, MakeBucketOptions{})
 			if err != nil {
 				t.Fatalf("Failed to make a bucket - %v", err)
 			}

@@ -22,7 +22,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
@@ -39,7 +38,7 @@ func TestFixFormatV3(t *testing.T) {
 	}
 	endpoints := mustGetNewEndpoints(erasureDirs...)
 
-	storageDisks, errs := initStorageDisksWithErrors(endpoints)
+	storageDisks, errs := initStorageDisksWithErrors(endpoints, true)
 	for _, err := range errs {
 		if err != nil && err != errDiskNotFound {
 			t.Fatal(err)
@@ -104,11 +103,7 @@ func TestFormatErasureEmpty(t *testing.T) {
 // Tests xl format migration.
 func TestFormatErasureMigrate(t *testing.T) {
 	// Get test root.
-	rootPath, err := getTestRoot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(rootPath)
+	rootPath := t.TempDir()
 
 	m := &formatErasureV1{}
 	m.Format = formatBackendErasure
@@ -126,7 +121,7 @@ func TestFormatErasureMigrate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err = ioutil.WriteFile(pathJoin(rootPath, minioMetaBucket, formatConfigFile), b, os.FileMode(0o644)); err != nil {
+	if err = os.WriteFile(pathJoin(rootPath, minioMetaBucket, formatConfigFile), b, os.FileMode(0o644)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -144,7 +139,7 @@ func TestFormatErasureMigrate(t *testing.T) {
 		t.Fatalf("expected version: %s, got: %s", formatErasureVersionV3, migratedVersion)
 	}
 
-	b, err = ioutil.ReadFile(pathJoin(rootPath, minioMetaBucket, formatConfigFile))
+	b, err = os.ReadFile(pathJoin(rootPath, minioMetaBucket, formatConfigFile))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -153,13 +148,13 @@ func TestFormatErasureMigrate(t *testing.T) {
 		t.Fatal(err)
 	}
 	if formatV3.Erasure.This != m.Erasure.Disk {
-		t.Fatalf("expected disk uuid: %s, got: %s", m.Erasure.Disk, formatV3.Erasure.This)
+		t.Fatalf("expected drive uuid: %s, got: %s", m.Erasure.Disk, formatV3.Erasure.This)
 	}
 	if len(formatV3.Erasure.Sets) != 1 {
 		t.Fatalf("expected single set after migrating from v1 to v3, but found %d", len(formatV3.Erasure.Sets))
 	}
 	if !reflect.DeepEqual(formatV3.Erasure.Sets[0], m.Erasure.JBOD) {
-		t.Fatalf("expected disk uuid: %v, got: %v", m.Erasure.JBOD, formatV3.Erasure.Sets[0])
+		t.Fatalf("expected drive uuid: %v, got: %v", m.Erasure.JBOD, formatV3.Erasure.Sets[0])
 	}
 
 	m = &formatErasureV1{}
@@ -174,7 +169,7 @@ func TestFormatErasureMigrate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err = ioutil.WriteFile(pathJoin(rootPath, minioMetaBucket, formatConfigFile), b, os.FileMode(0o644)); err != nil {
+	if err = os.WriteFile(pathJoin(rootPath, minioMetaBucket, formatConfigFile), b, os.FileMode(0o644)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -194,7 +189,7 @@ func TestFormatErasureMigrate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err = ioutil.WriteFile(pathJoin(rootPath, minioMetaBucket, formatConfigFile), b, os.FileMode(0o644)); err != nil {
+	if err = os.WriteFile(pathJoin(rootPath, minioMetaBucket, formatConfigFile), b, os.FileMode(0o644)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -564,7 +559,7 @@ func benchmarkInitStorageDisksN(b *testing.B, nDisks int) {
 	b.RunParallel(func(pb *testing.PB) {
 		endpoints := endpoints
 		for pb.Next() {
-			initStorageDisksWithErrors(endpoints)
+			initStorageDisksWithErrors(endpoints, true)
 		}
 	})
 }

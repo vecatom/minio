@@ -18,8 +18,8 @@
 package cmd
 
 import (
-	"io/ioutil"
 	"net/http"
+	"os"
 	"runtime"
 	"strconv"
 	"sync"
@@ -41,10 +41,9 @@ type apiConfig struct {
 	listQuorum       string
 	corsAllowOrigins []string
 	// total drives per erasure set across pools.
-	totalDriveCount          int
-	replicationWorkers       int
-	replicationFailedWorkers int
-	transitionWorkers        int
+	totalDriveCount     int
+	replicationPriority string
+	transitionWorkers   int
 
 	staleUploadsExpiry          time.Duration
 	staleUploadsCleanupInterval time.Duration
@@ -56,7 +55,7 @@ type apiConfig struct {
 const cgroupLimitFile = "/sys/fs/cgroup/memory/memory.limit_in_bytes"
 
 func cgroupLimit(limitFile string) (limit uint64) {
-	buf, err := ioutil.ReadFile(limitFile)
+	buf, err := os.ReadFile(limitFile)
 	if err != nil {
 		return 9223372036854771712
 	}
@@ -116,7 +115,9 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int) {
 		//    + 2 * 10MiB (default erasure block size v1) + 2 * 1MiB (default erasure block size v2)
 		blockSize := xioutil.BlockSizeLarge + xioutil.BlockSizeSmall
 		apiRequestsMaxPerNode = int(maxMem / uint64(maxSetDrives*blockSize+int(blockSizeV1*2+blockSizeV2*2)))
-		logger.Info("Automatically configured API requests per node based on available memory on the system: %d", apiRequestsMaxPerNode)
+		if globalIsDistErasure {
+			logger.Info("Automatically configured API requests per node based on available memory on the system: %d", apiRequestsMaxPerNode)
+		}
 	} else {
 		apiRequestsMaxPerNode = cfg.RequestsMax
 		if len(globalEndpoints.Hostnames()) > 0 {
@@ -135,12 +136,11 @@ func (t *apiConfig) init(cfg api.Config, setDriveCounts []int) {
 	t.requestsDeadline = cfg.RequestsDeadline
 	t.listQuorum = cfg.ListQuorum
 	if globalReplicationPool != nil &&
-		cfg.ReplicationWorkers != t.replicationWorkers {
-		globalReplicationPool.ResizeFailedWorkers(cfg.ReplicationFailedWorkers)
-		globalReplicationPool.ResizeWorkers(cfg.ReplicationWorkers)
+		cfg.ReplicationPriority != t.replicationPriority {
+		globalReplicationPool.ResizeWorkerPriority(cfg.ReplicationPriority)
 	}
-	t.replicationFailedWorkers = cfg.ReplicationFailedWorkers
-	t.replicationWorkers = cfg.ReplicationWorkers
+	t.replicationPriority = cfg.ReplicationPriority
+
 	if globalTransitionState != nil && cfg.TransitionWorkers != t.transitionWorkers {
 		globalTransitionState.UpdateWorkers(cfg.TransitionWorkers)
 	}
@@ -287,18 +287,11 @@ func maxClients(f http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-func (t *apiConfig) getReplicationFailedWorkers() int {
+func (t *apiConfig) getReplicationPriority() string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 
-	return t.replicationFailedWorkers
-}
-
-func (t *apiConfig) getReplicationWorkers() int {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-
-	return t.replicationWorkers
+	return t.replicationPriority
 }
 
 func (t *apiConfig) getTransitionWorkers() int {

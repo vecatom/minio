@@ -26,7 +26,7 @@ import (
 	"github.com/minio/madmin-go"
 	"github.com/minio/minio-go/v7/pkg/encrypt"
 	"github.com/minio/minio-go/v7/pkg/tags"
-	"github.com/minio/pkg/bucket/policy"
+	"github.com/minio/minio/internal/hash"
 
 	"github.com/minio/minio/internal/bucket/replication"
 	xioutil "github.com/minio/minio/internal/ioutil"
@@ -50,7 +50,9 @@ type ObjectOptions struct {
 	MTime                time.Time // Is only set in POST/PUT operations
 	Expires              time.Time // Is only used in POST/PUT operations
 
-	DeleteMarker      bool                // Is only set in DELETE operations for delete marker replication
+	DeleteMarker            bool // Is only set in DELETE operations for delete marker replication
+	CheckDMReplicationReady bool // Is delete marker ready to be replicated - set only during HEAD
+
 	UserDefined       map[string]string   // only set in case of POST/PUT operations
 	PartNumber        int                 // only useful in case of GetObject/HeadObject
 	CheckPrecondFn    CheckPreconditionFn // only set during GetObject/HeadObject/CopyObjectPart preconditional valuation
@@ -59,6 +61,10 @@ type ObjectOptions struct {
 	Transition        TransitionOptions
 	Expiration        ExpirationOptions
 
+	WantChecksum *hash.Checksum // x-amz-checksum-XXX checksum sent to PutObject/ CompleteMultipartUpload.
+
+	NoDecryption                        bool      // indicates if the stream must be decrypted.
+	PreserveETag                        string    // preserves this etag during a PUT call.
 	NoLock                              bool      // indicates to lower layers if the caller is expecting to hold locks.
 	ProxyRequest                        bool      // only set for GET/HEAD in active-active replication scenario
 	ProxyHeaderSet                      bool      // only set for GET/HEAD in active-active replication scenario
@@ -73,11 +79,23 @@ type ObjectOptions struct {
 	// Use the maximum parity (N/2), used when saving server configuration files
 	MaxParity bool
 
-	// Mutate set to 'true' if the call is namespace mutation call
-	Mutate        bool
-	WalkAscending bool // return Walk results in ascending order of versions
+	// Provides a per object encryption function, allowing metadata encryption.
+	EncryptFn objectMetaEncryptFn
 
+	// SkipDecommissioned set to 'true' if the call requires skipping the pool being decommissioned.
+	// mainly set for certain WRITE operations.
+	SkipDecommissioned bool
+	// SkipRebalancing should be set to 'true' if the call should skip pools
+	// participating in a rebalance operation. Typically set for 'write' operations.
+	SkipRebalancing bool
+
+	WalkFilter      func(info FileInfo) bool // return WalkFilter returns 'true/false'
+	WalkMarker      string                   // set to skip until this object
 	PrefixEnabledFn func(prefix string) bool // function which returns true if versioning is enabled on prefix
+
+	// IndexCB will return any index created but the compression.
+	// Object must have been read at this point.
+	IndexCB func() []byte
 }
 
 // ExpirationOptions represents object options for object expiration at objectLayer.
@@ -95,18 +113,25 @@ type TransitionOptions struct {
 	ExpireRestored bool
 }
 
-// BucketOptions represents bucket options for ObjectLayer bucket operations
-type BucketOptions struct {
+// MakeBucketOptions represents bucket options for ObjectLayer bucket operations
+type MakeBucketOptions struct {
 	Location          string
 	LockEnabled       bool
 	VersioningEnabled bool
-	ForceCreate       bool // Create buckets even if they are already created.
+	ForceCreate       bool      // Create buckets even if they are already created.
+	CreatedAt         time.Time // only for site replication
 }
 
 // DeleteBucketOptions provides options for DeleteBucket calls.
 type DeleteBucketOptions struct {
-	Force      bool // Force deletion
-	NoRecreate bool // Do not recreate on delete failures
+	Force      bool             // Force deletion
+	NoRecreate bool             // Do not recreate on delete failures
+	SRDeleteOp SRBucketDeleteOp // only when site replication is enabled
+}
+
+// BucketOptions provides options for ListBuckets and GetBucketInfo call.
+type BucketOptions struct {
+	Deleted bool // true only when site replication is enabled
 }
 
 // SetReplicaStatus sets replica status and timestamp for delete operations in ObjectOptions
@@ -160,13 +185,6 @@ const (
 	writeLock
 )
 
-// BackendMetrics - represents bytes served from backend
-type BackendMetrics struct {
-	bytesReceived uint64
-	bytesSent     uint64
-	requestStats  RequestStats
-}
-
 // ObjectLayer implements primitives for object API layer.
 type ObjectLayer interface {
 	// Locking operations on object.
@@ -180,9 +198,9 @@ type ObjectLayer interface {
 	LocalStorageInfo(ctx context.Context) (StorageInfo, []error)
 
 	// Bucket operations.
-	MakeBucketWithLocation(ctx context.Context, bucket string, opts BucketOptions) error
-	GetBucketInfo(ctx context.Context, bucket string) (bucketInfo BucketInfo, err error)
-	ListBuckets(ctx context.Context) (buckets []BucketInfo, err error)
+	MakeBucketWithLocation(ctx context.Context, bucket string, opts MakeBucketOptions) error
+	GetBucketInfo(ctx context.Context, bucket string, opts BucketOptions) (bucketInfo BucketInfo, err error)
+	ListBuckets(ctx context.Context, opts BucketOptions) (buckets []BucketInfo, err error)
 	DeleteBucket(ctx context.Context, bucket string, opts DeleteBucketOptions) error
 	ListObjects(ctx context.Context, bucket, prefix, marker, delimiter string, maxKeys int) (result ListObjectsInfo, err error)
 	ListObjectsV2(ctx context.Context, bucket, prefix, continuationToken, delimiter string, maxKeys int, fetchOwner bool, startAfter string) (result ListObjectsV2Info, err error)
@@ -209,7 +227,7 @@ type ObjectLayer interface {
 
 	// Multipart operations.
 	ListMultipartUploads(ctx context.Context, bucket, prefix, keyMarker, uploadIDMarker, delimiter string, maxUploads int) (result ListMultipartsInfo, err error)
-	NewMultipartUpload(ctx context.Context, bucket, object string, opts ObjectOptions) (uploadID string, err error)
+	NewMultipartUpload(ctx context.Context, bucket, object string, opts ObjectOptions) (result *NewMultipartUploadResult, err error)
 	CopyObjectPart(ctx context.Context, srcBucket, srcObject, destBucket, destObject string, uploadID string, partID int,
 		startOffset int64, length int64, srcInfo ObjectInfo, srcOpts, dstOpts ObjectOptions) (info PartInfo, err error)
 	PutObjectPart(ctx context.Context, bucket, object, uploadID string, partID int, data *PutObjReader, opts ObjectOptions) (info PartInfo, err error)
@@ -217,11 +235,6 @@ type ObjectLayer interface {
 	ListObjectParts(ctx context.Context, bucket, object, uploadID string, partNumberMarker int, maxParts int, opts ObjectOptions) (result ListPartsInfo, err error)
 	AbortMultipartUpload(ctx context.Context, bucket, object, uploadID string, opts ObjectOptions) error
 	CompleteMultipartUpload(ctx context.Context, bucket, object, uploadID string, uploadedParts []CompletePart, opts ObjectOptions) (objInfo ObjectInfo, err error)
-
-	// Policy operations
-	SetBucketPolicy(context.Context, string, *policy.Policy) error
-	GetBucketPolicy(context.Context, string) (*policy.Policy, error)
-	DeleteBucketPolicy(context.Context, string) error
 
 	// Supported operations check
 	IsNotificationSupported() bool
@@ -236,9 +249,6 @@ type ObjectLayer interface {
 	HealBucket(ctx context.Context, bucket string, opts madmin.HealOpts) (madmin.HealResultItem, error)
 	HealObject(ctx context.Context, bucket, object, versionID string, opts madmin.HealOpts) (madmin.HealResultItem, error)
 	HealObjects(ctx context.Context, bucket, prefix string, opts madmin.HealOpts, fn HealObjectFn) error
-
-	// Backend related metrics
-	GetMetrics(ctx context.Context) (*BackendMetrics, error)
 
 	// Returns health of the backend
 	Health(ctx context.Context, opts HealthOptions) HealthResult

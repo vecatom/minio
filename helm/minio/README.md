@@ -4,7 +4,7 @@
 
 MinIO is a High Performance Object Storage released under GNU Affero General Public License v3.0. It is API compatible with Amazon S3 cloud storage service. Use MinIO to build high performance infrastructure for machine learning, analytics and application data workloads.
 
-For more detailed documentation please visit [here](https://docs.minio.io/)
+For more detailed documentation please visit [here](https://min.io/docs/minio/linux/index.html)
 
 ## Introduction
 
@@ -188,7 +188,8 @@ Description of the configuration parameters used above -
 - `buckets[].policy` - can be one of none|download|upload|public
 - `buckets[].purge` - purge if bucket exists already
 
-33# Create policies after install
+### Create policies after install
+
 Install the chart, specifying the policies you want to create after install:
 
 ```bash

@@ -50,8 +50,8 @@ func handleSignals() {
 		// send signal to various go-routines that they need to quit.
 		cancelGlobalContext()
 
-		if globalNotificationSys != nil {
-			globalNotificationSys.RemoveAllRemoteTargets()
+		if globalEventNotifier != nil {
+			globalEventNotifier.RemoveAllRemoteTargets()
 		}
 
 		if httpServer := newHTTPServerFn(); httpServer != nil {
@@ -75,12 +75,15 @@ func handleSignals() {
 
 	for {
 		select {
-		case <-globalHTTPServerErrorCh:
+		case err := <-globalHTTPServerErrorCh:
+			logger.LogIf(context.Background(), err)
 			exit(stopProcess())
 		case osSignal := <-globalOSSignalCh:
+			globalReplicationPool.SaveState(context.Background())
 			logger.Info("Exiting on signal: %s", strings.ToUpper(osSignal.String()))
 			exit(stopProcess())
 		case signal := <-globalServiceSignalCh:
+			globalReplicationPool.SaveState(context.Background())
 			switch signal {
 			case serviceRestart:
 				logger.Info("Restarting on service signal")

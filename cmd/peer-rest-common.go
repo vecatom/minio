@@ -18,7 +18,8 @@
 package cmd
 
 const (
-	peerRESTVersion       = "v22" // Add bulk GetBucketStats
+	peerRESTVersion = "v28" // Added Rebalance peer APIs
+
 	peerRESTVersionPrefix = SlashSeparator + peerRESTVersion
 	peerRESTPrefix        = minioReservedBucketPath + "/peer"
 	peerRESTPath          = peerRESTPrefix + peerRESTVersionPrefix
@@ -39,7 +40,8 @@ const (
 	peerRESTMethodLoadBucketMetadata          = "/loadbucketmetadata"
 	peerRESTMethodGetBucketStats              = "/getbucketstats"
 	peerRESTMethodGetAllBucketStats           = "/getallbucketstats"
-	peerRESTMethodServerUpdate                = "/serverupdate"
+	peerRESTMethodDownloadBinary              = "/downloadbinary"
+	peerRESTMethodCommitBinary                = "/commitbinary"
 	peerRESTMethodSignalService               = "/signalservice"
 	peerRESTMethodBackgroundHealStatus        = "/backgroundhealstatus"
 	peerRESTMethodGetLocks                    = "/getlocks"
@@ -63,13 +65,16 @@ const (
 	peerRESTMethodUpdateMetacacheListing      = "/updatemetacache"
 	peerRESTMethodGetPeerMetrics              = "/peermetrics"
 	peerRESTMethodLoadTransitionTierConfig    = "/loadtransitiontierconfig"
-	peerRESTMethodSpeedtest                   = "/speedtest"
+	peerRESTMethodSpeedTest                   = "/speedtest"
 	peerRESTMethodDriveSpeedTest              = "/drivespeedtest"
 	peerRESTMethodReloadSiteReplicationConfig = "/reloadsitereplicationconfig"
 	peerRESTMethodReloadPoolMeta              = "/reloadpoolmeta"
+	peerRESTMethodLoadRebalanceMeta           = "/loadrebalancemeta"
+	peerRESTMethodStopRebalance               = "/stoprebalance"
 	peerRESTMethodGetLastDayTierStats         = "/getlastdaytierstats"
 	peerRESTMethodDevNull                     = "/devnull"
 	peerRESTMethodNetperf                     = "/netperf"
+	peerRESTMethodMetrics                     = "/metrics"
 )
 
 const (
@@ -80,20 +85,19 @@ const (
 	peerRESTUserTemp       = "user-temp"
 	peerRESTPolicy         = "policy"
 	peerRESTUserOrGroup    = "user-or-group"
+	peerRESTUserType       = "user-type"
 	peerRESTIsGroup        = "is-group"
 	peerRESTSignal         = "signal"
 	peerRESTSubSys         = "sub-sys"
 	peerRESTProfiler       = "profiler"
-	peerRESTTraceErr       = "err"
-	peerRESTTraceInternal  = "internal"
-	peerRESTTraceStorage   = "storage"
-	peerRESTTraceS3        = "s3"
-	peerRESTTraceOS        = "os"
-	peerRESTTraceThreshold = "threshold"
 	peerRESTSize           = "size"
 	peerRESTConcurrent     = "concurrent"
 	peerRESTDuration       = "duration"
 	peerRESTStorageClass   = "storage-class"
+	peerRESTMetricsTypes   = "types"
+	peerRESTDisk           = "disk"
+	peerRESTJobID          = "job-id"
+	peerRESTStartRebalance = "start-rebalance"
 
 	peerRESTListenBucket = "bucket"
 	peerRESTListenPrefix = "prefix"

@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"sort"
 	"strconv"
@@ -30,6 +31,8 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
+	"github.com/minio/madmin-go"
+	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/hash"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/pkg/console"
@@ -53,6 +56,9 @@ type PoolDecommissionInfo struct {
 
 	// Last bucket/object decommissioned.
 	Bucket string `json:"-" msg:"bkt"`
+	// Captures prefix that is currently being
+	// decommissioned inside the 'Bucket'
+	Prefix string `json:"-" msg:"pfx"`
 	Object string `json:"-" msg:"obj"`
 
 	// Verbose information
@@ -73,17 +79,12 @@ func (pd *PoolDecommissionInfo) bucketPop(bucket string) {
 			// Clear tracker info.
 			if pd.Bucket == bucket {
 				pd.Bucket = "" // empty this out for next bucket
+				pd.Prefix = "" // empty this out for the next bucket
 				pd.Object = "" // empty this out for next object
 			}
 			return
 		}
 	}
-}
-
-func (pd *PoolDecommissionInfo) bucketsToDecommission() []string {
-	queuedBuckets := make([]string, len(pd.QueuedBuckets))
-	copy(queuedBuckets, pd.QueuedBuckets)
-	return queuedBuckets
 }
 
 func (pd *PoolDecommissionInfo) isBucketDecommissioned(bucket string) bool {
@@ -95,17 +96,18 @@ func (pd *PoolDecommissionInfo) isBucketDecommissioned(bucket string) bool {
 	return false
 }
 
-func (pd *PoolDecommissionInfo) bucketPush(bucket string) {
+func (pd *PoolDecommissionInfo) bucketPush(bucket decomBucketInfo) {
 	for _, b := range pd.QueuedBuckets {
 		if pd.isBucketDecommissioned(b) {
 			return
 		}
-		if b == bucket {
+		if b == bucket.String() {
 			return
 		}
 	}
-	pd.QueuedBuckets = append(pd.QueuedBuckets, bucket)
-	pd.Bucket = bucket
+	pd.QueuedBuckets = append(pd.QueuedBuckets, bucket.String())
+	pd.Bucket = bucket.Name
+	pd.Prefix = bucket.Prefix
 }
 
 // PoolStatus captures current pool status
@@ -183,12 +185,12 @@ func (p poolMeta) isBucketDecommissioned(idx int, bucket string) bool {
 	return p.Pools[idx].Decommission.isBucketDecommissioned(bucket)
 }
 
-func (p *poolMeta) BucketDone(idx int, bucket string) {
+func (p *poolMeta) BucketDone(idx int, bucket decomBucketInfo) {
 	if p.Pools[idx].Decommission == nil {
 		// Decommission not in progress.
 		return
 	}
-	p.Pools[idx].Decommission.bucketPop(bucket)
+	p.Pools[idx].Decommission.bucketPop(bucket.String())
 }
 
 func (p poolMeta) ResumeBucketObject(idx int) (bucket, object string) {
@@ -208,19 +210,38 @@ func (p *poolMeta) TrackCurrentBucketObject(idx int, bucket string, object strin
 	p.Pools[idx].Decommission.Object = object
 }
 
-func (p *poolMeta) PendingBuckets(idx int) []string {
+func (p *poolMeta) PendingBuckets(idx int) []decomBucketInfo {
 	if p.Pools[idx].Decommission == nil {
 		// Decommission not in progress.
 		return nil
 	}
 
-	return p.Pools[idx].Decommission.bucketsToDecommission()
+	decomBuckets := make([]decomBucketInfo, len(p.Pools[idx].Decommission.QueuedBuckets))
+	for i := range decomBuckets {
+		bucket, prefix := path2BucketObject(p.Pools[idx].Decommission.QueuedBuckets[i])
+		decomBuckets[i] = decomBucketInfo{
+			Name:   bucket,
+			Prefix: prefix,
+		}
+	}
+
+	return decomBuckets
 }
 
-func (p *poolMeta) QueueBuckets(idx int, buckets []BucketInfo) {
+//msgp:ignore decomBucketInfo
+type decomBucketInfo struct {
+	Name   string
+	Prefix string
+}
+
+func (db decomBucketInfo) String() string {
+	return pathJoin(db.Name, db.Prefix)
+}
+
+func (p *poolMeta) QueueBuckets(idx int, buckets []decomBucketInfo) {
 	// add new queued buckets
 	for _, bucket := range buckets {
-		p.Pools[idx].Decommission.bucketPush(bucket.Name)
+		p.Pools[idx].Decommission.bucketPush(bucket)
 	}
 }
 
@@ -338,7 +359,11 @@ func (p *poolMeta) validate(pools []*erasureSets) (bool, error) {
 			}
 		}
 		if !ok {
-			return false, fmt.Errorf("pool(%s) = %s is not specified, please specify on server command line", humanize.Ordinal(pi.position+1), k)
+			if globalIsErasureSD {
+				update = true
+			} else {
+				return false, fmt.Errorf("pool(%s) = %s is not specified, please specify on server command line", humanize.Ordinal(pi.position+1), k)
+			}
 		}
 	}
 
@@ -353,9 +378,13 @@ func (p *poolMeta) validate(pools []*erasureSets) (bool, error) {
 				}
 			}
 			if !ok {
-				return false, fmt.Errorf("pool(%s) = %s is not specified, please specify on server command line", humanize.Ordinal(pi.position+1), k)
+				if globalIsErasureSD {
+					update = true
+				} else {
+					return false, fmt.Errorf("pool(%s) = %s is not specified, please specify on server command line", humanize.Ordinal(pi.position+1), k)
+				}
 			}
-			if pos != pi.position {
+			if ok && pos != pi.position {
 				return false, fmt.Errorf("pool order change detected for %s, expected position is (%s) but found (%s)", k, humanize.Ordinal(pi.position+1), humanize.Ordinal(pos+1))
 			}
 		}
@@ -436,7 +465,7 @@ func (p *poolMeta) updateAfter(ctx context.Context, idx int, pools []*erasureSet
 	now := UTCNow()
 	if now.Sub(p.Pools[idx].LastUpdate) >= duration {
 		if serverDebugLog {
-			console.Debugf("decommission: persisting poolMeta on disk: threshold:%s, poolMeta:%#v\n", now.Sub(p.Pools[idx].LastUpdate), p.Pools[idx])
+			console.Debugf("decommission: persisting poolMeta on drive: threshold:%s, poolMeta:%#v\n", now.Sub(p.Pools[idx].LastUpdate), p.Pools[idx])
 		}
 		p.Pools[idx].LastUpdate = now
 		if err := p.save(ctx, pools); err != nil {
@@ -478,6 +507,15 @@ const (
 // Init() initializes pools and saves additional information about them
 // in 'pool.bin', this is eventually used for decommissioning the pool.
 func (z *erasureServerPools) Init(ctx context.Context) error {
+	// Load rebalance metadata if present
+	err := z.loadRebalanceMeta(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to load rebalance data: %w", err)
+	}
+
+	// Start rebalance routine
+	z.StartRebalance()
+
 	meta := poolMeta{}
 
 	if err := meta.load(ctx, z.serverPools[0], z.serverPools); err != nil {
@@ -505,14 +543,26 @@ func (z *erasureServerPools) Init(ctx context.Context) error {
 			}
 			if globalEndpoints[idx].Endpoints[0].IsLocal {
 				go func(pool PoolStatus) {
-					switch err := z.Decommission(ctx, pool.ID); err {
-					case nil:
-						// we already started decommission
-					case errDecommissionAlreadyRunning:
-						// A previous decommission running found restart it.
-						z.doDecommissionInRoutine(ctx, idx)
-					default:
-						logger.LogIf(ctx, fmt.Errorf("Unable to resume decommission of pool %v: %w", pool, err))
+					r := rand.New(rand.NewSource(time.Now().UnixNano()))
+					for {
+						if err := z.Decommission(ctx, pool.ID); err != nil {
+							switch err {
+							// we already started decommission
+							case errDecommissionAlreadyRunning:
+								// A previous decommission running found restart it.
+								z.doDecommissionInRoutine(ctx, idx)
+								return
+							default:
+								if configRetriableErrors(err) {
+									logger.LogIf(ctx, fmt.Errorf("Unable to resume decommission of pool %v: %w: retrying..", pool, err))
+									time.Sleep(time.Second + time.Duration(r.Float64()*float64(5*time.Second)))
+									continue
+								}
+								logger.LogIf(ctx, fmt.Errorf("Unable to resume decommission of pool %v: %w", pool, err))
+								return
+							}
+						}
+						break
 					}
 				}(pool)
 			}
@@ -540,6 +590,19 @@ func (z *erasureServerPools) Init(ctx context.Context) error {
 	return nil
 }
 
+func (z *erasureServerPools) IsDecommissionRunning() bool {
+	z.poolMetaMutex.RLock()
+	defer z.poolMetaMutex.RUnlock()
+	meta := z.poolMeta
+	for _, pool := range meta.Pools {
+		if pool.Decommission != nil {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (z *erasureServerPools) decommissionObject(ctx context.Context, bucket string, gr *GetObjectReader) (err error) {
 	objInfo := gr.ObjInfo
 
@@ -548,56 +611,82 @@ func (z *erasureServerPools) decommissionObject(ctx context.Context, bucket stri
 		auditLogDecom(ctx, "DecomCopyData", objInfo.Bucket, objInfo.Name, objInfo.VersionID, err)
 	}()
 
+	actualSize, err := objInfo.GetActualSize()
+	if err != nil {
+		return err
+	}
+
 	if objInfo.isMultipart() {
-		uploadID, err := z.NewMultipartUpload(ctx, bucket, objInfo.Name, ObjectOptions{
+		res, err := z.NewMultipartUpload(ctx, bucket, objInfo.Name, ObjectOptions{
 			VersionID:   objInfo.VersionID,
 			MTime:       objInfo.ModTime,
 			UserDefined: objInfo.UserDefined,
 		})
 		if err != nil {
-			return err
+			return fmt.Errorf("decommissionObject: NewMultipartUpload() %w", err)
 		}
-		defer z.AbortMultipartUpload(ctx, bucket, objInfo.Name, uploadID, ObjectOptions{})
+		defer z.AbortMultipartUpload(ctx, bucket, objInfo.Name, res.UploadID, ObjectOptions{})
 		parts := make([]CompletePart, len(objInfo.Parts))
 		for i, part := range objInfo.Parts {
-			hr, err := hash.NewReader(gr, part.Size, "", "", part.Size)
+			hr, err := hash.NewReader(gr, part.Size, "", "", part.ActualSize)
 			if err != nil {
-				return err
+				return fmt.Errorf("decommissionObject: hash.NewReader() %w", err)
 			}
-			pi, err := z.PutObjectPart(ctx, bucket, objInfo.Name, uploadID,
+			pi, err := z.PutObjectPart(ctx, bucket, objInfo.Name, res.UploadID,
 				part.Number,
 				NewPutObjReader(hr),
-				ObjectOptions{})
+				ObjectOptions{
+					PreserveETag: part.ETag, // Preserve original ETag to ensure same metadata.
+					IndexCB: func() []byte {
+						return part.Index // Preserve part Index to ensure decompression works.
+					},
+				})
 			if err != nil {
-				return err
+				return fmt.Errorf("decommissionObject: PutObjectPart() %w", err)
 			}
 			parts[i] = CompletePart{
-				ETag:       pi.ETag,
-				PartNumber: pi.PartNumber,
+				ETag:           pi.ETag,
+				PartNumber:     pi.PartNumber,
+				ChecksumCRC32:  pi.ChecksumCRC32,
+				ChecksumCRC32C: pi.ChecksumCRC32C,
+				ChecksumSHA256: pi.ChecksumSHA256,
+				ChecksumSHA1:   pi.ChecksumSHA1,
 			}
 		}
-		_, err = z.CompleteMultipartUpload(ctx, bucket, objInfo.Name, uploadID, parts, ObjectOptions{
+		_, err = z.CompleteMultipartUpload(ctx, bucket, objInfo.Name, res.UploadID, parts, ObjectOptions{
 			MTime: objInfo.ModTime,
 		})
+		if err != nil {
+			err = fmt.Errorf("decommissionObject: CompleteMultipartUpload() %w", err)
+		}
 		return err
 	}
-	hr, err := hash.NewReader(gr, objInfo.Size, "", "", objInfo.Size)
+
+	hr, err := hash.NewReader(gr, objInfo.Size, "", "", actualSize)
 	if err != nil {
-		return err
+		return fmt.Errorf("decommissionObject: hash.NewReader() %w", err)
 	}
 	_, err = z.PutObject(ctx,
 		bucket,
 		objInfo.Name,
 		NewPutObjReader(hr),
 		ObjectOptions{
-			VersionID:   objInfo.VersionID,
-			MTime:       objInfo.ModTime,
-			UserDefined: objInfo.UserDefined,
+			VersionID:    objInfo.VersionID,
+			MTime:        objInfo.ModTime,
+			UserDefined:  objInfo.UserDefined,
+			PreserveETag: objInfo.ETag, // Preserve original ETag to ensure same metadata.
+			IndexCB: func() []byte {
+				return objInfo.Parts[0].Index // Preserve part Index to ensure decompression works.
+			},
 		})
+	if err != nil {
+		err = fmt.Errorf("decommissionObject: PutObject() %w", err)
+	}
 	return err
 }
 
 // versionsSorter sorts FileInfo slices by version.
+//
 //msgp:ignore versionsSorter
 type versionsSorter []FileInfo
 
@@ -607,7 +696,7 @@ func (v versionsSorter) reverse() {
 	})
 }
 
-func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool *erasureSets, bName string) error {
+func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool *erasureSets, bi decomBucketInfo) error {
 	ctx = logger.SetReqInfo(ctx, &logger.ReqInfo{})
 
 	var wg sync.WaitGroup
@@ -623,12 +712,39 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 		set := set
 		disks := set.getOnlineDisks()
 		if len(disks) == 0 {
-			logger.LogIf(GlobalContext, fmt.Errorf("no online disks found for set with endpoints %s",
+			logger.LogIf(GlobalContext, fmt.Errorf("no online drives found for set with endpoints %s",
 				set.getEndpoints()))
 			continue
 		}
 
-		vc, _ := globalBucketVersioningSys.Get(bName)
+		vc, _ := globalBucketVersioningSys.Get(bi.Name)
+
+		// Check if the current bucket has a configured lifecycle policy
+		lc, _ := globalLifecycleSys.Get(bi.Name)
+
+		// Check if bucket is object locked.
+		lr, _ := globalBucketObjectLockSys.Get(bi.Name)
+
+		filterLifecycle := func(bucket, object string, fi FileInfo) bool {
+			if lc == nil {
+				return false
+			}
+			versioned := vc != nil && vc.Versioned(object)
+			objInfo := fi.ToObjectInfo(bucket, object, versioned)
+			evt := evalActionFromLifecycle(ctx, *lc, lr, objInfo)
+			switch evt.Action {
+			case lifecycle.DeleteVersionAction, lifecycle.DeleteAction:
+				globalExpiryState.enqueueByDays(objInfo, false, evt.Action == lifecycle.DeleteVersionAction)
+				// Skip this entry.
+				return true
+			case lifecycle.DeleteRestoredAction, lifecycle.DeleteRestoredVersionAction:
+				globalExpiryState.enqueueByDays(objInfo, true, evt.Action == lifecycle.DeleteRestoredVersionAction)
+				// Skip this entry.
+				return true
+			}
+			return false
+		}
+
 		decommissionEntry := func(entry metaCacheEntry) {
 			defer func() {
 				<-parallelWorkers
@@ -639,7 +755,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 				return
 			}
 
-			fivs, err := entry.fileInfoVersions(bName)
+			fivs, err := entry.fileInfoVersions(bi.Name)
 			if err != nil {
 				return
 			}
@@ -652,26 +768,40 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 			for _, version := range fivs.Versions {
 				// TODO: Skip transitioned objects for now.
 				if version.IsRemote() {
-					logger.LogIf(ctx, fmt.Errorf("found %s/%s transitioned object, transitioned object won't be decommissioned", bName, version.Name))
+					logger.LogIf(ctx, fmt.Errorf("found %s/%s transitioned object, transitioned object won't be decommissioned", bi.Name, version.Name))
 					continue
 				}
+
+				// Apply lifecycle rules on the objects that are expired.
+				if filterLifecycle(bi.Name, version.Name, version) {
+					logger.LogIf(ctx, fmt.Errorf("found %s/%s (%s) expired object based on ILM rules, skipping and scheduled for deletion", bi.Name, version.Name, version.VersionID))
+					continue
+				}
+
 				// We will skip decommissioning delete markers
 				// with single version, its as good as there
 				// is no data associated with the object.
 				if version.Deleted && len(fivs.Versions) == 1 {
-					logger.LogIf(ctx, fmt.Errorf("found %s/%s delete marked object with no other versions, skipping since there is no content left", bName, version.Name))
+					logger.LogIf(ctx, fmt.Errorf("found %s/%s delete marked object with no other versions, skipping since there is no content left", bi.Name, version.Name))
 					continue
 				}
+
 				if version.Deleted {
 					_, err := z.DeleteObject(ctx,
-						bName,
+						bi.Name,
 						version.Name,
 						ObjectOptions{
-							Versioned:         vc.PrefixEnabled(version.Name),
-							VersionID:         version.VersionID,
-							MTime:             version.ModTime,
-							DeleteReplication: version.ReplicationState,
+							Versioned:          vc.PrefixEnabled(version.Name),
+							VersionID:          version.VersionID,
+							MTime:              version.ModTime,
+							DeleteReplication:  version.ReplicationState,
+							DeleteMarker:       true, // make sure we create a delete marker
+							SkipDecommissioned: true, // make sure we skip the decommissioned pool
 						})
+					if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+						// object/version already deleted by the application, nothing to do here we move on.
+						continue
+					}
 					var failure bool
 					if err != nil {
 						logger.LogIf(ctx, err)
@@ -680,41 +810,49 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 					z.poolMetaMutex.Lock()
 					z.poolMeta.CountItem(idx, 0, failure)
 					z.poolMetaMutex.Unlock()
-					if failure {
-						break // break out on first error
+					if !failure {
+						// Success keep a count.
+						decommissionedCount++
 					}
-					decommissionedCount++
 					continue
 				}
 
-				var failure bool
+				var failure, ignore bool
 				// gr.Close() is ensured by decommissionObject().
 				for try := 0; try < 3; try++ {
 					gr, err := set.GetObjectNInfo(ctx,
-						bName,
+						bi.Name,
 						encodeDirObject(version.Name),
 						nil,
 						http.Header{},
 						noLock, // all mutations are blocked reads are safe without locks.
 						ObjectOptions{
-							VersionID: version.VersionID,
+							VersionID:    version.VersionID,
+							NoDecryption: true,
 						})
-					if isErrObjectNotFound(err) {
+					if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
 						// object deleted by the application, nothing to do here we move on.
-						return
+						ignore = true
+						break
 					}
 					if err != nil {
 						failure = true
 						logger.LogIf(ctx, err)
 						continue
 					}
-					if err = z.decommissionObject(ctx, bName, gr); err != nil {
+					stopFn := globalDecommissionMetrics.log(decomMetricDecommissionObject, idx, bi.Name, version.Name, version.VersionID)
+					if err = z.decommissionObject(ctx, bi.Name, gr); err != nil {
+						stopFn(err)
 						failure = true
 						logger.LogIf(ctx, err)
 						continue
 					}
+					stopFn(nil)
 					failure = false
 					break
+				}
+				if ignore {
+					continue
 				}
 				z.poolMetaMutex.Lock()
 				z.poolMeta.CountItem(idx, version.Size, failure)
@@ -727,20 +865,22 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 
 			// if all versions were decommissioned, then we can delete the object versions.
 			if decommissionedCount == len(fivs.Versions) {
+				stopFn := globalDecommissionMetrics.log(decomMetricDecommissionRemoveObject, idx, bi.Name, entry.name)
 				_, err := set.DeleteObject(ctx,
-					bName,
+					bi.Name,
 					encodeDirObject(entry.name),
 					ObjectOptions{
 						DeletePrefix: true, // use prefix delete to delete all versions at once.
 					},
 				)
-				auditLogDecom(ctx, "DecomDeleteObject", bName, entry.name, "", err)
+				stopFn(err)
+				auditLogDecom(ctx, "DecomDeleteObject", bi.Name, entry.name, "", err)
 				if err != nil {
 					logger.LogIf(ctx, err)
 				}
 			}
 			z.poolMetaMutex.Lock()
-			z.poolMeta.TrackCurrentBucketObject(idx, bName, entry.name)
+			z.poolMeta.TrackCurrentBucketObject(idx, bi.Name, entry.name)
 			ok, err := z.poolMeta.updateAfter(ctx, idx, z.serverPools, 30*time.Second)
 			logger.LogIf(ctx, err)
 			if ok {
@@ -753,7 +893,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 		resolver := metadataResolutionParams{
 			dirQuorum: len(disks) / 2, // make sure to capture all quorum ratios
 			objQuorum: len(disks) / 2, // make sure to capture all quorum ratios
-			bucket:    bName,
+			bucket:    bi.Name,
 		}
 
 		wg.Add(1)
@@ -761,7 +901,8 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 			defer wg.Done()
 			err := listPathRaw(ctx, listPathRawOptions{
 				disks:          disks,
-				bucket:         bName,
+				bucket:         bi.Name,
+				path:           bi.Prefix,
 				recursive:      true,
 				forwardTo:      "",
 				minDisks:       len(disks) / 2, // to capture all quorum ratios
@@ -771,7 +912,7 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 					wg.Add(1)
 					go decommissionEntry(entry)
 				},
-				partial: func(entries metaCacheEntries, nAgreed int, errs []error) {
+				partial: func(entries metaCacheEntries, _ []error) {
 					entry, ok := entries.resolve(&resolver)
 					if ok {
 						parallelWorkers <- struct{}{}
@@ -788,10 +929,51 @@ func (z *erasureServerPools) decommissionPool(ctx context.Context, idx int, pool
 	return nil
 }
 
+//msgp:ignore decomMetrics
+type decomMetrics struct{}
+
+var globalDecommissionMetrics decomMetrics
+
+//msgp:ignore decomMetric
+//go:generate stringer -type=decomMetric -trimprefix=decomMetric $GOFILE
+type decomMetric uint8
+
+const (
+	decomMetricDecommissionBucket decomMetric = iota
+	decomMetricDecommissionObject
+	decomMetricDecommissionRemoveObject
+)
+
+func decomTrace(d decomMetric, poolIdx int, startTime time.Time, duration time.Duration, path string, err error) madmin.TraceInfo {
+	var errStr string
+	if err != nil {
+		errStr = err.Error()
+	}
+	return madmin.TraceInfo{
+		TraceType: madmin.TraceDecommission,
+		Time:      startTime,
+		NodeName:  globalLocalNodeName,
+		FuncName:  fmt.Sprintf("decommission.%s (pool-id=%d)", d.String(), poolIdx),
+		Duration:  duration,
+		Path:      path,
+		Error:     errStr,
+	}
+}
+
+func (m *decomMetrics) log(d decomMetric, poolIdx int, paths ...string) func(err error) {
+	startTime := time.Now()
+	return func(err error) {
+		duration := time.Since(startTime)
+		if globalTrace.NumSubscribers(madmin.TraceDecommission) > 0 {
+			globalTrace.Publish(decomTrace(d, poolIdx, startTime, duration, strings.Join(paths, " "), err))
+		}
+	}
+}
+
 func (z *erasureServerPools) decommissionInBackground(ctx context.Context, idx int) error {
 	pool := z.serverPools[idx]
 	for _, bucket := range z.poolMeta.PendingBuckets(idx) {
-		if z.poolMeta.isBucketDecommissioned(idx, bucket) {
+		if z.poolMeta.isBucketDecommissioned(idx, bucket.String()) {
 			if serverDebugLog {
 				console.Debugln("decommission: already done, moving on", bucket)
 			}
@@ -803,11 +985,15 @@ func (z *erasureServerPools) decommissionInBackground(ctx context.Context, idx i
 			continue
 		}
 		if serverDebugLog {
-			console.Debugln("decommission: currently on bucket", bucket)
+			console.Debugln("decommission: currently on bucket", bucket.Name)
 		}
+		stopFn := globalDecommissionMetrics.log(decomMetricDecommissionBucket, idx, bucket.Name)
 		if err := z.decommissionPool(ctx, idx, pool, bucket); err != nil {
+			stopFn(err)
 			return err
 		}
+		stopFn(nil)
+
 		z.poolMetaMutex.Lock()
 		z.poolMeta.BucketDone(idx, bucket)
 		z.poolMeta.save(ctx, z.serverPools)
@@ -892,15 +1078,9 @@ func (z *erasureServerPools) getDecommissionPoolSpaceInfo(idx int) (pi poolSpace
 	if idx+1 > len(z.serverPools) {
 		return pi, errInvalidArgument
 	}
+
 	info, _ := z.serverPools[idx].StorageInfo(context.Background())
 	info.Backend = z.BackendInfo()
-	for _, disk := range info.Disks {
-		if disk.Healing {
-			return pi, decomError{
-				Err: fmt.Sprintf("%s drive is healing, decommission will not be started", disk.Endpoint),
-			}
-		}
-	}
 
 	usableTotal := int64(GetTotalUsableCapacity(info.Disks, info))
 	usableFree := int64(GetTotalUsableCapacityFree(info.Disks, info))
@@ -921,7 +1101,7 @@ func (z *erasureServerPools) Status(ctx context.Context, idx int) (PoolStatus, e
 
 	pi, err := z.getDecommissionPoolSpaceInfo(idx)
 	if err != nil {
-		return PoolStatus{}, errInvalidArgument
+		return PoolStatus{}, err
 	}
 
 	poolInfo := z.poolMeta.Pools[idx]
@@ -964,7 +1144,9 @@ func (z *erasureServerPools) DecommissionCancel(ctx context.Context, idx int) (e
 	defer z.poolMetaMutex.Unlock()
 
 	if z.poolMeta.DecommissionCancel(idx) {
-		defer z.decommissionCancelers[idx]() // cancel any active thread.
+		if fn := z.decommissionCancelers[idx]; fn != nil {
+			defer fn() // cancel any active thread.
+		}
 		if err = z.poolMeta.save(ctx, z.serverPools); err != nil {
 			return err
 		}
@@ -986,7 +1168,9 @@ func (z *erasureServerPools) DecommissionFailed(ctx context.Context, idx int) (e
 	defer z.poolMetaMutex.Unlock()
 
 	if z.poolMeta.DecommissionFailed(idx) {
-		defer z.decommissionCancelers[idx]() // cancel any active thread.
+		if fn := z.decommissionCancelers[idx]; fn != nil {
+			defer fn() // cancel any active thread.
+		}
 		if err = z.poolMeta.save(ctx, z.serverPools); err != nil {
 			return err
 		}
@@ -1008,7 +1192,9 @@ func (z *erasureServerPools) CompleteDecommission(ctx context.Context, idx int) 
 	defer z.poolMetaMutex.Unlock()
 
 	if z.poolMeta.DecommissionComplete(idx) {
-		defer z.decommissionCancelers[idx]() // cancel any active thread.
+		if fn := z.decommissionCancelers[idx]; fn != nil {
+			defer fn() // cancel any active thread.
+		}
 		if err = z.poolMeta.save(ctx, z.serverPools); err != nil {
 			return err
 		}
@@ -1026,13 +1212,27 @@ func (z *erasureServerPools) StartDecommission(ctx context.Context, idx int) (er
 		return errInvalidArgument
 	}
 
-	buckets, err := z.ListBuckets(ctx)
+	buckets, err := z.ListBuckets(ctx, BucketOptions{})
 	if err != nil {
 		return err
 	}
 
-	// TODO: Support decommissioning transition tiers.
+	// Make sure to heal the buckets to ensure the new
+	// pool has the new buckets, this is to avoid
+	// failures later.
 	for _, bucket := range buckets {
+		z.HealBucket(ctx, bucket.Name, madmin.HealOpts{})
+	}
+
+	decomBuckets := make([]decomBucketInfo, len(buckets))
+	for i := range buckets {
+		decomBuckets[i] = decomBucketInfo{
+			Name: buckets[i].Name,
+		}
+	}
+
+	// TODO: Support decommissioning transition tiers.
+	for _, bucket := range decomBuckets {
 		if lc, err := globalLifecycleSys.Get(bucket.Name); err == nil {
 			if lc.HasTransition() {
 				return decomError{
@@ -1050,7 +1250,7 @@ func (z *erasureServerPools) StartDecommission(ctx context.Context, idx int) (er
 		pathJoin(minioMetaBucket, bucketMetaPrefix),
 	} {
 		var bucketExists BucketExists
-		if err = z.MakeBucketWithLocation(ctx, metaBucket, BucketOptions{}); err != nil {
+		if err = z.MakeBucketWithLocation(ctx, metaBucket, MakeBucketOptions{}); err != nil {
 			if !errors.As(err, &bucketExists) {
 				return err
 			}
@@ -1059,11 +1259,13 @@ func (z *erasureServerPools) StartDecommission(ctx context.Context, idx int) (er
 
 	// Buckets data are dispersed in multiple zones/sets, make
 	// sure to decommission the necessary metadata.
-	buckets = append(buckets, BucketInfo{
-		Name: pathJoin(minioMetaBucket, minioConfigPrefix),
+	decomBuckets = append(decomBuckets, decomBucketInfo{
+		Name:   minioMetaBucket,
+		Prefix: minioConfigPrefix,
 	})
-	buckets = append(buckets, BucketInfo{
-		Name: pathJoin(minioMetaBucket, bucketMetaPrefix),
+	decomBuckets = append(decomBuckets, decomBucketInfo{
+		Name:   minioMetaBucket,
+		Prefix: bucketMetaPrefix,
 	})
 
 	var pool *erasureSets
@@ -1089,7 +1291,7 @@ func (z *erasureServerPools) StartDecommission(ctx context.Context, idx int) (er
 	if err = z.poolMeta.Decommission(idx, pi); err != nil {
 		return err
 	}
-	z.poolMeta.QueueBuckets(idx, buckets)
+	z.poolMeta.QueueBuckets(idx, decomBuckets)
 	if err = z.poolMeta.save(ctx, z.serverPools); err != nil {
 		return err
 	}
@@ -1102,9 +1304,11 @@ func auditLogDecom(ctx context.Context, apiName, bucket, object, versionID strin
 	if err != nil {
 		errStr = err.Error()
 	}
-	auditLogInternal(ctx, bucket, object, AuditLogOptions{
-		Trigger:   "decommissioning",
+	auditLogInternal(ctx, AuditLogOptions{
+		Event:     "decommission",
 		APIName:   apiName,
+		Bucket:    bucket,
+		Object:    object,
 		VersionID: versionID,
 		Error:     errStr,
 	})

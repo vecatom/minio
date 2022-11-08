@@ -18,6 +18,7 @@
 package cmd
 
 import (
+	"fmt"
 	"time"
 )
 
@@ -26,7 +27,7 @@ import (
 // ReplicationLatency holds information of bucket operations latency, such us uploads
 type ReplicationLatency struct {
 	// Single & Multipart PUTs latency
-	UploadHistogram LastMinuteLatencies
+	UploadHistogram LastMinuteHistogram
 }
 
 // Merge two replication latency into a new one
@@ -41,7 +42,7 @@ func (rl ReplicationLatency) getUploadLatency() (ret map[string]uint64) {
 	avg := rl.UploadHistogram.GetAvgData()
 	for k, v := range avg {
 		// Convert nanoseconds to milliseconds
-		ret[sizeTagToString(k)] = v.avg() / uint64(time.Millisecond)
+		ret[sizeTagToString(k)] = uint64(v.avg() / time.Millisecond)
 	}
 	return
 }
@@ -52,7 +53,10 @@ func (rl *ReplicationLatency) update(size int64, duration time.Duration) {
 }
 
 // BucketStatsMap captures bucket statistics for all buckets
-type BucketStatsMap map[string]BucketStats
+type BucketStatsMap struct {
+	Stats     map[string]BucketStats
+	Timestamp time.Time
+}
 
 // BucketStats bucket statistics
 type BucketStats struct {
@@ -62,7 +66,7 @@ type BucketStats struct {
 // BucketReplicationStats represents inline replication statistics
 // such as pending, failed and completed bytes in total for a bucket
 type BucketReplicationStats struct {
-	Stats map[string]*BucketReplicationStat
+	Stats map[string]*BucketReplicationStat `json:",omitempty"`
 	// Pending size in bytes
 	PendingSize int64 `json:"pendingReplicationSize"`
 	// Completed size in bytes
@@ -125,4 +129,12 @@ func (bs *BucketReplicationStat) hasReplicationUsage() bool {
 		bs.FailedCount > 0 ||
 		bs.PendingCount > 0 ||
 		bs.PendingSize > 0
+}
+
+func (brs BucketReplicationStats) String() string {
+	s := "ReplicatedSize=" + fmt.Sprintf("%d", brs.ReplicatedSize) + "+\n ReplicaSize=" + fmt.Sprintf("%d", brs.ReplicaSize)
+	for arn, st := range brs.Stats {
+		s += "\n arn: " + arn + " ReplicatedSize=" + fmt.Sprintf("%d", st.ReplicatedSize) + "  +::ReplicaSize=" + fmt.Sprintf("%d", st.ReplicaSize)
+	}
+	return s
 }

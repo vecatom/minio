@@ -22,7 +22,6 @@ import (
 	"crypto/hmac"
 	"encoding/hex"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"strconv"
 	"strings"
@@ -83,12 +82,12 @@ func skipContentSha256Cksum(r *http.Request) bool {
 // Returns SHA256 for calculating canonical-request.
 func getContentSha256Cksum(r *http.Request, stype serviceType) string {
 	if stype == serviceSTS {
-		payload, err := ioutil.ReadAll(io.LimitReader(r.Body, stsRequestBodyLimit))
+		payload, err := io.ReadAll(io.LimitReader(r.Body, stsRequestBodyLimit))
 		if err != nil {
 			logger.CriticalIf(GlobalContext, err)
 		}
 		sum256 := sha256.Sum256(payload)
-		r.Body = ioutil.NopCloser(bytes.NewReader(payload))
+		r.Body = io.NopCloser(bytes.NewReader(payload))
 		return hex.EncodeToString(sum256[:])
 	}
 
@@ -142,7 +141,7 @@ func isValidRegion(reqRegion string, confRegion string) bool {
 // check if the access key is valid and recognized, additionally
 // also returns if the access key is owner/admin.
 func checkKeyValid(r *http.Request, accessKey string) (auth.Credentials, bool, APIErrorCode) {
-	if !globalIAMSys.Initialized() && !globalIsGateway {
+	if !globalIAMSys.Initialized() {
 		// Check if server has initialized, then only proceed
 		// to check for IAM users otherwise its okay for clients
 		// to retry with 503 errors when server is coming up.
@@ -152,16 +151,16 @@ func checkKeyValid(r *http.Request, accessKey string) (auth.Credentials, bool, A
 	cred := globalActiveCred
 	if cred.AccessKey != accessKey {
 		// Check if the access key is part of users credentials.
-		ucred, ok := globalIAMSys.GetUser(r.Context(), accessKey)
+		u, ok := globalIAMSys.GetUser(r.Context(), accessKey)
 		if !ok {
 			// Credentials will be invalid but and disabled
 			// return a different error in such a scenario.
-			if ucred.Status == auth.AccountOff {
+			if u.Credentials.Status == auth.AccountOff {
 				return cred, false, ErrAccessKeyDisabled
 			}
 			return cred, false, ErrInvalidAccessKeyID
 		}
-		cred = ucred
+		cred = u.Credentials
 	}
 
 	claims, s3Err := checkClaimsFromToken(r, cred)

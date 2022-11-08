@@ -44,10 +44,17 @@ func mustGetStorageInfo(objAPI ObjectLayer) StorageInfo {
 
 // Prints the formatted startup message.
 func printStartupMessage(apiEndpoints []string, err error) {
+	logger.Info(color.Bold("MinIO Object Storage Server"))
 	if err != nil {
 		if globalConsoleSys != nil {
-			globalConsoleSys.Send(fmt.Sprintf("Server startup failed with '%v', some features may be missing", err), string(logger.All))
+			globalConsoleSys.Send(fmt.Sprintf("Server startup failed with '%v', some features may be missing", err))
 		}
+	}
+
+	if !globalSubnetConfig.Registered() {
+		var builder strings.Builder
+		startupBanner(&builder)
+		logger.Info(builder.String())
 	}
 
 	strippedAPIEndpoints := stripStandardPorts(apiEndpoints, globalMinioHost)
@@ -72,12 +79,6 @@ func printStartupMessage(apiEndpoints []string, err error) {
 
 	// Prints documentation message.
 	printObjectAPIMsg()
-
-	if globalMinioConsolePortAuto && globalBrowserEnabled {
-		msg := fmt.Sprintf("\nWARNING: Console endpoint is listening on a dynamic port (%s), please use --console-address \":PORT\" to choose a static port.",
-			globalMinioConsolePort)
-		logger.Info(color.RedBold(msg))
-	}
 }
 
 // Returns true if input is IPv6
@@ -143,7 +144,7 @@ func printServerCommonMsg(apiEndpoints []string) {
 
 	if globalBrowserEnabled {
 		consoleEndpointStr := strings.Join(stripStandardPorts(getConsoleEndpoints(), globalMinioConsoleHost), " ")
-		logger.Info(color.Blue("\nConsole: ") + color.Bold(fmt.Sprintf("%s ", consoleEndpointStr)))
+		logger.Info(color.Blue("Console: ") + color.Bold(fmt.Sprintf("%s ", consoleEndpointStr)))
 		if color.IsTerminal() && (!globalCLIContext.Anonymous && !globalCLIContext.JSON) {
 			logger.Info(color.Blue("RootUser: ") + color.Bold(fmt.Sprintf("%s ", cred.AccessKey)))
 			logger.Info(color.Blue("RootPass: ") + color.Bold(fmt.Sprintf("%s ", cred.SecretKey)))
@@ -151,9 +152,9 @@ func printServerCommonMsg(apiEndpoints []string) {
 	}
 }
 
-// Prints startup message for Object API acces, prints link to our SDK documentation.
+// Prints startup message for Object API access, prints link to our SDK documentation.
 func printObjectAPIMsg() {
-	logger.Info(color.Blue("\nDocumentation: ") + "https://docs.min.io")
+	logger.Info(color.Blue("\nDocumentation: ") + "https://min.io/docs/minio/linux/index.html")
 }
 
 // Prints bucket notification configurations.
@@ -162,7 +163,7 @@ func printEventNotifiers() {
 		return
 	}
 
-	arns := globalNotificationSys.GetARNList(true)
+	arns := globalEventNotifier.GetARNList(true)
 	if len(arns) == 0 {
 		return
 	}
@@ -181,7 +182,7 @@ func printCLIAccessMsg(endPoint string, alias string) {
 	// Get saved credentials.
 	cred := globalActiveCred
 
-	const mcQuickStartGuide = "https://docs.min.io/docs/minio-client-quickstart-guide"
+	const mcQuickStartGuide = "https://min.io/docs/minio/linux/reference/minio-mc.html#quickstart"
 
 	// Configure 'mc', following block prints platform specific information for minio client.
 	if color.IsTerminal() && !globalCLIContext.Anonymous {
@@ -205,7 +206,7 @@ func getStorageInfoMsg(storageInfo StorageInfo) string {
 	onlineDisks, offlineDisks := getOnlineOfflineDisksStats(storageInfo.Disks)
 	if storageInfo.Backend.Type == madmin.Erasure {
 		if offlineDisks.Sum() > 0 {
-			mcMessage = "Use `mc admin info` to look for latest server/disk info\n"
+			mcMessage = "Use `mc admin info` to look for latest server/drive info\n"
 		}
 
 		diskInfo := fmt.Sprintf(" %d Online, %d Offline. ", onlineDisks.Sum(), offlineDisks.Sum())

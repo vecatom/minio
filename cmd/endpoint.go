@@ -292,6 +292,19 @@ func (l EndpointServerPools) LocalDisksPaths() []string {
 	return disks
 }
 
+// NLocalDisksPathsPerPool returns the disk paths of the local disks per pool
+func (l EndpointServerPools) NLocalDisksPathsPerPool() []int {
+	localDisksCount := make([]int, len(l))
+	for i, ep := range l {
+		for _, endpoint := range ep.Endpoints {
+			if endpoint.IsLocal {
+				localDisksCount[i]++
+			}
+		}
+	}
+	return localDisksCount
+}
+
 // FirstLocal returns true if the first endpoint is local.
 func (l EndpointServerPools) FirstLocal() bool {
 	return l[0].Endpoints[0].IsLocal
@@ -302,7 +315,7 @@ func (l EndpointServerPools) HTTPS() bool {
 	return l[0].Endpoints.HTTPS()
 }
 
-// NEndpoints - returns all nodes count
+// NEndpoints - returns number of endpoints
 func (l EndpointServerPools) NEndpoints() (count int) {
 	for _, ep := range l {
 		count += len(ep.Endpoints)
@@ -689,6 +702,17 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 		}
 	}
 
+	// Add missing port in all endpoints.
+	for i := range endpoints {
+		_, port, err := net.SplitHostPort(endpoints[i].Host)
+		if err != nil {
+			endpoints[i].Host = net.JoinHostPort(endpoints[i].Host, serverAddrPort)
+		} else if endpoints[i].IsLocal && serverAddrPort != port {
+			// If endpoint is local, but port is different than serverAddrPort, then make it as remote.
+			endpoints[i].IsLocal = false
+		}
+	}
+
 	// All endpoints are pointing to local host
 	if len(endpoints) == localEndpointCount {
 		// If all endpoints have same port number, Just treat it as local erasure setup
@@ -703,17 +727,6 @@ func CreateEndpoints(serverAddr string, foundLocal bool, args ...[]string) (Endp
 
 		// Even though all endpoints are local, but those endpoints use different ports.
 		// This means it is DistErasure setup.
-	}
-
-	// Add missing port in all endpoints.
-	for i := range endpoints {
-		_, port, err := net.SplitHostPort(endpoints[i].Host)
-		if err != nil {
-			endpoints[i].Host = net.JoinHostPort(endpoints[i].Host, serverAddrPort)
-		} else if endpoints[i].IsLocal && serverAddrPort != port {
-			// If endpoint is local, but port is different than serverAddrPort, then make it as remote.
-			endpoints[i].IsLocal = false
-		}
 	}
 
 	uniqueArgs := set.NewStringSet()

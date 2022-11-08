@@ -42,7 +42,7 @@ type endpointSet struct {
 
 // Supported set sizes this is used to find the optimal
 // single set size.
-var setSizes = []uint64{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+var setSizes = []uint64{2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
 
 // getDivisibleSize - returns a greatest common divisor of
 // all the ellipses sizes.
@@ -156,7 +156,7 @@ func getSetIndexes(args []string, totalSizes []uint64, customSetDriveCount uint6
 
 	setCounts := possibleSetCounts(commonSize)
 	if len(setCounts) == 0 {
-		msg := fmt.Sprintf("Incorrect number of endpoints provided %s, number of disks %d is not divisible by any supported erasure set sizes %d", args, commonSize, setSizes)
+		msg := fmt.Sprintf("Incorrect number of endpoints provided %s, number of drives %d is not divisible by any supported erasure set sizes %d", args, commonSize, setSizes)
 		return nil, config.ErrInvalidNumberOfErasureEndpoints(nil).Msg(msg)
 	}
 
@@ -183,7 +183,7 @@ func getSetIndexes(args []string, totalSizes []uint64, customSetDriveCount uint6
 		setCounts = possibleSetCountsWithSymmetry(setCounts, argPatterns)
 
 		if len(setCounts) == 0 {
-			msg := fmt.Sprintf("No symmetric distribution detected with input endpoints provided %s, disks %d cannot be spread symmetrically by any supported erasure set sizes %d", args, commonSize, setSizes)
+			msg := fmt.Sprintf("No symmetric distribution detected with input endpoints provided %s, drives %d cannot be spread symmetrically by any supported erasure set sizes %d", args, commonSize, setSizes)
 			return nil, config.ErrInvalidNumberOfErasureEndpoints(nil).Msg(msg)
 		}
 
@@ -193,7 +193,7 @@ func getSetIndexes(args []string, totalSizes []uint64, customSetDriveCount uint6
 
 	// Check whether setSize is with the supported range.
 	if !isValidSetSize(setSize) {
-		msg := fmt.Sprintf("Incorrect number of endpoints provided %s, number of disks %d is not divisible by any supported erasure set sizes %d", args, commonSize, setSizes)
+		msg := fmt.Sprintf("Incorrect number of endpoints provided %s, number of drives %d is not divisible by any supported erasure set sizes %d", args, commonSize, setSizes)
 		return nil, config.ErrInvalidNumberOfErasureEndpoints(nil).Msg(msg)
 	}
 
@@ -343,7 +343,13 @@ func createServerEndpoints(serverAddr string, args ...string) (
 		return nil, -1, errInvalidArgument
 	}
 
-	if !ellipses.HasEllipses(args...) {
+	ok := true
+	for _, arg := range args {
+		ok = ok && !ellipses.HasEllipses(arg)
+	}
+
+	// None of the args have ellipses use the old style.
+	if ok {
 		setArgs, err := GetAllSets(args...)
 		if err != nil {
 			return nil, -1, err
@@ -365,6 +371,10 @@ func createServerEndpoints(serverAddr string, args ...string) (
 
 	var foundPrevLocal bool
 	for _, arg := range args {
+		if !ellipses.HasEllipses(arg) && len(args) > 1 {
+			// TODO: support SNSD deployments to be decommissioned in future
+			return nil, -1, fmt.Errorf("all args must have ellipses for pool expansion (%w) args: %s", errInvalidArgument, args)
+		}
 		setArgs, err := GetAllSets(arg)
 		if err != nil {
 			return nil, -1, err

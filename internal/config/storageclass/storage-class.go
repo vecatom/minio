@@ -50,10 +50,10 @@ const (
 	schemePrefix = "EC"
 
 	// Min parity disks
-	minParityDisks = 2
+	minParityDisks = 0
 
 	// Default RRS parity is always minimum parity.
-	defaultRRSParity = minParityDisks
+	defaultRRSParity = 1
 )
 
 // DefaultKVS - default storage class config
@@ -65,7 +65,7 @@ var (
 		},
 		config.KV{
 			Key:   ClassRRS,
-			Value: "EC:2",
+			Value: "EC:1",
 		},
 	}
 )
@@ -76,7 +76,7 @@ type StorageClass struct {
 }
 
 // ConfigLock is a global lock for storage-class config
-var ConfigLock = sync.RWMutex{}
+var ConfigLock sync.RWMutex
 
 // Config storage class configuration
 type Config struct {
@@ -132,12 +132,12 @@ func (sc *StorageClass) String() string {
 }
 
 // Parses given storageClassEnv and returns a storageClass structure.
-// Supported Storage Class format is "Scheme:Number of parity disks".
+// Supported Storage Class format is "Scheme:Number of parity drives".
 // Currently only supported scheme is "EC".
 func parseStorageClass(storageClassEnv string) (sc StorageClass, err error) {
 	s := strings.Split(storageClassEnv, ":")
 
-	// only two elements allowed in the string - "scheme" and "number of parity disks"
+	// only two elements allowed in the string - "scheme" and "number of parity drives"
 	if len(s) > 2 {
 		return StorageClass{}, config.ErrStorageClassValue(nil).Msg("Too many sections in " + storageClassEnv)
 	} else if len(s) < 2 {
@@ -154,7 +154,9 @@ func parseStorageClass(storageClassEnv string) (sc StorageClass, err error) {
 	if err != nil {
 		return StorageClass{}, config.ErrStorageClassValue(err)
 	}
-
+	if parityDisks < 0 {
+		return StorageClass{}, config.ErrStorageClassValue(nil).Msg("Unsupported parity value " + s[1] + " provided")
+	}
 	return StorageClass{
 		Parity: parityDisks,
 	}, nil
@@ -191,17 +193,19 @@ func validateParity(ssParity, rrsParity, setDriveCount int) (err error) {
 		return fmt.Errorf("Reduced redundancy storage class parity %d should be greater than or equal to %d", rrsParity, minParityDisks)
 	}
 
-	if ssParity > setDriveCount/2 {
-		return fmt.Errorf("Standard storage class parity %d should be less than or equal to %d", ssParity, setDriveCount/2)
-	}
+	if setDriveCount > 2 {
+		if ssParity > setDriveCount/2 {
+			return fmt.Errorf("Standard storage class parity %d should be less than or equal to %d", ssParity, setDriveCount/2)
+		}
 
-	if rrsParity > setDriveCount/2 {
-		return fmt.Errorf("Reduced redundancy storage class parity %d should be less than  or equal to %d", rrsParity, setDriveCount/2)
+		if rrsParity > setDriveCount/2 {
+			return fmt.Errorf("Reduced redundancy storage class parity %d should be less than or equal to %d", rrsParity, setDriveCount/2)
+		}
 	}
 
 	if ssParity > 0 && rrsParity > 0 {
 		if ssParity > 0 && ssParity < rrsParity {
-			return fmt.Errorf("Standard storage class parity disks %d should be greater than or equal to Reduced redundancy storage class parity disks %d", ssParity, rrsParity)
+			return fmt.Errorf("Standard storage class parity drives %d should be greater than or equal to Reduced redundancy storage class parity drives %d", ssParity, rrsParity)
 		}
 	}
 	return nil
@@ -214,19 +218,18 @@ func validateParity(ssParity, rrsParity, setDriveCount int) (err error) {
 //
 // -- if input storage class is empty then standard is assumed
 // -- if input is RRS but RRS is not configured default '2' parity
-//    for RRS is assumed
+//
+//	for RRS is assumed
+//
 // -- if input is STANDARD but STANDARD is not configured '0' parity
-//    is returned, the caller is expected to choose the right parity
-//    at that point.
+//
+//	is returned, the caller is expected to choose the right parity
+//	at that point.
 func (sCfg Config) GetParityForSC(sc string) (parity int) {
 	ConfigLock.RLock()
 	defer ConfigLock.RUnlock()
 	switch strings.TrimSpace(sc) {
 	case RRS:
-		// set the rrs parity if available
-		if sCfg.RRS.Parity == 0 {
-			return defaultRRSParity
-		}
 		return sCfg.RRS.Parity
 	default:
 		return sCfg.Standard.Parity
@@ -248,6 +251,22 @@ func Enabled(kvs config.KVS) bool {
 	return ssc != "" || rrsc != ""
 }
 
+// DefaultParityBlocks returns default parity blocks for 'drive' count
+func DefaultParityBlocks(drive int) int {
+	switch drive {
+	case 1:
+		return 0
+	case 3, 2:
+		return 1
+	case 4, 5:
+		return 2
+	case 6, 7:
+		return 3
+	default:
+		return 4
+	}
+}
+
 // LookupConfig - lookup storage class config and override with valid environment settings if any.
 func LookupConfig(kvs config.KVS, setDriveCount int) (cfg Config, err error) {
 	cfg = Config{}
@@ -266,6 +285,8 @@ func LookupConfig(kvs config.KVS, setDriveCount int) (cfg Config, err error) {
 		if err != nil {
 			return Config{}, err
 		}
+	} else {
+		cfg.Standard.Parity = DefaultParityBlocks(setDriveCount)
 	}
 
 	if rrsc != "" {
@@ -273,9 +294,11 @@ func LookupConfig(kvs config.KVS, setDriveCount int) (cfg Config, err error) {
 		if err != nil {
 			return Config{}, err
 		}
-	}
-	if cfg.RRS.Parity == 0 {
+	} else {
 		cfg.RRS.Parity = defaultRRSParity
+		if setDriveCount == 1 {
+			cfg.RRS.Parity = 0
+		}
 	}
 
 	// Validation is done after parsing both the storage classes. This is needed because we need one

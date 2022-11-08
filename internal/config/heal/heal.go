@@ -60,7 +60,9 @@ type Config struct {
 
 // BitrotScanCycle returns the configured cycle for the scanner healing
 // -1 for not enabled
-//  0 for contiunous bitrot scanning
+//
+//	0 for contiunous bitrot scanning
+//
 // >0 interval duration between cycles
 func (opts Config) BitrotScanCycle() (d time.Duration) {
 	configMutex.RLock()
@@ -71,7 +73,7 @@ func (opts Config) BitrotScanCycle() (d time.Duration) {
 // Wait waits for IOCount to go down or max sleep to elapse before returning.
 // usually used in healing paths to wait for specified amount of time to
 // throttle healing.
-func (opts Config) Wait(currentIO func() int, systemIO func() int) {
+func (opts Config) Wait(currentIO func() int, activeListeners func() int) {
 	configMutex.RLock()
 	maxIO, maxWait := opts.IOCount, opts.Sleep
 	configMutex.RUnlock()
@@ -87,7 +89,7 @@ func (opts Config) Wait(currentIO func() int, systemIO func() int) {
 	tmpMaxWait := maxWait
 
 	if currentIO != nil {
-		for currentIO() >= maxIO+systemIO() {
+		for currentIO() >= maxIO+activeListeners() {
 			if tmpMaxWait > 0 {
 				if tmpMaxWait < waitTick {
 					time.Sleep(tmpMaxWait)

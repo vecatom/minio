@@ -200,9 +200,9 @@ func (d *naughtyDisk) AppendFile(ctx context.Context, volume string, path string
 	return d.disk.AppendFile(ctx, volume, path, buf)
 }
 
-func (d *naughtyDisk) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string) error {
+func (d *naughtyDisk) RenameData(ctx context.Context, srcVolume, srcPath string, fi FileInfo, dstVolume, dstPath string) (uint64, error) {
 	if err := d.calcError(); err != nil {
-		return err
+		return 0, err
 	}
 	return d.disk.RenameData(ctx, srcVolume, srcPath, fi, dstVolume, dstPath)
 }
@@ -221,11 +221,11 @@ func (d *naughtyDisk) CheckParts(ctx context.Context, volume string, path string
 	return d.disk.CheckParts(ctx, volume, path, fi)
 }
 
-func (d *naughtyDisk) Delete(ctx context.Context, volume string, path string, recursive bool) (err error) {
+func (d *naughtyDisk) Delete(ctx context.Context, volume string, path string, deleteOpts DeleteOptions) (err error) {
 	if err := d.calcError(); err != nil {
 		return err
 	}
-	return d.disk.Delete(ctx, volume, path, recursive)
+	return d.disk.Delete(ctx, volume, path, deleteOpts)
 }
 
 func (d *naughtyDisk) DeleteVersions(ctx context.Context, volume string, versions []FileInfoVersions) []error {
@@ -300,4 +300,12 @@ func (d *naughtyDisk) StatInfoFile(ctx context.Context, volume, path string, glo
 		return stat, err
 	}
 	return d.disk.StatInfoFile(ctx, volume, path, glob)
+}
+
+func (d *naughtyDisk) ReadMultiple(ctx context.Context, req ReadMultipleReq, resp chan<- ReadMultipleResp) error {
+	if err := d.calcError(); err != nil {
+		close(resp)
+		return err
+	}
+	return d.disk.ReadMultiple(ctx, req, resp)
 }

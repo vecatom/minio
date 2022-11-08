@@ -18,10 +18,11 @@
 package cmd
 
 import (
-	ring "container/ring"
+	"container/ring"
 	"context"
 	"sync"
 
+	"github.com/minio/madmin-go"
 	"github.com/minio/minio/internal/logger"
 	"github.com/minio/minio/internal/logger/message/log"
 	"github.com/minio/minio/internal/logger/target/console"
@@ -36,7 +37,7 @@ const defaultLogBufferCount = 10000
 // HTTPConsoleLoggerSys holds global console logger state
 type HTTPConsoleLoggerSys struct {
 	sync.RWMutex
-	pubsub   *pubsub.PubSub
+	pubsub   *pubsub.PubSub[log.Info, madmin.LogMask]
 	console  *console.Target
 	nodeName string
 	logBuf   *ring.Ring
@@ -45,9 +46,8 @@ type HTTPConsoleLoggerSys struct {
 // NewConsoleLogger - creates new HTTPConsoleLoggerSys with all nodes subscribed to
 // the console logging pub sub system
 func NewConsoleLogger(ctx context.Context) *HTTPConsoleLoggerSys {
-	ps := pubsub.New(8)
 	return &HTTPConsoleLoggerSys{
-		pubsub:  ps,
+		pubsub:  pubsub.New[log.Info, madmin.LogMask](8),
 		console: console.New(),
 		logBuf:  ring.New(defaultLogBufferCount),
 	}
@@ -71,11 +71,11 @@ func (sys *HTTPConsoleLoggerSys) SetNodeName(nodeName string) {
 // HasLogListeners returns true if console log listeners are registered
 // for this node or peers
 func (sys *HTTPConsoleLoggerSys) HasLogListeners() bool {
-	return sys != nil && sys.pubsub.NumSubscribers() > 0
+	return sys != nil && sys.pubsub.Subscribers() > 0
 }
 
 // Subscribe starts console logging for this node.
-func (sys *HTTPConsoleLoggerSys) Subscribe(subCh chan interface{}, doneCh <-chan struct{}, node string, last int, logKind string, filter func(entry interface{}) bool) error {
+func (sys *HTTPConsoleLoggerSys) Subscribe(subCh chan log.Info, doneCh <-chan struct{}, node string, last int, logKind madmin.LogMask, filter func(entry log.Info) bool) error {
 	// Enable console logging for remote client.
 	if !sys.HasLogListeners() {
 		logger.AddSystemTarget(sys)
@@ -115,8 +115,7 @@ func (sys *HTTPConsoleLoggerSys) Subscribe(subCh chan interface{}, doneCh <-chan
 			}
 		}
 	}
-
-	return sys.pubsub.Subscribe(subCh, doneCh, filter)
+	return sys.pubsub.Subscribe(madmin.LogMaskAll, subCh, doneCh, filter)
 }
 
 // Init if HTTPConsoleLoggerSys is valid, always returns nil right now
@@ -163,9 +162,9 @@ func (sys *HTTPConsoleLoggerSys) Type() types.TargetType {
 
 // Send log message 'e' to console and publish to console
 // log pubsub system
-func (sys *HTTPConsoleLoggerSys) Send(e interface{}, logKind string) error {
+func (sys *HTTPConsoleLoggerSys) Send(entry interface{}) error {
 	var lg log.Info
-	switch e := e.(type) {
+	switch e := entry.(type) {
 	case log.Entry:
 		lg = log.Info{Entry: e, NodeName: sys.nodeName}
 	case string:
@@ -179,5 +178,5 @@ func (sys *HTTPConsoleLoggerSys) Send(e interface{}, logKind string) error {
 	sys.logBuf = sys.logBuf.Next()
 	sys.Unlock()
 
-	return sys.console.Send(e, string(logger.All))
+	return sys.console.Send(entry, string(logger.All))
 }

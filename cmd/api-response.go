@@ -31,8 +31,10 @@ import (
 
 	"github.com/minio/minio/internal/crypto"
 	"github.com/minio/minio/internal/handlers"
+	"github.com/minio/minio/internal/hash"
 	xhttp "github.com/minio/minio/internal/http"
 	"github.com/minio/minio/internal/logger"
+	xxml "github.com/minio/xxml"
 )
 
 const (
@@ -162,6 +164,12 @@ type Part struct {
 	LastModified string
 	ETag         string
 	Size         int64
+
+	// Checksum values
+	ChecksumCRC32  string `xml:"ChecksumCRC32,omitempty"`
+	ChecksumCRC32C string `xml:"ChecksumCRC32C,omitempty"`
+	ChecksumSHA1   string `xml:"ChecksumSHA1,omitempty"`
+	ChecksumSHA256 string `xml:"ChecksumSHA256,omitempty"`
 }
 
 // ListPartsResponse - format for list parts response.
@@ -183,6 +191,7 @@ type ListPartsResponse struct {
 	MaxParts             int
 	IsTruncated          bool
 
+	ChecksumAlgorithm string
 	// List of parts.
 	Parts []Part `xml:"Part"`
 }
@@ -252,45 +261,88 @@ type ObjectVersion struct {
 }
 
 // MarshalXML - marshal ObjectVersion
-func (o ObjectVersion) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+func (o ObjectVersion) MarshalXML(e *xxml.Encoder, start xxml.StartElement) error {
 	if o.isDeleteMarker {
 		start.Name.Local = "DeleteMarker"
 	} else {
 		start.Name.Local = "Version"
 	}
-
 	type objectVersionWrapper ObjectVersion
 	return e.EncodeElement(objectVersionWrapper(o), start)
 }
 
-// StringMap is a map[string]string
-type StringMap map[string]string
+// DeleteMarkerVersion container for delete marker metadata
+type DeleteMarkerVersion struct {
+	Key          string
+	LastModified string // time string of format "2006-01-02T15:04:05.000Z"
+
+	// Owner of the object.
+	Owner Owner
+
+	IsLatest  bool
+	VersionID string `xml:"VersionId"`
+}
+
+// Metadata metadata items implemented to ensure XML marshaling works.
+type Metadata struct {
+	Items []struct {
+		Key   string
+		Value string
+	}
+}
+
+// Set add items, duplicate items get replaced.
+func (s *Metadata) Set(k, v string) {
+	for i, item := range s.Items {
+		if item.Key == k {
+			s.Items[i] = struct {
+				Key   string
+				Value string
+			}{
+				Key:   k,
+				Value: v,
+			}
+			return
+		}
+	}
+	s.Items = append(s.Items, struct {
+		Key   string
+		Value string
+	}{
+		Key:   k,
+		Value: v,
+	})
+}
+
+type xmlKeyEntry struct {
+	XMLName xml.Name
+	Value   string `xml:",chardata"`
+}
 
 // MarshalXML - StringMap marshals into XML.
-func (s StringMap) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
-	tokens := []xml.Token{start}
-
-	for key, value := range s {
-		t := xml.StartElement{}
-		t.Name = xml.Name{
-			Space: "",
-			Local: key,
-		}
-		tokens = append(tokens, t, xml.CharData(value), xml.EndElement{Name: t.Name})
+func (s *Metadata) MarshalXML(e *xml.Encoder, start xml.StartElement) error {
+	if s == nil {
+		return nil
 	}
 
-	tokens = append(tokens, xml.EndElement{
-		Name: start.Name,
-	})
+	if len(s.Items) == 0 {
+		return nil
+	}
 
-	for _, t := range tokens {
-		if err := e.EncodeToken(t); err != nil {
+	if err := e.EncodeToken(start); err != nil {
+		return err
+	}
+
+	for _, item := range s.Items {
+		if err := e.Encode(xmlKeyEntry{
+			XMLName: xml.Name{Local: item.Key},
+			Value:   item.Value,
+		}); err != nil {
 			return err
 		}
 	}
 
-	// flush to ensure tokens are written
-	return e.Flush()
+	return e.EncodeToken(start.End())
 }
 
 // Object container for object metadata
@@ -307,7 +359,7 @@ type Object struct {
 	StorageClass string
 
 	// UserMetadata user-defined metadata
-	UserMetadata StringMap `xml:"UserMetadata,omitempty"`
+	UserMetadata *Metadata `xml:"UserMetadata,omitempty"`
 }
 
 // CopyObjectResponse container returns ETag and LastModified of the successfully copied object
@@ -350,6 +402,11 @@ type CompleteMultipartUploadResponse struct {
 	Bucket   string
 	Key      string
 	ETag     string
+
+	ChecksumCRC32  string `xml:"ChecksumCRC32,omitempty"`
+	ChecksumCRC32C string `xml:"ChecksumCRC32C,omitempty"`
+	ChecksumSHA1   string `xml:"ChecksumSHA1,omitempty"`
+	ChecksumSHA256 string `xml:"ChecksumSHA256,omitempty"`
 }
 
 // DeleteError structure.
@@ -438,6 +495,7 @@ func generateListBucketsResponse(buckets []BucketInfo) ListBucketsResponse {
 // generates an ListBucketVersions response for the said bucket with other enumerated options.
 func generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delimiter, encodingType string, maxKeys int, resp ListObjectVersionsInfo) ListVersionsResponse {
 	versions := make([]ObjectVersion, 0, len(resp.Objects))
+
 	owner := Owner{
 		ID:          globalMinioDefaultOwnerID,
 		DisplayName: "minio",
@@ -445,10 +503,10 @@ func generateListVersionsResponse(bucket, prefix, marker, versionIDMarker, delim
 	data := ListVersionsResponse{}
 
 	for _, object := range resp.Objects {
-		content := ObjectVersion{}
 		if object.Name == "" {
 			continue
 		}
+		content := ObjectVersion{}
 		content.Key = s3EncodeName(object.Name, encodingType)
 		content.LastModified = object.ModTime.UTC().Format(iso8601TimeFormat)
 		if object.ETag != "" {
@@ -569,16 +627,16 @@ func generateListObjectsV2Response(bucket, prefix, token, nextToken, startAfter,
 		}
 		content.Owner = owner
 		if metadata {
-			content.UserMetadata = make(StringMap)
+			content.UserMetadata = &Metadata{}
 			switch kind, _ := crypto.IsEncrypted(object.UserDefined); kind {
 			case crypto.S3:
-				content.UserMetadata[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionAES
+				content.UserMetadata.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionAES)
 			case crypto.S3KMS:
-				content.UserMetadata[xhttp.AmzServerSideEncryption] = xhttp.AmzEncryptionKMS
+				content.UserMetadata.Set(xhttp.AmzServerSideEncryption, xhttp.AmzEncryptionKMS)
 			case crypto.SSEC:
-				content.UserMetadata[xhttp.AmzServerSideEncryptionCustomerAlgorithm] = xhttp.AmzEncryptionAES
+				content.UserMetadata.Set(xhttp.AmzServerSideEncryptionCustomerAlgorithm, xhttp.AmzEncryptionAES)
 			}
-			for k, v := range CleanMinioInternalMetadataKeys(object.UserDefined) {
+			for k, v := range cleanMinioInternalMetadataKeys(object.UserDefined) {
 				if strings.HasPrefix(strings.ToLower(k), ReservedMetadataPrefixLower) {
 					// Do not need to send any internal metadata
 					// values to client.
@@ -588,7 +646,7 @@ func generateListObjectsV2Response(bucket, prefix, token, nextToken, startAfter,
 				if equals(k, xhttp.AmzMetaUnencryptedContentLength, xhttp.AmzMetaUnencryptedContentMD5) {
 					continue
 				}
-				content.UserMetadata[k] = v
+				content.UserMetadata.Set(k, v)
 			}
 		}
 		contents = append(contents, content)
@@ -642,14 +700,20 @@ func generateInitiateMultipartUploadResponse(bucket, key, uploadID string) Initi
 }
 
 // generates CompleteMultipartUploadResponse for given bucket, key, location and ETag.
-func generateCompleteMultpartUploadResponse(bucket, key, location, etag string) CompleteMultipartUploadResponse {
-	return CompleteMultipartUploadResponse{
+func generateCompleteMultpartUploadResponse(bucket, key, location string, oi ObjectInfo) CompleteMultipartUploadResponse {
+	cs := oi.decryptChecksums()
+	c := CompleteMultipartUploadResponse{
 		Location: location,
 		Bucket:   bucket,
 		Key:      key,
 		// AWS S3 quotes the ETag in XML, make sure we are compatible here.
-		ETag: "\"" + etag + "\"",
+		ETag:           "\"" + oi.ETag + "\"",
+		ChecksumSHA1:   cs[hash.ChecksumSHA1.String()],
+		ChecksumSHA256: cs[hash.ChecksumSHA256.String()],
+		ChecksumCRC32:  cs[hash.ChecksumCRC32.String()],
+		ChecksumCRC32C: cs[hash.ChecksumCRC32C.String()],
 	}
+	return c
 }
 
 // generates ListPartsResponse from ListPartsInfo.
@@ -674,6 +738,7 @@ func generateListPartsResponse(partsInfo ListPartsInfo, encodingType string) Lis
 	listPartsResponse.PartNumberMarker = partsInfo.PartNumberMarker
 	listPartsResponse.IsTruncated = partsInfo.IsTruncated
 	listPartsResponse.NextPartNumberMarker = partsInfo.NextPartNumberMarker
+	listPartsResponse.ChecksumAlgorithm = partsInfo.ChecksumAlgorithm
 
 	listPartsResponse.Parts = make([]Part, len(partsInfo.Parts))
 	for index, part := range partsInfo.Parts {
@@ -682,6 +747,10 @@ func generateListPartsResponse(partsInfo ListPartsInfo, encodingType string) Lis
 		newPart.ETag = "\"" + part.ETag + "\""
 		newPart.Size = part.Size
 		newPart.LastModified = part.LastModified.UTC().Format(iso8601TimeFormat)
+		newPart.ChecksumCRC32 = part.ChecksumCRC32
+		newPart.ChecksumCRC32C = part.ChecksumCRC32C
+		newPart.ChecksumSHA1 = part.ChecksumSHA1
+		newPart.ChecksumSHA256 = part.ChecksumSHA256
 		listPartsResponse.Parts[index] = newPart
 	}
 	return listPartsResponse

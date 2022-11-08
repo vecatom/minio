@@ -7,10 +7,9 @@ For best deployment experience MinIO recommends operating systems RHEL/CentOS 8.
 | Item                                                            | Specification |
 |:----------------------------------------------------------------|:--------------|
 | Maximum number of servers per cluster                           | no-limit      |
-| Maximum number of federated clusters                            | no-limit      |
 | Minimum number of servers                                       | 02            |
-| Minimum number of drives per server when server count is 1      | 04            |
-| Minimum number of drives per server when server count is 2 or 3 | 02            |
+| Minimum number of drives per server when server count is 1      | 02            |
+| Minimum number of drives per server when server count is 2 or 3 | 01            |
 | Minimum number of drives per server when server count is 4      | 01            |
 | Maximum number of drives per server                             | no-limit      |
 | Read quorum                                                     | N/2           |
@@ -20,9 +19,9 @@ For best deployment experience MinIO recommends operating systems RHEL/CentOS 8.
 
 | Item                                                                            | Specification                                 |
 |:--------------------------------------------------------------------------------|:----------------------------------------------|
-| Maximum number of buckets                                                       | no-limit                                      |
+| Maximum number of buckets                                                       | 500000                                        |
 | Maximum number of objects per bucket                                            | no-limit                                      |
-| Maximum object size                                                             | 5 TiB                                         |
+| Maximum object size                                                             | 50 TiB                                        |
 | Minimum object size                                                             | 0 B                                           |
 | Maximum object size per PUT operation                                           | 5 TiB                                         |
 | Maximum number of parts per upload                                              | 10,000                                        |
@@ -40,20 +39,25 @@ We found the following APIs to be redundant or less useful outside of AWS S3. If
 
 ### List of Amazon S3 Bucket API's not supported on MinIO
 
-- BucketACL (Use [bucket policies](https://docs.min.io/docs/minio-client-complete-guide#policy) instead)
+- BucketACL (Use [bucket policies](https://min.io/docs/minio/linux/administration/identity-access-management/policy-based-access-control.html) instead)
 - BucketCORS (CORS enabled by default on all buckets for all HTTP verbs)
 - BucketWebsite (Use [`caddy`](https://github.com/caddyserver/caddy) or [`nginx`](https://www.nginx.com/resources/wiki/))
-- BucketAnalytics, BucketMetrics, BucketLogging (Use [bucket notification](https://docs.min.io/docs/minio-client-complete-guide#events) APIs)
+- BucketAnalytics, BucketMetrics, BucketLogging (Use [bucket notification](https://min.io/docs/minio/linux/administration/monitoring/bucket-notifications.html) APIs)
 - BucketRequestPayment
 
 ### List of Amazon S3 Object API's not supported on MinIO
 
-- ObjectACL (Use [bucket policies](https://docs.min.io/docs/minio-client-complete-guide#policy) instead)
+- ObjectACL (Use [bucket policies](https://min.io/docs/minio/linux/administration/identity-access-management/policy-based-access-control.html) instead)
 
 ## Object name restrictions on MinIO
 
-- Object names that contain characters `^*|\/&";` are unsupported on Windows platform or any other file systems that do not support filenames with special charaters. **This list is non exhaustive, it depends on the operating system and filesystem under use - please consult your operating system vendor**. MinIO recommends using Linux based deployments for production workloads.
-- Objects should not have conflicting objects as parents, applications using this behavior should change their behavior and use proper unique keys, for example situations such as following conflicting key patterns are not supported.
+- Object name restrictions on MinIO are governed by OS and filesystem limitations. For example object names that contain characters `^*|\/&";` are unsupported on Windows platform or any other file systems that do not support filenames with special charaters.
+
+> **This list is non exhaustive, it depends on the operating system and filesystem under use - please consult your operating system vendor for a more comprehensiv list**.
+
+MinIO recommends using Linux operating system for for production workloads.
+
+- Objects must not have conflicting objects as parent objects, applications using this behavior should change their behavior and use non-conflicting unique keys, for example situations such as following conflicting key patterns are not supported.
 
 ```
 PUT <bucketname>/a/b/1.txt

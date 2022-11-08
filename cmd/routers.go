@@ -40,6 +40,9 @@ func registerDistErasureRouters(router *mux.Router, endpointServerPools Endpoint
 
 // List of some generic handlers which are applied for all incoming requests.
 var globalHandlers = []mux.MiddlewareFunc{
+	// The generic tracer needs to be the first handler
+	// to catch all requests returned early by any other handler
+	httpTracer,
 	// Auth handler verifies incoming authorization headers and
 	// routes them accordingly. Client receives a HTTP error for
 	// invalid/unsupported signatures.
@@ -58,6 +61,8 @@ var globalHandlers = []mux.MiddlewareFunc{
 	setRequestValidityHandler,
 	// set x-amz-request-id header.
 	addCustomHeaders,
+	// Add upload forwarding handler for site replication
+	setUploadForwardingHandler,
 	// Add bucket forwarding handler
 	setBucketForwardingHandler,
 	// Add new handlers here.
@@ -85,6 +90,9 @@ func configureServerHandler(endpointServerPools EndpointServerPools) (http.Handl
 
 	// Add STS router always.
 	registerSTSRouter(router)
+
+	// Add KMS router
+	registerKMSRouter(router)
 
 	// Add API router
 	registerAPIRouter(router)

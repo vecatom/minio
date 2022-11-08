@@ -22,7 +22,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -141,7 +141,7 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 	// objectNames[0].
 	// uploadIds [0].
 	// Create bucket before initiating NewMultipartUpload.
-	err := obj.MakeBucketWithLocation(context.Background(), bucketName, BucketOptions{})
+	err := obj.MakeBucketWithLocation(context.Background(), bucketName, MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -222,7 +222,7 @@ func testPostPolicyBucketHandler(obj ObjectLayer, instanceType string, t TestErr
 		}
 		if testCase.malformedBody {
 			// Change the request body.
-			req.Body = ioutil.NopCloser(bytes.NewReader([]byte("Hello,")))
+			req.Body = io.NopCloser(bytes.NewReader([]byte("Hello,")))
 		}
 		// Since `apiRouter` satisfies `http.Handler` it has a ServeHTTP to execute the logic ofthe handler.
 		// Call the ServeHTTP to execute the handler.
@@ -447,7 +447,7 @@ func testPostPolicyBucketHandlerRedirect(obj ObjectLayer, instanceType string, t
 	targetObj := keyName + "/upload.txt"
 
 	// The url of success_action_redirect field
-	redirectURL, err := url.Parse("http://www.google.com")
+	redirectURL, err := url.Parse("http://www.google.com?query=value")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,7 +460,7 @@ func testPostPolicyBucketHandlerRedirect(obj ObjectLayer, instanceType string, t
 	curTime := UTCNow()
 	curTimePlus5Min := curTime.Add(time.Minute * 5)
 
-	err = obj.MakeBucketWithLocation(context.Background(), bucketName, BucketOptions{})
+	err = obj.MakeBucketWithLocation(context.Background(), bucketName, MakeBucketOptions{})
 	if err != nil {
 		// Failed to create newbucket, abort.
 		t.Fatalf("%s : %s", instanceType, err.Error())
@@ -499,7 +499,11 @@ func testPostPolicyBucketHandlerRedirect(obj ObjectLayer, instanceType string, t
 		t.Error("Unexpected error: ", err)
 	}
 
-	redirectURL.RawQuery = getRedirectPostRawQuery(info)
+	v := redirectURL.Query()
+	v.Add("bucket", info.Bucket)
+	v.Add("key", info.Name)
+	v.Add("etag", "\""+info.ETag+"\"")
+	redirectURL.RawQuery = v.Encode()
 	expectedLocation := redirectURL.String()
 
 	// Check the new location url

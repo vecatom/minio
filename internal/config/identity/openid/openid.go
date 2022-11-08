@@ -18,12 +18,12 @@
 package openid
 
 import (
-	"crypto"
 	"crypto/sha1"
 	"encoding/base64"
 	"errors"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -115,6 +115,18 @@ var (
 			Key:   Scopes,
 			Value: "",
 		},
+		config.KV{
+			Key:   Vendor,
+			Value: "",
+		},
+		config.KV{
+			Key:   KeyCloakRealm,
+			Value: "",
+		},
+		config.KV{
+			Key:   KeyCloakAdminURL,
+			Value: "",
+		},
 	}
 )
 
@@ -185,7 +197,7 @@ func LookupConfig(s config.Config, transport http.RoundTripper, closeRespFn func
 		ProviderCfgs:       map[string]*providerCfg{},
 		pubKeys: publicKeys{
 			RWMutex: &sync.RWMutex{},
-			pkMap:   map[string]crypto.PublicKey{},
+			pkMap:   map[string]interface{}{},
 		},
 		roleArnPolicyMap: map[arn.ARN]string{},
 		transport:        openIDClientTransport,
@@ -197,8 +209,17 @@ func LookupConfig(s config.Config, transport http.RoundTripper, closeRespFn func
 		seenClientIDs          = set.NewStringSet()
 	)
 
-	// remove this since we have removed support for this already.
 	deprecatedKeys := []string{JwksURL}
+
+	// remove this since we have removed support for this already.
+	for k := range s[config.IdentityOpenIDSubSys] {
+		for _, dk := range deprecatedKeys {
+			kvs := s[config.IdentityOpenIDSubSys][k]
+			kvs.Delete(dk)
+			s[config.IdentityOpenIDSubSys][k] = kvs
+		}
+	}
+
 	if err := s.CheckValidKeys(config.IdentityOpenIDSubSys, deprecatedKeys); err != nil {
 		return c, err
 	}
@@ -382,6 +403,107 @@ func LookupConfig(s config.Config, transport http.RoundTripper, closeRespFn func
 	return c, nil
 }
 
+// ErrProviderConfigNotFound - represents a non-existing provider error.
+var ErrProviderConfigNotFound = errors.New("provider configuration not found")
+
+// GetConfigInfo - returns configuration and related info for the given IDP
+// provider.
+func (r *Config) GetConfigInfo(s config.Config, cfgName string) ([]madmin.IDPCfgInfo, error) {
+	openIDConfigs, err := s.GetAvailableTargets(config.IdentityOpenIDSubSys)
+	if err != nil {
+		return nil, err
+	}
+
+	present := false
+	for _, cfg := range openIDConfigs {
+		if cfg == cfgName {
+			present = true
+			break
+		}
+	}
+
+	if !present {
+		return nil, ErrProviderConfigNotFound
+	}
+
+	kvsrcs, err := s.GetResolvedConfigParams(config.IdentityOpenIDSubSys, cfgName)
+	if err != nil {
+		return nil, err
+	}
+
+	res := make([]madmin.IDPCfgInfo, 0, len(kvsrcs)+1)
+	for _, kvsrc := range kvsrcs {
+		// skip default values.
+		if kvsrc.Src == config.ValueSourceDef {
+			if kvsrc.Key != madmin.EnableKey {
+				continue
+			}
+			// set an explicit on/off from live configuration.
+			kvsrc.Value = "off"
+			if _, ok := r.ProviderCfgs[cfgName]; ok {
+				if r.Enabled {
+					kvsrc.Value = "on"
+				}
+			}
+		}
+		res = append(res, madmin.IDPCfgInfo{
+			Key:   kvsrc.Key,
+			Value: kvsrc.Value,
+			IsCfg: true,
+			IsEnv: kvsrc.Src == config.ValueSourceEnv,
+		})
+	}
+
+	if provCfg, exists := r.ProviderCfgs[cfgName]; exists && provCfg.RolePolicy != "" {
+		// Append roleARN
+		res = append(res, madmin.IDPCfgInfo{
+			Key:   "roleARN",
+			Value: provCfg.roleArn.String(),
+			IsCfg: false,
+		})
+	}
+
+	// sort the structs by the key
+	sort.Slice(res, func(i, j int) bool {
+		return res[i].Key < res[j].Key
+	})
+
+	return res, nil
+}
+
+// GetConfigList - list openID configurations
+func (r *Config) GetConfigList(s config.Config) ([]madmin.IDPListItem, error) {
+	openIDConfigs, err := s.GetAvailableTargets(config.IdentityOpenIDSubSys)
+	if err != nil {
+		return nil, err
+	}
+
+	var res []madmin.IDPListItem
+	for _, cfg := range openIDConfigs {
+		pcfg, ok := r.ProviderCfgs[cfg]
+		if !ok {
+			res = append(res, madmin.IDPListItem{
+				Type:    "openid",
+				Name:    cfg,
+				Enabled: false,
+			})
+		} else {
+			var roleARN string
+			if pcfg.RolePolicy != "" {
+				roleARN = pcfg.roleArn.String()
+			}
+			res = append(res, madmin.IDPListItem{
+				Type:    "openid",
+				Name:    cfg,
+				Enabled: r.Enabled,
+				RoleARN: roleARN,
+			})
+		}
+	}
+
+	return res, nil
+}
+
 // Enabled returns if configURL is enabled.
 func Enabled(kvs config.KVS) bool {
 	return kvs.Get(ConfigURL) != ""
@@ -404,7 +526,7 @@ func (r *Config) GetSettings() madmin.OpenIDSettings {
 			hashedSecret = base64.RawURLEncoding.EncodeToString(bs)
 		}
 		if arn != DummyRoleARN {
-			if res.Roles != nil {
+			if res.Roles == nil {
 				res.Roles = make(map[string]madmin.OpenIDProviderSettings)
 			}
 			res.Roles[arn.String()] = madmin.OpenIDProviderSettings{

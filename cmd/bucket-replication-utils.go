@@ -21,12 +21,14 @@ import (
 	"bytes"
 	"fmt"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/minio/madmin-go"
 	"github.com/minio/minio/internal/bucket/replication"
 	xhttp "github.com/minio/minio/internal/http"
 )
@@ -503,6 +505,8 @@ func getHealReplicateObjectInfo(objInfo ObjectInfo, rcfg replicationConfig) Repl
 	}
 	var dsc ReplicateDecision
 	var tgtStatuses map[string]replication.StatusType
+	var purgeStatuses map[string]VersionPurgeStatusType
+
 	if oi.DeleteMarker || !oi.VersionPurgeStatus.Empty() {
 		dsc = checkReplicateDelete(GlobalContext, oi.Bucket, ObjectToDelete{
 			ObjectV: ObjectV{
@@ -516,15 +520,17 @@ func getHealReplicateObjectInfo(objInfo ObjectInfo, rcfg replicationConfig) Repl
 		}, replication.HealReplicationType, ObjectOptions{}))
 	}
 	tgtStatuses = replicationStatusesMap(oi.ReplicationStatusInternal)
-
+	purgeStatuses = versionPurgeStatusesMap(oi.VersionPurgeStatusInternal)
 	existingObjResync := rcfg.Resync(GlobalContext, oi, &dsc, tgtStatuses)
-
+	tm, _ := time.Parse(time.RFC3339Nano, oi.UserDefined[ReservedMetadataPrefixLower+ReplicationTimestamp])
 	return ReplicateObjectInfo{
-		ObjectInfo:        oi,
-		OpType:            replication.HealReplicationType,
-		Dsc:               dsc,
-		ExistingObjResync: existingObjResync,
-		TargetStatuses:    tgtStatuses,
+		ObjectInfo:           oi,
+		OpType:               replication.HealReplicationType,
+		Dsc:                  dsc,
+		ExistingObjResync:    existingObjResync,
+		TargetStatuses:       tgtStatuses,
+		TargetPurgeStatuses:  purgeStatuses,
+		ReplicationTimestamp: tm,
 	}
 }
 
@@ -724,3 +730,51 @@ func parseSizeFromContentRange(h http.Header) (sz int64, err error) {
 	}
 	return int64(usz), nil
 }
+
+func extractReplicateDiffOpts(q url.Values) (opts madmin.ReplDiffOpts) {
+	opts.Verbose = q.Get("verbose") == "true"
+	opts.ARN = q.Get("arn")
+	opts.Prefix = q.Get("prefix")
+	return
+}
+
+const (
+	replicationMRFDir = bucketMetaPrefix + SlashSeparator + replicationDir + SlashSeparator + "mrf"
+	mrfMetaFormat     = 1
+	mrfMetaVersionV1  = 1
+	mrfMetaVersion    = mrfMetaVersionV1
+)
+
+// MRFReplicateEntry mrf entry to save to disk
+type MRFReplicateEntry struct {
+	Bucket    string `json:"bucket" msg:"b"`
+	Object    string `json:"object" msg:"o"`
+	versionID string `json:"-"`
+}
+
+// MRFReplicateEntries has the map of MRF entries to save to disk
+type MRFReplicateEntries struct {
+	Entries map[string]MRFReplicateEntry `json:"entries" msg:"e"`
+	Version int                          `json:"version" msg:"v"`
+}
+
+// ToMRFEntry returns the relevant info needed by MRF
+func (ri ReplicateObjectInfo) ToMRFEntry() MRFReplicateEntry {
+	return MRFReplicateEntry{
+		Bucket:    ri.Bucket,
+		Object:    ri.Name,
+		versionID: ri.VersionID,
+	}
+}
+
+func getReplicationStatsPath(nodeName string) string {
+	nodeStr := strings.ReplaceAll(nodeName, ":", "_")
+	return bucketMetaPrefix + SlashSeparator + replicationDir + SlashSeparator + nodeStr + ".stats"
+}
+
+const (
+	replStatsMetaFormat   = 1
+	replStatsVersionV1    = 1
+	replStatsVersion      = replStatsVersionV1
+	replStatsSaveInterval = time.Minute * 5
+)

@@ -30,7 +30,8 @@ import (
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	"google.golang.org/api/googleapi"
 
-	minio "github.com/minio/minio-go/v7"
+	"github.com/minio/madmin-go"
+	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/bucket/lifecycle"
@@ -176,6 +177,7 @@ const (
 	ErrBucketAlreadyOwnedByYou
 	ErrInvalidDuration
 	ErrBucketAlreadyExists
+	ErrTooManyBuckets
 	ErrMetadataTooLarge
 	ErrUnsupportedMetadata
 	ErrMaximumExpires
@@ -196,8 +198,9 @@ const (
 	ErrInvalidTagDirective
 	// Add new error codes here.
 
-	// SSE-S3 related API errors
+	// SSE-S3/SSE-KMS related API errors
 	ErrInvalidEncryptionMethod
+	ErrInvalidEncryptionKeyID
 
 	// Server-Side-Encryption (with Customer provided key) related API errors.
 	ErrInsecureSSECustomerRequest
@@ -231,6 +234,7 @@ const (
 
 	// S3 extended errors.
 	ErrContentSHA256Mismatch
+	ErrContentChecksumMismatch
 
 	// Add new extended error codes here.
 
@@ -260,6 +264,7 @@ const (
 	ErrAdminNoSuchUser
 	ErrAdminNoSuchGroup
 	ErrAdminGroupNotEmpty
+	ErrAdminNoSuchJob
 	ErrAdminNoSuchPolicy
 	ErrAdminInvalidArgument
 	ErrAdminInvalidAccessKey
@@ -267,7 +272,13 @@ const (
 	ErrAdminConfigNoQuorum
 	ErrAdminConfigTooLarge
 	ErrAdminConfigBadJSON
+	ErrAdminNoSuchConfigTarget
+	ErrAdminConfigEnvOverridden
 	ErrAdminConfigDuplicateKeys
+	ErrAdminConfigInvalidIDPType
+	ErrAdminConfigLDAPValidation
+	ErrAdminConfigIDPCfgNameAlreadyExists
+	ErrAdminConfigIDPCfgNameDoesNotExist
 	ErrAdminCredentialsMismatch
 	ErrInsecureClientRequest
 	ErrObjectTampered
@@ -281,6 +292,10 @@ const (
 	ErrSiteReplicationBucketMetaError
 	ErrSiteReplicationIAMError
 	ErrSiteReplicationConfigMissing
+
+	// Pool rebalance errors
+	ErrAdminRebalanceAlreadyStarted
+	ErrAdminRebalanceNotStarted
 
 	// Bucket Quota error codes
 	ErrAdminBucketQuotaExceeded
@@ -389,6 +404,8 @@ const (
 	ErrAccountNotEligible
 	ErrAdminServiceAccountNotFound
 	ErrPostPolicyConditionInvalidFormat
+
+	ErrInvalidChecksum
 )
 
 type errorCodeMap map[APIErrorCode]APIError
@@ -678,6 +695,11 @@ var errorCodes = errorCodeMap{
 		Description:    "The authorization mechanism you have provided is not supported. Please use AWS4-HMAC-SHA256.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrTooManyBuckets: {
+		Code:           "TooManyBuckets",
+		Description:    "You have attempted to create more buckets than allowed",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrBucketNotEmpty: {
 		Code:           "BucketNotEmpty",
 		Description:    "The bucket you tried to delete is not empty",
@@ -885,7 +907,7 @@ var errorCodes = errorCodeMap{
 	},
 	ErrReplicationRemoteConnectionError: {
 		Code:           "XMinioAdminReplicationRemoteConnectionError",
-		Description:    "Remote service connection error - please check remote service credentials and target bucket",
+		Description:    "Remote service connection error",
 		HTTPStatusCode: http.StatusNotFound,
 	},
 	ErrReplicationBandwidthLimitError: {
@@ -1070,6 +1092,11 @@ var errorCodes = errorCodeMap{
 		Description:    "The encryption method specified is not supported",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrInvalidEncryptionKeyID: {
+		Code:           "InvalidRequest",
+		Description:    "The specified KMS KeyID contains unsupported characters",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrInsecureSSECustomerRequest: {
 		Code:           "InvalidRequest",
 		Description:    "Requests specifying Server Side Encryption with Customer provided keys must be made over a secure connection.",
@@ -1152,11 +1179,16 @@ var errorCodes = errorCodeMap{
 		Description:    "The provided 'x-amz-content-sha256' header does not match what was computed.",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrContentChecksumMismatch: {
+		Code:           "XAmzContentChecksumMismatch",
+		Description:    "The provided 'x-amz-checksum' header does not match what was computed.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 
 	// MinIO extensions.
 	ErrStorageFull: {
 		Code:           "XMinioStorageFull",
-		Description:    "Storage backend has reached its minimum free disk threshold. Please delete a few objects to proceed.",
+		Description:    "Storage backend has reached its minimum free drive threshold. Please delete a few objects to proceed.",
 		HTTPStatusCode: http.StatusInsufficientStorage,
 	},
 	ErrRequestBodyParse: {
@@ -1204,6 +1236,11 @@ var errorCodes = errorCodeMap{
 		Description:    "The specified group does not exist.",
 		HTTPStatusCode: http.StatusNotFound,
 	},
+	ErrAdminNoSuchJob: {
+		Code:           "XMinioAdminNoSuchJob",
+		Description:    "The specified job does not exist.",
+		HTTPStatusCode: http.StatusNotFound,
+	},
 	ErrAdminGroupNotEmpty: {
 		Code:           "XMinioAdminGroupNotEmpty",
 		Description:    "The specified group is not empty - cannot remove it.",
@@ -1240,14 +1277,44 @@ var errorCodes = errorCodeMap{
 			maxEConfigJSONSize),
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrAdminNoSuchConfigTarget: {
+		Code:           "XMinioAdminNoSuchConfigTarget",
+		Description:    "No such named configuration target exists",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrAdminConfigBadJSON: {
 		Code:           "XMinioAdminConfigBadJSON",
 		Description:    "JSON configuration provided is of incorrect format",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
+	ErrAdminConfigEnvOverridden: {
+		Code:           "XMinioAdminConfigEnvOverridden",
+		Description:    "Unable to update config via Admin API due to environment variable override",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	ErrAdminConfigDuplicateKeys: {
 		Code:           "XMinioAdminConfigDuplicateKeys",
 		Description:    "JSON configuration provided has objects with duplicate keys",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrAdminConfigInvalidIDPType: {
+		Code:           "XMinioAdminConfigInvalidIDPType",
+		Description:    fmt.Sprintf("Invalid IDP configuration type - must be one of %v", madmin.ValidIDPConfigTypes),
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrAdminConfigLDAPValidation: {
+		Code:           "XMinioAdminConfigLDAPValidation",
+		Description:    "LDAP Configuration validation failed",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrAdminConfigIDPCfgNameAlreadyExists: {
+		Code:           "XMinioAdminConfigIDPCfgNameAlreadyExists",
+		Description:    "An IDP configuration with the given name aleady exists",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrAdminConfigIDPCfgNameDoesNotExist: {
+		Code:           "XMinioAdminConfigIDPCfgNameDoesNotExist",
+		Description:    "No such IDP configuration exists",
 		HTTPStatusCode: http.StatusBadRequest,
 	},
 	ErrAdminConfigNotificationTargetsFailed: {
@@ -1345,6 +1412,16 @@ var errorCodes = errorCodeMap{
 		Code:           "XMinioSiteReplicationConfigMissingError",
 		Description:    "Site not found in site replication configuration",
 		HTTPStatusCode: http.StatusBadRequest,
+	},
+	ErrAdminRebalanceAlreadyStarted: {
+		Code:           "XMinioAdminRebalanceAlreadyStarted",
+		Description:    "Pool rebalance is already started",
+		HTTPStatusCode: http.StatusConflict,
+	},
+	ErrAdminRebalanceNotStarted: {
+		Code:           "XMinioAdminRebalanceNotStarted",
+		Description:    "Pool rebalance is not started",
+		HTTPStatusCode: http.StatusNotFound,
 	},
 	ErrMaximumExpires: {
 		Code:           "AuthorizationQueryParametersError",
@@ -1856,6 +1933,11 @@ var errorCodes = errorCodeMap{
 		Description:    "Invalid according to Policy: Policy Condition failed",
 		HTTPStatusCode: http.StatusForbidden,
 	},
+	ErrInvalidChecksum: {
+		Code:           "InvalidArgument",
+		Description:    "Invalid checksum provided.",
+		HTTPStatusCode: http.StatusBadRequest,
+	},
 	// Add your error structure here.
 }
 
@@ -1886,6 +1968,8 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrAdminNoSuchGroup
 	case errGroupNotEmpty:
 		apiErr = ErrAdminGroupNotEmpty
+	case errNoSuchJob:
+		apiErr = ErrAdminNoSuchJob
 	case errNoSuchPolicy:
 		apiErr = ErrAdminNoSuchPolicy
 	case errSignatureMismatch:
@@ -1909,6 +1993,8 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrInvalidEncryptionParameters
 	case crypto.ErrInvalidEncryptionMethod:
 		apiErr = ErrInvalidEncryptionMethod
+	case crypto.ErrInvalidEncryptionKeyID:
+		apiErr = ErrInvalidEncryptionKeyID
 	case crypto.ErrInvalidCustomerAlgorithm:
 		apiErr = ErrInvalidSSECustomerAlgorithm
 	case crypto.ErrMissingCustomerKey:
@@ -2026,6 +2112,8 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrSignatureDoesNotMatch
 	case hash.SHA256Mismatch:
 		apiErr = ErrContentSHA256Mismatch
+	case hash.ChecksumMismatch:
+		apiErr = ErrContentChecksumMismatch
 	case ObjectTooLarge:
 		apiErr = ErrEntityTooLarge
 	case ObjectTooSmall:
@@ -2054,7 +2142,7 @@ func toAPIErrorCode(ctx context.Context, err error) (apiErr APIErrorCode) {
 		apiErr = ErrRemoteDestinationNotFoundError
 	case BucketRemoteTargetNotFound:
 		apiErr = ErrRemoteTargetNotFoundError
-	case BucketRemoteConnectionErr:
+	case RemoteTargetConnectionErr:
 		apiErr = ErrReplicationRemoteConnectionError
 	case BucketRemoteAlreadyExists:
 		apiErr = ErrBucketRemoteAlreadyExists
@@ -2176,9 +2264,14 @@ func toAPIError(ctx context.Context, err error) APIError {
 	if apiErr.Code == "InternalError" {
 		// If we see an internal error try to interpret
 		// any underlying errors if possible depending on
-		// their internal error types. This code is only
-		// useful with gateway implementations.
+		// their internal error types.
 		switch e := err.(type) {
+		case batchReplicationJobError:
+			apiErr = APIError{
+				Code:           e.Code,
+				Description:    e.Description,
+				HTTPStatusCode: e.HTTPStatusCode,
+			}
 		case InvalidArgument:
 			apiErr = APIError{
 				Code:           "InvalidArgument",
@@ -2241,7 +2334,7 @@ func toAPIError(ctx context.Context, err error) APIError {
 				Description:    e.Message,
 				HTTPStatusCode: e.StatusCode,
 			}
-			if globalIsGateway && strings.Contains(e.Message, "KMS is not configured") {
+			if strings.Contains(e.Message, "KMS is not configured") {
 				apiErr = APIError{
 					Code:           "NotImplemented",
 					Description:    e.Message,
@@ -2265,7 +2358,7 @@ func toAPIError(ctx context.Context, err error) APIError {
 				Description:    e.Error(),
 				HTTPStatusCode: e.Response().StatusCode,
 			}
-			// Add more Gateway SDKs here if any in future.
+			// Add more other SDK related errors here if any in future.
 		default:
 			//nolint:gocritic
 			if errors.Is(err, errMalformedEncoding) {

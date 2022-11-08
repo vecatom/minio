@@ -23,11 +23,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
-	"net/url"
 	"regexp"
 	"strings"
 
@@ -197,16 +195,6 @@ func extractMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[
 	return nil
 }
 
-// The Query string for the redirect URL the client is
-// redirected on successful upload.
-func getRedirectPostRawQuery(objInfo ObjectInfo) string {
-	redirectValues := make(url.Values)
-	redirectValues.Set("bucket", objInfo.Bucket)
-	redirectValues.Set("key", objInfo.Name)
-	redirectValues.Set("etag", "\""+objInfo.ETag+"\"")
-	return redirectValues.Encode()
-}
-
 // Returns access credentials in the request Authorization header.
 func getReqAccessCred(r *http.Request, region string) (cred auth.Credentials) {
 	cred, _, _ = getReqAccessKeyV4(r, region, serviceS3)
@@ -316,7 +304,7 @@ func extractPostPolicyFormValues(ctx context.Context, form *multipart.Form) (fil
 			b.WriteString(v)
 		}
 		fileSize = int64(b.Len())
-		filePart = ioutil.NopCloser(b)
+		filePart = io.NopCloser(b)
 		return filePart, fileName, fileSize, formValues, nil
 	}
 
@@ -355,30 +343,6 @@ func extractPostPolicyFormValues(ctx context.Context, form *multipart.Form) (fil
 		}
 	}
 	return filePart, fileName, fileSize, formValues, nil
-}
-
-// Log headers and body.
-func httpTraceAll(f http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if globalTrace.NumSubscribers() == 0 {
-			f.ServeHTTP(w, r)
-			return
-		}
-		trace := Trace(f, true, w, r)
-		globalTrace.Publish(trace)
-	}
-}
-
-// Log only the headers.
-func httpTraceHdrs(f http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if globalTrace.NumSubscribers() == 0 {
-			f.ServeHTTP(w, r)
-			return
-		}
-		trace := Trace(f, false, w, r)
-		globalTrace.Publish(trace)
-	}
 }
 
 func collectAPIStats(api string, f http.HandlerFunc) http.HandlerFunc {

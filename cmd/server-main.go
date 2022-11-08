@@ -23,9 +23,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math/rand"
+	"net"
 	"os"
 	"os/signal"
 	"runtime"
@@ -35,6 +35,9 @@ import (
 	"time"
 
 	"github.com/minio/cli"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+	"github.com/minio/minio-go/v7/pkg/set"
 	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/bucket/bandwidth"
 	"github.com/minio/minio/internal/color"
@@ -56,10 +59,11 @@ var ServerFlags = []cli.Flag{
 		EnvVar: "MINIO_ADDRESS",
 	},
 	cli.IntFlag{
-		Name:   "listeners",
+		Name:   "listeners", // Deprecated Oct 2022
 		Value:  1,
 		Usage:  "bind N number of listeners per ADDRESS:PORT",
 		EnvVar: "MINIO_LISTENERS",
+		Hidden: true,
 	},
 	cli.StringFlag{
 		Name:   "console-address",
@@ -87,6 +91,34 @@ var ServerFlags = []cli.Flag{
 		EnvVar: "MINIO_READ_HEADER_TIMEOUT",
 		Hidden: true,
 	},
+	cli.DurationFlag{
+		Name:   "conn-read-deadline",
+		Usage:  "custom connection READ deadline",
+		Hidden: true,
+		Value:  10 * time.Minute,
+		EnvVar: "MINIO_CONN_READ_DEADLINE",
+	},
+	cli.DurationFlag{
+		Name:   "conn-write-deadline",
+		Usage:  "custom connection WRITE deadline",
+		Hidden: true,
+		Value:  10 * time.Minute,
+		EnvVar: "MINIO_CONN_WRITE_DEADLINE",
+	},
+}
+
+var gatewayCmd = cli.Command{
+	Name:            "gateway",
+	Usage:           "start object storage gateway",
+	Hidden:          true,
+	Flags:           append(ServerFlags, GlobalFlags...),
+	HideHelpCommand: true,
+	Action:          gatewayMain,
+}
+
+func gatewayMain(ctx *cli.Context) error {
+	logger.Fatal(errInvalidArgument, "Gateway is deprecated, To continue to use Gateway please use releases no later than 'RELEASE.2022-10-24T18-35-07Z'. We recommend all our users to migrate from gateway mode to server mode. Please read https://blog.min.io/deprecation-of-the-minio-gateway/")
+	return nil
 }
 
 var serverCmd = cli.Command{
@@ -231,6 +263,9 @@ func serverHandleCmdArgs(ctx *cli.Context) {
 		globalIsErasure = true
 	}
 	globalIsErasureSD = (setupType == ErasureSDSetupType)
+
+	globalConnReadDeadline = ctx.Duration("conn-read-deadline")
+	globalConnWriteDeadline = ctx.Duration("conn-write-deadline")
 }
 
 func serverHandleEnvVars() {
@@ -240,15 +275,18 @@ func serverHandleEnvVars() {
 
 var globalHealStateLK sync.RWMutex
 
-func initAllSubsystems() {
+func initAllSubsystems(ctx context.Context) {
 	globalHealStateLK.Lock()
 	// New global heal state
-	globalAllHealState = newHealState(true)
-	globalBackgroundHealState = newHealState(false)
+	globalAllHealState = newHealState(ctx, true)
+	globalBackgroundHealState = newHealState(ctx, false)
 	globalHealStateLK.Unlock()
 
-	// Create new notification system and initialize notification peer targets
+	// Initialize notification peer targets
 	globalNotificationSys = NewNotificationSys(globalEndpoints)
+
+	// Create new notification system
+	globalEventNotifier = NewEventNotifier()
 
 	// Create new bucket metadata system.
 	if globalBucketMetadataSys == nil {
@@ -259,7 +297,7 @@ func initAllSubsystems() {
 	}
 
 	// Create the bucket bandwidth monitor
-	globalBucketMonitor = bandwidth.NewMonitor(GlobalContext, totalNodeCount())
+	globalBucketMonitor = bandwidth.NewMonitor(ctx, totalNodeCount())
 
 	// Create a new config system.
 	globalConfigSys = NewConfigSys()
@@ -288,7 +326,7 @@ func initAllSubsystems() {
 	}
 
 	// Create new bucket replication subsytem
-	globalBucketTargetSys = NewBucketTargetSys()
+	globalBucketTargetSys = NewBucketTargetSys(GlobalContext)
 
 	// Create new ILM tier configuration subsystem
 	globalTierConfigMgr = NewTierConfigMgr()
@@ -413,6 +451,24 @@ func initConfigSubsystem(ctx context.Context, newObject ObjectLayer) error {
 	return nil
 }
 
+// Return the list of address that MinIO server needs to listen on:
+//   - Returning 127.0.0.1 is necessary so Console will be able to send
+//     requests to the local S3 API.
+//   - The returned List needs to be deduplicated as well.
+func getServerListenAddrs() []string {
+	// Use a string set to avoid duplication
+	addrs := set.NewStringSet()
+	// Listen on local interface to receive requests from Console
+	for _, ip := range mustGetLocalIPs() {
+		if ip != nil && ip.IsLoopback() {
+			addrs.Add(net.JoinHostPort(ip.String(), globalMinioPort))
+		}
+	}
+	// Add the interface specified by the user
+	addrs.Add(globalMinioAddr)
+	return addrs.ToSlice()
+}
+
 // serverMain handler called for 'minio server' command.
 func serverMain(ctx *cli.Context) {
 	signal.Notify(globalOSSignalCh, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT)
@@ -446,7 +502,7 @@ func serverMain(ctx *cli.Context) {
 	initHelp()
 
 	// Initialize all sub-systems
-	initAllSubsystems()
+	initAllSubsystems(GlobalContext)
 
 	// Is distributed setup, error out if no certificates are found for HTTPS endpoints.
 	if globalIsDistErasure {
@@ -495,23 +551,14 @@ func serverMain(ctx *cli.Context) {
 		getCert = globalTLSCerts.GetCertificate
 	}
 
-	listeners := ctx.Int("listeners")
-	if listeners == 0 {
-		listeners = 1
-	}
-	addrs := make([]string, 0, listeners)
-	for i := 0; i < listeners; i++ {
-		addrs = append(addrs, globalMinioAddr)
-	}
-
-	httpServer := xhttp.NewServer(addrs).
+	httpServer := xhttp.NewServer(getServerListenAddrs()).
 		UseHandler(setCriticalErrorHandler(corsHandler(handler))).
 		UseTLSConfig(newTLSConfig(getCert)).
 		UseShutdownTimeout(ctx.Duration("shutdown-timeout")).
 		UseIdleTimeout(ctx.Duration("idle-timeout")).
 		UseReadHeaderTimeout(ctx.Duration("read-header-timeout")).
 		UseBaseContext(GlobalContext).
-		UseCustomLogger(log.New(ioutil.Discard, "", 0)) // Turn-off random logging by Go stdlib
+		UseCustomLogger(log.New(io.Discard, "", 0)) // Turn-off random logging by Go stdlib
 
 	go func() {
 		globalHTTPServerErrorCh <- httpServer.Start(GlobalContext)
@@ -539,12 +586,6 @@ func serverMain(ctx *cli.Context) {
 	initHealMRF(GlobalContext, newObject)
 	initBackgroundExpiry(GlobalContext, newObject)
 
-	if globalActiveCred.Equal(auth.DefaultCredentials) {
-		msg := fmt.Sprintf("WARNING: Detected default credentials '%s', we recommend that you change these values with 'MINIO_ROOT_USER' and 'MINIO_ROOT_PASSWORD' environment variables",
-			globalActiveCred)
-		logger.Info(color.RedBold(msg))
-	}
-
 	if !globalCLIContext.StrictS3Compat {
 		logger.Info(color.RedBold("WARNING: Strict AWS S3 compatible incoming PUT, POST content payload validation is turned off, caution is advised do not use in production"))
 	}
@@ -565,21 +606,37 @@ func serverMain(ctx *cli.Context) {
 		logger.LogIf(GlobalContext, err)
 	}
 
-	if globalBrowserEnabled {
-		srv, err := initConsoleServer()
-		if err != nil {
-			logger.FatalIf(err, "Unable to initialize console service")
-		}
+	if globalActiveCred.Equal(auth.DefaultCredentials) {
+		msg := fmt.Sprintf("WARNING: Detected default credentials '%s', we recommend that you change these values with 'MINIO_ROOT_USER' and 'MINIO_ROOT_PASSWORD' environment variables",
+			globalActiveCred)
+		logger.Info(color.RedBold(msg))
+	}
 
-		setConsoleSrv(srv)
-
-		go func() {
-			logger.FatalIf(newConsoleServerFn().Serve(), "Unable to initialize console server")
-		}()
+	savedCreds, _ := config.LookupCreds(globalServerConfig[config.CredentialsSubSys][config.Default])
+	if globalActiveCred.Equal(auth.DefaultCredentials) && !globalActiveCred.Equal(savedCreds) {
+		msg := fmt.Sprintf("WARNING: Detected credentials changed to '%s', please set them back to previously set values",
+			globalActiveCred)
+		logger.Info(color.RedBold(msg))
 	}
 
 	// Initialize users credentials and policies in background right after config has initialized.
-	go globalIAMSys.Init(GlobalContext, newObject, globalEtcdClient, globalRefreshIAMInterval)
+	go func() {
+		globalIAMSys.Init(GlobalContext, newObject, globalEtcdClient, globalRefreshIAMInterval)
+
+		// Initialize
+		if globalBrowserEnabled {
+			srv, err := initConsoleServer()
+			if err != nil {
+				logger.FatalIf(err, "Unable to initialize console service")
+			}
+
+			setConsoleSrv(srv)
+
+			go func() {
+				logger.FatalIf(newConsoleServerFn().Serve(), "Unable to initialize console server")
+			}()
+		}
+	}()
 
 	// Background all other operations such as initializing bucket metadata etc.
 	go func() {
@@ -587,8 +644,11 @@ func serverMain(ctx *cli.Context) {
 		initBackgroundReplication(GlobalContext, newObject)
 		initBackgroundTransition(GlobalContext, newObject)
 
+		globalBatchJobPool = newBatchJobPool(GlobalContext, newObject, 100)
+
 		go func() {
-			if err := globalTierConfigMgr.Init(GlobalContext, newObject); err != nil {
+			err := globalTierConfigMgr.Init(GlobalContext, newObject)
+			if err != nil {
 				logger.LogIf(GlobalContext, err)
 			}
 
@@ -604,7 +664,7 @@ func serverMain(ctx *cli.Context) {
 		initDataScanner(GlobalContext, newObject)
 
 		// List buckets to heal, and be re-used for loading configs.
-		buckets, err := newObject.ListBuckets(GlobalContext)
+		buckets, err := newObject.ListBuckets(GlobalContext, BucketOptions{})
 		if err != nil {
 			logger.LogIf(GlobalContext, fmt.Errorf("Unable to list buckets to heal: %w", err))
 		}
@@ -623,15 +683,15 @@ func serverMain(ctx *cli.Context) {
 		// Initialize site replication manager.
 		globalSiteReplicationSys.Init(GlobalContext, newObject)
 
-		// Initialize bucket notification targets.
-		globalNotificationSys.InitBucketTargets(GlobalContext, newObject)
+		// Initialize bucket notification system
+		logger.LogIf(GlobalContext, globalEventNotifier.InitBucketTargets(GlobalContext, newObject))
 
 		// initialize the new disk cache objects.
 		if globalCacheConfig.Enabled {
-			logger.Info(color.Yellow("WARNING: Disk caching is deprecated for single/multi drive MinIO setups. Please migrate to using MinIO S3 gateway instead of disk caching"))
+			logger.Info(color.Yellow("WARNING: Drive caching is deprecated for single/multi drive MinIO setups."))
 			var cacheAPI CacheObjectLayer
 			cacheAPI, err = newServerCacheObjects(GlobalContext, globalCacheConfig)
-			logger.FatalIf(err, "Unable to initialize disk caching")
+			logger.FatalIf(err, "Unable to initialize drive caching")
 
 			setCacheObjectLayer(cacheAPI)
 		}
@@ -639,6 +699,18 @@ func serverMain(ctx *cli.Context) {
 		// Prints the formatted startup message, if err is not nil then it prints additional information as well.
 		printStartupMessage(getAPIEndpoints(), err)
 	}()
+
+	region := globalSite.Region
+	if region == "" {
+		region = "us-east-1"
+	}
+	globalMinioClient, err = minio.New(globalLocalNodeName, &minio.Options{
+		Creds:     credentials.NewStaticV4(globalActiveCred.AccessKey, globalActiveCred.SecretKey, ""),
+		Secure:    globalIsTLS,
+		Transport: globalProxyTransport,
+		Region:    region,
+	})
+	logger.FatalIf(err, "Unable to initialize MinIO client")
 
 	if serverDebugLog {
 		logger.Info("== DEBUG Mode enabled ==")
@@ -664,17 +736,5 @@ func serverMain(ctx *cli.Context) {
 
 // Initialize object layer with the supplied disks, objectLayer is nil upon any error.
 func newObjectLayer(ctx context.Context, endpointServerPools EndpointServerPools) (newObject ObjectLayer, err error) {
-	// For FS only, directly use the disk.
-	if endpointServerPools.NEndpoints() == 1 {
-		// Initialize new FS object layer.
-		newObject, err = NewFSObjectLayer(endpointServerPools[0].Endpoints[0].Path)
-		if err == nil {
-			return newObject, nil
-		}
-		if err != nil && err != errFreshDisk {
-			return newObject, err
-		}
-	}
-
 	return newErasureServerPools(ctx, endpointServerPools)
 }

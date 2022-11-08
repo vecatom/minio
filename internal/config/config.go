@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/minio/madmin-go"
@@ -51,6 +52,8 @@ const (
 	Enable  = madmin.EnableKey
 	Comment = madmin.CommentKey
 
+	EnvSeparator = "="
+
 	// Enable values
 	EnableOn  = madmin.EnableOn
 	EnableOff = madmin.EnableOff
@@ -67,46 +70,46 @@ const (
 
 // Top level config constants.
 const (
-	CredentialsSubSys    = "credentials"
-	PolicyOPASubSys      = "policy_opa"
-	PolicyPluginSubSys   = "policy_plugin"
-	IdentityOpenIDSubSys = "identity_openid"
-	IdentityLDAPSubSys   = "identity_ldap"
-	IdentityTLSSubSys    = "identity_tls"
-	IdentityPluginSubSys = "identity_plugin"
-	CacheSubSys          = "cache"
-	SiteSubSys           = "site"
-	RegionSubSys         = "region"
-	EtcdSubSys           = "etcd"
-	StorageClassSubSys   = "storage_class"
-	APISubSys            = "api"
-	CompressionSubSys    = "compression"
-	LoggerWebhookSubSys  = "logger_webhook"
-	AuditWebhookSubSys   = "audit_webhook"
-	AuditKafkaSubSys     = "audit_kafka"
-	HealSubSys           = "heal"
-	ScannerSubSys        = "scanner"
-	CrawlerSubSys        = "crawler"
-	SubnetSubSys         = "subnet"
-	CallhomeSubSys       = "callhome"
+	CredentialsSubSys    = madmin.CredentialsSubSys
+	PolicyOPASubSys      = madmin.PolicyOPASubSys
+	PolicyPluginSubSys   = madmin.PolicyPluginSubSys
+	IdentityOpenIDSubSys = madmin.IdentityOpenIDSubSys
+	IdentityLDAPSubSys   = madmin.IdentityLDAPSubSys
+	IdentityTLSSubSys    = madmin.IdentityTLSSubSys
+	IdentityPluginSubSys = madmin.IdentityPluginSubSys
+	CacheSubSys          = madmin.CacheSubSys
+	SiteSubSys           = madmin.SiteSubSys
+	RegionSubSys         = madmin.RegionSubSys
+	EtcdSubSys           = madmin.EtcdSubSys
+	StorageClassSubSys   = madmin.StorageClassSubSys
+	APISubSys            = madmin.APISubSys
+	CompressionSubSys    = madmin.CompressionSubSys
+	LoggerWebhookSubSys  = madmin.LoggerWebhookSubSys
+	AuditWebhookSubSys   = madmin.AuditWebhookSubSys
+	AuditKafkaSubSys     = madmin.AuditKafkaSubSys
+	HealSubSys           = madmin.HealSubSys
+	ScannerSubSys        = madmin.ScannerSubSys
+	CrawlerSubSys        = madmin.CrawlerSubSys
+	SubnetSubSys         = madmin.SubnetSubSys
+	CallhomeSubSys       = madmin.CallhomeSubSys
 
-	// Add new constants here if you add new fields to config.
+	// Add new constants here (similar to above) if you add new fields to config.
 )
 
 // Notification config constants.
 const (
-	NotifyKafkaSubSys    = "notify_kafka"
-	NotifyMQTTSubSys     = "notify_mqtt"
-	NotifyMySQLSubSys    = "notify_mysql"
-	NotifyNATSSubSys     = "notify_nats"
-	NotifyNSQSubSys      = "notify_nsq"
-	NotifyESSubSys       = "notify_elasticsearch"
-	NotifyAMQPSubSys     = "notify_amqp"
-	NotifyPostgresSubSys = "notify_postgres"
-	NotifyRedisSubSys    = "notify_redis"
-	NotifyWebhookSubSys  = "notify_webhook"
+	NotifyKafkaSubSys    = madmin.NotifyKafkaSubSys
+	NotifyMQTTSubSys     = madmin.NotifyMQTTSubSys
+	NotifyMySQLSubSys    = madmin.NotifyMySQLSubSys
+	NotifyNATSSubSys     = madmin.NotifyNATSSubSys
+	NotifyNSQSubSys      = madmin.NotifyNSQSubSys
+	NotifyESSubSys       = madmin.NotifyESSubSys
+	NotifyAMQPSubSys     = madmin.NotifyAMQPSubSys
+	NotifyPostgresSubSys = madmin.NotifyPostgresSubSys
+	NotifyRedisSubSys    = madmin.NotifyRedisSubSys
+	NotifyWebhookSubSys  = madmin.NotifyWebhookSubSys
 
-	// Add new constants here if you add new fields to config.
+	// Add new constants here (similar to above) if you add new fields to config.
 )
 
 // NotifySubSystems - all notification sub-systems
@@ -131,39 +134,7 @@ var LoggerSubSystems = set.CreateStringSet(
 )
 
 // SubSystems - all supported sub-systems
-var SubSystems = set.CreateStringSet(
-	CredentialsSubSys,
-	SiteSubSys,
-	RegionSubSys,
-	EtcdSubSys,
-	CacheSubSys,
-	APISubSys,
-	StorageClassSubSys,
-	CompressionSubSys,
-	LoggerWebhookSubSys,
-	AuditWebhookSubSys,
-	AuditKafkaSubSys,
-	PolicyOPASubSys,
-	PolicyPluginSubSys,
-	IdentityLDAPSubSys,
-	IdentityOpenIDSubSys,
-	IdentityTLSSubSys,
-	IdentityPluginSubSys,
-	ScannerSubSys,
-	HealSubSys,
-	NotifyAMQPSubSys,
-	NotifyESSubSys,
-	NotifyKafkaSubSys,
-	NotifyMQTTSubSys,
-	NotifyMySQLSubSys,
-	NotifyNATSSubSys,
-	NotifyNSQSubSys,
-	NotifyPostgresSubSys,
-	NotifyRedisSubSys,
-	NotifyWebhookSubSys,
-	SubnetSubSys,
-	CallhomeSubSys,
-)
+var SubSystems = madmin.SubSystems
 
 // SubSystemsDynamic - all sub-systems that have dynamic config.
 var SubSystemsDynamic = set.CreateStringSet(
@@ -180,7 +151,7 @@ var SubSystemsDynamic = set.CreateStringSet(
 )
 
 // SubSystemsSingleTargets - subsystems which only support single target.
-var SubSystemsSingleTargets = set.CreateStringSet([]string{
+var SubSystemsSingleTargets = set.CreateStringSet(
 	CredentialsSubSys,
 	SiteSubSys,
 	RegionSubSys,
@@ -196,7 +167,9 @@ var SubSystemsSingleTargets = set.CreateStringSet([]string{
 	IdentityPluginSubSys,
 	HealSubSys,
 	ScannerSubSys,
-}...)
+	SubnetSubSys,
+	CallhomeSubSys,
+)
 
 // Constant separators
 const (
@@ -209,8 +182,8 @@ const (
 	KvSingleQuote      = madmin.KvSingleQuote
 
 	// Env prefix used for all envs in MinIO
-	EnvPrefix        = "MINIO_"
-	EnvWordDelimiter = `_`
+	EnvPrefix        = madmin.EnvPrefix
+	EnvWordDelimiter = madmin.EnvWordDelimiter
 )
 
 // DefaultKVS - default kvs for all sub-systems
@@ -259,6 +232,23 @@ func RegisterHelpDeprecatedSubSys(helpDeprecatedKVMap map[string]HelpKV) {
 type KV struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
+
+	Deprecated bool `json:"-"`
+}
+
+func (kv KV) String() string {
+	var s strings.Builder
+	s.WriteString(kv.Key)
+	s.WriteString(KvSeparator)
+	spc := madmin.HasSpace(kv.Value)
+	if spc {
+		s.WriteString(KvDoubleQuote)
+	}
+	s.WriteString(kv.Value)
+	if spc {
+		s.WriteString(KvDoubleQuote)
+	}
+	return s.String()
 }
 
 // KVS - is a shorthand for some wrapper functions
@@ -304,20 +294,7 @@ func (kvs KVS) Keys() []string {
 func (kvs KVS) String() string {
 	var s strings.Builder
 	for _, kv := range kvs {
-		// Do not need to print if state is on
-		if kv.Key == Enable && kv.Value == EnableOn {
-			continue
-		}
-		s.WriteString(kv.Key)
-		s.WriteString(KvSeparator)
-		spc := madmin.HasSpace(kv.Value)
-		if spc {
-			s.WriteString(KvDoubleQuote)
-		}
-		s.WriteString(kv.Value)
-		if spc {
-			s.WriteString(KvDoubleQuote)
-		}
+		s.WriteString(kv.String())
 		s.WriteString(KvSpaceSeparator)
 	}
 	return s.String()
@@ -374,6 +351,16 @@ func (kvs *KVS) Delete(key string) {
 			return
 		}
 	}
+}
+
+// LookupKV returns the KV by its key
+func (kvs KVS) LookupKV(key string) (KV, bool) {
+	for _, kv := range kvs {
+		if kv.Key == key {
+			return kv, true
+		}
+	}
+	return KV{}, false
 }
 
 // Lookup - lookup a key in a list of KVS
@@ -454,39 +441,6 @@ func (c Config) RedactSensitiveInfo() Config {
 	nc.DelKVS(CredentialsSubSys)
 
 	return nc
-}
-
-type configWriteTo struct {
-	Config
-	filterByKey string
-}
-
-// NewConfigWriteTo - returns a struct which
-// allows for serializing the config/kv struct
-// to a io.WriterTo
-func NewConfigWriteTo(cfg Config, key string) io.WriterTo {
-	return &configWriteTo{Config: cfg, filterByKey: key}
-}
-
-// WriteTo - implements io.WriterTo interface implementation for config.
-func (c *configWriteTo) WriteTo(w io.Writer) (int64, error) {
-	kvsTargets, err := c.GetKVS(c.filterByKey, DefaultKVS)
-	if err != nil {
-		return 0, err
-	}
-	var n int
-	for _, target := range kvsTargets {
-		m1, _ := w.Write([]byte(target.SubSystem))
-		m2, _ := w.Write([]byte(KvSpaceSeparator))
-		m3, _ := w.Write([]byte(target.KVS.String()))
-		if len(kvsTargets) > 1 {
-			m4, _ := w.Write([]byte(KvNewline))
-			n += m1 + m2 + m3 + m4
-		} else {
-			n += m1 + m2 + m3
-		}
-	}
-	return int64(n), nil
 }
 
 // Default KV configs for worm and region
@@ -773,35 +727,40 @@ func (c Config) GetKVS(s string, defaultKVS map[string]KVS) (Targets, error) {
 
 // DelKVS - delete a specific key.
 func (c Config) DelKVS(s string) error {
-	if len(s) == 0 {
-		return Errorf("input arguments cannot be empty")
-	}
-	inputs := strings.Fields(s)
-	if len(inputs) > 1 {
-		return Errorf("invalid number of arguments %s", s)
-	}
-	subSystemValue := strings.SplitN(inputs[0], SubSystemSeparator, 2)
-	if len(subSystemValue) == 0 {
-		return Errorf("invalid number of arguments %s", s)
-	}
-	if !SubSystems.Contains(subSystemValue[0]) {
-		// Unknown sub-system found try to remove it anyways.
-		delete(c, subSystemValue[0])
-		return nil
-	}
-	tgt := Default
-	subSys := subSystemValue[0]
-	if len(subSystemValue) == 2 {
-		if len(subSystemValue[1]) == 0 {
-			return Errorf("sub-system target '%s' cannot be empty", s)
+	subSys, inputs, tgt, err := GetSubSys(s)
+	if err != nil {
+		if !SubSystems.Contains(subSys) && len(inputs) == 1 {
+			// Unknown sub-system found try to remove it anyways.
+			delete(c, subSys)
+			return nil
 		}
-		tgt = subSystemValue[1]
+		return err
 	}
-	_, ok := c[subSys][tgt]
+
+	ck, ok := c[subSys][tgt]
 	if !ok {
-		return Errorf("sub-system %s already deleted", s)
+		return Errorf("sub-system %s:%s already deleted or does not exist", subSys, tgt)
 	}
-	delete(c[subSys], tgt)
+
+	if len(inputs) == 2 {
+		currKVS := ck.Clone()
+		defKVS := DefaultKVS[subSys]
+		for _, delKey := range strings.Fields(inputs[1]) {
+			_, ok := currKVS.Lookup(delKey)
+			if !ok {
+				return Errorf("key %s doesn't exist", delKey)
+			}
+			defVal, isDef := defKVS.Lookup(delKey)
+			if isDef {
+				currKVS.Set(delKey, defVal)
+			} else {
+				currKVS.Delete(delKey)
+			}
+		}
+		c[subSys][tgt] = currKVS
+	} else {
+		delete(c[subSys], tgt)
+	}
 	return nil
 }
 
@@ -831,10 +790,6 @@ func GetSubSys(s string) (subSys string, inputs []string, tgt string, e error) {
 		return subSys, inputs, tgt, Errorf("unknown sub-system %s", s)
 	}
 
-	if len(inputs) == 1 {
-		return subSys, inputs, tgt, nil
-	}
-
 	if SubSystemsSingleTargets.Contains(subSystemValue[0]) && len(subSystemValue) == 2 {
 		return subSys, inputs, tgt, Errorf("sub-system '%s' only supports single target", subSystemValue[0])
 	}
@@ -846,6 +801,33 @@ func GetSubSys(s string) (subSys string, inputs []string, tgt string, e error) {
 	return subSys, inputs, tgt, e
 }
 
+// kvFields - converts an input string of form "k1=v1 k2=v2" into
+// fields of ["k1=v1", "k2=v2"], the tokenization of each `k=v`
+// happens with the right number of input keys, if keys
+// input is empty returned value is empty slice as well.
+func kvFields(input string, keys []string) []string {
+	valueIndexes := make([]int, 0, len(keys))
+	for _, key := range keys {
+		i := strings.Index(input, key+KvSeparator)
+		if i == -1 {
+			continue
+		}
+		valueIndexes = append(valueIndexes, i)
+	}
+
+	sort.Ints(valueIndexes)
+	fields := make([]string, len(valueIndexes))
+	for i := range valueIndexes {
+		j := i + 1
+		if j < len(valueIndexes) {
+			fields[i] = strings.TrimSpace(input[valueIndexes[i]:valueIndexes[j]])
+		} else {
+			fields[i] = strings.TrimSpace(input[valueIndexes[i]:])
+		}
+	}
+	return fields
+}
+
 // SetKVS - set specific key values per sub-system.
 func (c Config) SetKVS(s string, defaultKVS map[string]KVS) (dynamic bool, err error) {
 	subSys, inputs, tgt, err := GetSubSys(s)
@@ -855,7 +837,7 @@ func (c Config) SetKVS(s string, defaultKVS map[string]KVS) (dynamic bool, err e
 
 	dynamic = SubSystemsDynamic.Contains(subSys)
 
-	fields := madmin.KvFields(inputs[1], defaultKVS[subSys].Keys())
+	fields := kvFields(inputs[1], defaultKVS[subSys].Keys())
 	if len(fields) == 0 {
 		return false, Errorf("sub-system '%s' cannot have empty keys", subSys)
 	}
@@ -947,7 +929,7 @@ func (c Config) SetKVS(s string, defaultKVS map[string]KVS) (dynamic bool, err e
 func (c Config) CheckValidKeys(subSys string, deprecatedKeys []string) error {
 	defKVS, ok := DefaultKVS[subSys]
 	if !ok {
-		return fmt.Errorf("Subsystem %s does not exist", subSys)
+		return Errorf("Subsystem %s does not exist", subSys)
 	}
 
 	// Make a list of valid keys for the subsystem including the `comment`
@@ -972,7 +954,7 @@ func (c Config) CheckValidKeys(subSys string, deprecatedKeys []string) error {
 
 	isSingleTarget := SubSystemsSingleTargets.Contains(subSys)
 	if isSingleTarget && len(candidates) > 0 {
-		return fmt.Errorf("The following environment variables are unknown: %s",
+		return Errorf("The following environment variables are unknown: %s",
 			strings.Join(candidates.ToSlice(), ", "))
 	}
 
@@ -992,7 +974,7 @@ func (c Config) CheckValidKeys(subSys string, deprecatedKeys []string) error {
 
 		// Whatever remains are invalid env vars - return an error.
 		if len(candidates) > 0 {
-			return fmt.Errorf("The following environment variables are unknown: %s",
+			return Errorf("The following environment variables are unknown: %s",
 				strings.Join(candidates.ToSlice(), ", "))
 		}
 	}
@@ -1019,7 +1001,8 @@ func (c Config) CheckValidKeys(subSys string, deprecatedKeys []string) error {
 // GetAvailableTargets - returns a list of targets configured for the given
 // subsystem (whether they are enabled or not). A target could be configured via
 // environment variables or via the configuration store. The default target is
-// `_` and is always returned.
+// `_` and is always returned. The result is sorted so that the default target
+// is the first one and the remaining entries are sorted in ascending order.
 func (c Config) GetAvailableTargets(subSys string) ([]string, error) {
 	if SubSystemsSingleTargets.Contains(subSys) {
 		return []string{Default}, nil
@@ -1027,15 +1010,15 @@ func (c Config) GetAvailableTargets(subSys string) ([]string, error) {
 
 	defKVS, ok := DefaultKVS[subSys]
 	if !ok {
-		return nil, fmt.Errorf("Subsystem %s does not exist", subSys)
+		return nil, Errorf("Subsystem %s does not exist", subSys)
 	}
 
 	kvsMap := c[subSys]
-	s := set.NewStringSet()
+	seen := set.NewStringSet()
 
 	// Add all targets that are configured in the config store.
 	for k := range kvsMap {
-		s.Add(k)
+		seen.Add(k)
 	}
 
 	// Add targets that are configured via environment variables.
@@ -1045,23 +1028,29 @@ func (c Config) GetAvailableTargets(subSys string) ([]string, error) {
 		for _, k := range envsWithPrefix {
 			tgtName := strings.TrimPrefix(k, envVarPrefix)
 			if tgtName != "" {
-				s.Add(tgtName)
+				seen.Add(tgtName)
 			}
 		}
 	}
 
-	return s.ToSlice(), nil
+	seen.Remove(Default)
+	targets := seen.ToSlice()
+	sort.Strings(targets)
+	targets = append([]string{Default}, targets...)
+
+	return targets, nil
 }
 
 func getEnvVarName(subSys, target, param string) string {
 	if target == Default {
-		return fmt.Sprintf("%s%s_%s", EnvPrefix, strings.ToUpper(subSys), strings.ToUpper(param))
+		return fmt.Sprintf("%s%s%s%s", EnvPrefix, strings.ToUpper(subSys), Default, strings.ToUpper(param))
 	}
 
-	return fmt.Sprintf("%s%s_%s_%s", EnvPrefix, strings.ToUpper(subSys), strings.ToUpper(param), target)
+	return fmt.Sprintf("%s%s%s%s%s%s", EnvPrefix, strings.ToUpper(subSys), Default, strings.ToUpper(param),
+		Default, target)
 }
 
-var resolvableSubsystems = set.CreateStringSet(IdentityOpenIDSubSys)
+var resolvableSubsystems = set.CreateStringSet(IdentityOpenIDSubSys, IdentityLDAPSubSys)
 
 // ValueSource represents the source of a config parameter value.
 type ValueSource uint8
@@ -1100,6 +1089,10 @@ func (c Config) ResolveConfigParam(subSys, target, cfgParam string) (value strin
 	}
 
 	defValue, isFound := defKVS.Lookup(cfgParam)
+	// Comments usually are absent from `defKVS`, so we handle it specially.
+	if !isFound && cfgParam == Comment {
+		defValue, isFound = "", true
+	}
 	if !isFound {
 		return
 	}
@@ -1133,4 +1126,193 @@ func (c Config) ResolveConfigParam(subSys, target, cfgParam string) (value strin
 	value = defValue
 	cs = ValueSourceDef
 	return
+}
+
+// KVSrc represents a configuration parameter key and value along with the
+// source of the value.
+type KVSrc struct {
+	Key   string
+	Value string
+	Src   ValueSource
+}
+
+// GetResolvedConfigParams returns all applicable config parameters with their
+// value sources.
+func (c Config) GetResolvedConfigParams(subSys, target string) ([]KVSrc, error) {
+	// Initially only support OpenID
+	if !resolvableSubsystems.Contains(subSys) {
+		return nil, Errorf("unsupported subsystem: %s", subSys)
+	}
+
+	// Check if config param requested is valid.
+	defKVS, ok := DefaultKVS[subSys]
+	if !ok {
+		return nil, Errorf("unknown subsystem: %s", subSys)
+	}
+
+	r := make([]KVSrc, 0, len(defKVS)+1)
+	for _, kv := range defKVS {
+		v, vs := c.ResolveConfigParam(subSys, target, kv.Key)
+
+		// Fix `vs` when default.
+		if v == kv.Value {
+			vs = ValueSourceDef
+		}
+
+		r = append(r, KVSrc{
+			Key:   kv.Key,
+			Value: v,
+			Src:   vs,
+		})
+	}
+
+	// Add the comment key as well if non-empty.
+	v, vs := c.ResolveConfigParam(subSys, target, Comment)
+	if vs != ValueSourceDef {
+		r = append(r, KVSrc{
+			Key:   Comment,
+			Value: v,
+			Src:   vs,
+		})
+	}
+
+	return r, nil
+}
+
+func (c Config) getTargetKVS(subSys, target string) KVS {
+	store, ok := c[subSys]
+	if !ok {
+		return nil
+	}
+	return store[target]
+}
+
+// EnvPair represents an environment variable and its value.
+type EnvPair struct {
+	Name, Value string
+}
+
+// SubsysInfo holds config info for a subsystem target.
+type SubsysInfo struct {
+	SubSys, Target string
+	Defaults       KVS
+	Config         KVS
+
+	// map of config parameter name to EnvPair.
+	EnvMap map[string]EnvPair
+}
+
+// GetSubsysInfo returns `SubsysInfo`s for all targets for the subsystem, when
+// target is empty. Otherwise returns `SubsysInfo` for the desired target only.
+// To request the default target only, target must be set to `Default`.
+func (c Config) GetSubsysInfo(subSys, target string) ([]SubsysInfo, error) {
+	// Check if config param requested is valid.
+	defKVS1, ok := DefaultKVS[subSys]
+	if !ok {
+		return nil, Errorf("unknown subsystem: %s", subSys)
+	}
+
+	targets, err := c.GetAvailableTargets(subSys)
+	if err != nil {
+		return nil, err
+	}
+
+	if target != "" {
+		found := false
+		for _, t := range targets {
+			if t == target {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, Errorf("there is no target `%s` for subsystem `%s`", target, subSys)
+		}
+		targets = []string{target}
+	}
+
+	// The `Comment` configuration variable is optional but is available to be
+	// set for all sub-systems. It is not present in the `DefaultKVS` map's
+	// values. To enable fetching a configured comment value from the
+	// environment we add it to the list of default keys for the subsystem.
+	defKVS := make([]KV, len(defKVS1), len(defKVS1)+1)
+	copy(defKVS, defKVS1)
+	defKVS = append(defKVS, KV{Key: Comment})
+
+	r := make([]SubsysInfo, 0, len(targets))
+	for _, target := range targets {
+		kvs := c.getTargetKVS(subSys, target)
+		cs := SubsysInfo{
+			SubSys:   subSys,
+			Target:   target,
+			Defaults: defKVS,
+			Config:   kvs,
+			EnvMap:   make(map[string]EnvPair),
+		}
+
+		// Add all env vars that are set.
+		for _, kv := range defKVS {
+			envName := getEnvVarName(subSys, target, kv.Key)
+			envPair := EnvPair{
+				Name:  envName,
+				Value: env.Get(envName, ""),
+			}
+			if envPair.Value != "" {
+				cs.EnvMap[kv.Key] = envPair
+			}
+		}
+
+		r = append(r, cs)
+	}
+
+	return r, nil
+}
+
+// AddEnvString adds env vars to the given string builder.
+func (cs *SubsysInfo) AddEnvString(b *strings.Builder) {
+	for _, v := range cs.Defaults {
+		if ep, ok := cs.EnvMap[v.Key]; ok {
+			b.WriteString(KvComment)
+			b.WriteString(KvSpaceSeparator)
+			b.WriteString(ep.Name)
+			b.WriteString(EnvSeparator)
+			b.WriteString(ep.Value)
+			b.WriteString(KvNewline)
+		}
+	}
+}
+
+// WriteTo writes the string representation of the configuration to the given
+// builder. When off is true, adds a comment character before the config system
+// output. It also ignores values when empty and deprecated.
+func (cs *SubsysInfo) WriteTo(b *strings.Builder, off bool) {
+	cs.AddEnvString(b)
+	if off {
+		b.WriteString(KvComment)
+		b.WriteString(KvSpaceSeparator)
+	}
+	b.WriteString(cs.SubSys)
+	if cs.Target != Default {
+		b.WriteString(SubSystemSeparator)
+		b.WriteString(cs.Target)
+	}
+	b.WriteString(KvSpaceSeparator)
+	for _, kv := range cs.Config {
+		dkv, ok := cs.Defaults.LookupKV(kv.Key)
+		if !ok {
+			continue
+		}
+		// Ignore empty and deprecated values
+		if dkv.Deprecated && kv.Value == "" {
+			continue
+		}
+		// Do not need to print if state is on
+		if kv.Key == Enable && kv.Value == EnableOn {
+			continue
+		}
+		b.WriteString(kv.String())
+		b.WriteString(KvSpaceSeparator)
+	}
+
+	b.WriteString(KvNewline)
 }

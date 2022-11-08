@@ -48,7 +48,7 @@ type Config struct {
 	Transport  http.RoundTripper `json:"-"`
 
 	// Custom logger
-	LogOnce func(ctx context.Context, err error, id interface{}, errKind ...interface{}) `json:"-"`
+	LogOnce func(ctx context.Context, err error, id string, errKind ...interface{}) `json:"-"`
 }
 
 // Target implements logger.Target and sends the json
@@ -203,7 +203,7 @@ func New(config Config) *Target {
 }
 
 // Send log message 'e' to http target.
-func (h *Target) Send(entry interface{}, errKind string) error {
+func (h *Target) Send(entry interface{}) error {
 	select {
 	case <-h.doneCh:
 		return nil

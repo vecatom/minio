@@ -48,7 +48,7 @@ type Target struct {
 }
 
 // Send log message 'e' to kafka target.
-func (h *Target) Send(entry interface{}, errKind string) error {
+func (h *Target) Send(entry interface{}) error {
 	select {
 	case <-h.doneCh:
 		return nil
@@ -129,7 +129,7 @@ type Config struct {
 	} `json:"sasl"`
 
 	// Custom logger
-	LogOnce func(ctx context.Context, err error, id interface{}, errKind ...interface{}) `json:"-"`
+	LogOnce func(ctx context.Context, err error, id string, errKind ...interface{}) `json:"-"`
 }
 
 // Check if atleast one broker in cluster is active

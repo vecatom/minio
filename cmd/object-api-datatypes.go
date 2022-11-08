@@ -18,12 +18,11 @@
 package cmd
 
 import (
-	"encoding/base64"
 	"io"
 	"math"
 	"time"
 
-	humanize "github.com/dustin/go-humanize"
+	"github.com/dustin/go-humanize"
 	"github.com/minio/madmin-go"
 	"github.com/minio/minio/internal/bucket/replication"
 	"github.com/minio/minio/internal/hash"
@@ -39,8 +38,6 @@ const (
 	BackendFS = BackendType(madmin.FS)
 	// Multi disk BackendErasure (single, distributed) backend.
 	BackendErasure = BackendType(madmin.Erasure)
-	// Gateway backend.
-	BackendGateway = BackendType(madmin.Gateway)
 	// Add your own backend.
 )
 
@@ -78,6 +75,10 @@ type BucketInfo struct {
 
 	// Date and time when the bucket was created.
 	Created time.Time
+	Deleted time.Time
+
+	// Bucket features enabled
+	Versioning, ObjectLocking bool
 }
 
 // ObjectInfo - represents object metadata.
@@ -99,9 +100,6 @@ type ObjectInfo struct {
 
 	// Hex encoded unique entity tag of the object.
 	ETag string
-
-	// The ETag stored in the gateway backend
-	InnerETag string
 
 	// Version ID of this object.
 	VersionID string
@@ -177,6 +175,10 @@ type ObjectInfo struct {
 	NumVersions int
 	//  The modtime of the successor object version if any
 	SuccessorModTime time.Time
+
+	// Checksums added on upload.
+	// Encoded, maybe encrypted.
+	Checksum []byte
 }
 
 // ArchiveInfo returns any saved zip archive meta information
@@ -187,14 +189,6 @@ func (o ObjectInfo) ArchiveInfo() []byte {
 	z, ok := o.UserDefined[archiveInfoMetadataKey]
 	if !ok {
 		return nil
-	}
-	if len(z) > 0 && z[0] >= 32 {
-		// FS/gateway mode does base64 encoding on roundtrip.
-		// zipindex has version as first byte, which is below any base64 value.
-		zipInfo, _ := base64.StdEncoding.DecodeString(z)
-		if len(zipInfo) != 0 {
-			return zipInfo
-		}
 	}
 	return []byte(z)
 }
@@ -208,7 +202,6 @@ func (o ObjectInfo) Clone() (cinfo ObjectInfo) {
 		Size:                       o.Size,
 		IsDir:                      o.IsDir,
 		ETag:                       o.ETag,
-		InnerETag:                  o.InnerETag,
 		VersionID:                  o.VersionID,
 		IsLatest:                   o.IsLatest,
 		DeleteMarker:               o.DeleteMarker,
@@ -261,13 +254,16 @@ func (o ObjectInfo) tierStats() tierStats {
 // ReplicateObjectInfo represents object info to be replicated
 type ReplicateObjectInfo struct {
 	ObjectInfo
-	OpType            replication.Type
-	RetryCount        uint32
-	ResetID           string
-	Dsc               ReplicateDecision
-	ExistingObjResync ResyncDecision
-	TargetArn         string
-	TargetStatuses    map[string]replication.StatusType
+	OpType               replication.Type
+	EventType            string
+	RetryCount           uint32
+	ResetID              string
+	Dsc                  ReplicateDecision
+	ExistingObjResync    ResyncDecision
+	TargetArn            string
+	TargetStatuses       map[string]replication.StatusType
+	TargetPurgeStatuses  map[string]VersionPurgeStatusType
+	ReplicationTimestamp time.Time
 }
 
 // MultipartInfo captures metadata information about the uploadId
@@ -325,6 +321,9 @@ type ListPartsInfo struct {
 
 	// Any metadata set during InitMultipartUpload, including encryption headers.
 	UserDefined map[string]string
+
+	// ChecksumAlgorithm if set
+	ChecksumAlgorithm string
 }
 
 // Lookup - returns if uploadID is valid
@@ -501,6 +500,12 @@ type PartInfo struct {
 
 	// Decompressed Size.
 	ActualSize int64
+
+	// Checksum values
+	ChecksumCRC32  string
+	ChecksumCRC32C string
+	ChecksumSHA1   string
+	ChecksumSHA256 string
 }
 
 // CompletePart - represents the part that was completed, this is sent by the client
@@ -512,6 +517,12 @@ type CompletePart struct {
 
 	// Entity tag returned when the part was uploaded.
 	ETag string
+
+	// Checksum values. Optional.
+	ChecksumCRC32  string
+	ChecksumCRC32C string
+	ChecksumSHA1   string
+	ChecksumSHA256 string
 }
 
 // CompletedParts - is a collection satisfying sort.Interface.
@@ -525,4 +536,10 @@ func (a CompletedParts) Less(i, j int) bool { return a[i].PartNumber < a[j].Part
 // client during CompleteMultipartUpload request.
 type CompleteMultipartUpload struct {
 	Parts []CompletePart `xml:"Part"`
+}
+
+// NewMultipartUploadResult contains information about a newly created multipart upload.
+type NewMultipartUploadResult struct {
+	UploadID     string
+	ChecksumAlgo string
 }

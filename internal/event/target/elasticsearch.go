@@ -24,7 +24,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -36,6 +35,7 @@ import (
 	elasticsearch7 "github.com/elastic/go-elasticsearch/v7"
 	"github.com/minio/highwayhash"
 	"github.com/minio/minio/internal/event"
+	"github.com/minio/minio/internal/logger"
 	xnet "github.com/minio/pkg/net"
 	"github.com/pkg/errors"
 )
@@ -152,11 +152,14 @@ func (a ElasticsearchArgs) Validate() error {
 
 // ElasticsearchTarget - Elasticsearch target.
 type ElasticsearchTarget struct {
+	lazyInit lazyInit
+
 	id         event.TargetID
 	args       ElasticsearchArgs
 	client     esClient
 	store      Store
-	loggerOnce func(ctx context.Context, err error, id interface{}, errKind ...interface{})
+	loggerOnce logger.LogOnce
+	quitCh     chan struct{}
 }
 
 // ID - returns target ID.
@@ -164,13 +167,15 @@ func (target *ElasticsearchTarget) ID() event.TargetID {
 	return target.id
 }
 
-// HasQueueStore - Checks if the queueStore has been configured for the target
-func (target *ElasticsearchTarget) HasQueueStore() bool {
-	return target.store != nil
-}
-
 // IsActive - Return true if target is up and active
 func (target *ElasticsearchTarget) IsActive() (bool, error) {
+	if err := target.init(); err != nil {
+		return false, err
+	}
+	return target.isActive()
+}
+
+func (target *ElasticsearchTarget) isActive() (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -184,6 +189,10 @@ func (target *ElasticsearchTarget) IsActive() (bool, error) {
 
 // Save - saves the events to the store if queuestore is configured, which will be replayed when the elasticsearch connection is active.
 func (target *ElasticsearchTarget) Save(eventData event.Event) error {
+	if err := target.init(); err != nil {
+		return err
+	}
+
 	if target.store != nil {
 		return target.store.Put(eventData)
 	}
@@ -246,6 +255,10 @@ func (target *ElasticsearchTarget) send(eventData event.Event) error {
 
 // Send - reads an event from store and sends it to Elasticsearch.
 func (target *ElasticsearchTarget) Send(eventKey string) error {
+	if err := target.init(); err != nil {
+		return err
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -277,6 +290,7 @@ func (target *ElasticsearchTarget) Send(eventKey string) error {
 
 // Close - does nothing and available for interface compatibility.
 func (target *ElasticsearchTarget) Close() error {
+	close(target.quitCh)
 	if target.client != nil {
 		// Stops the background processes that the client is running.
 		target.client.stop()
@@ -319,39 +333,46 @@ func (target *ElasticsearchTarget) checkAndInitClient(ctx context.Context) error
 	return nil
 }
 
-// NewElasticsearchTarget - creates new Elasticsearch target.
-func NewElasticsearchTarget(id string, args ElasticsearchArgs, doneCh <-chan struct{}, loggerOnce func(ctx context.Context, err error, id interface{}, kind ...interface{}), test bool) (*ElasticsearchTarget, error) {
-	target := &ElasticsearchTarget{
-		id:         event.TargetID{ID: id, Name: "elasticsearch"},
-		args:       args,
-		loggerOnce: loggerOnce,
-	}
+func (target *ElasticsearchTarget) init() error {
+	return target.lazyInit.Do(target.initElasticsearch)
+}
 
-	if args.QueueDir != "" {
-		queueDir := filepath.Join(args.QueueDir, storePrefix+"-elasticsearch-"+id)
-		target.store = NewQueueStore(queueDir, args.QueueLimit)
-		if err := target.store.Open(); err != nil {
-			target.loggerOnce(context.Background(), err, target.ID())
-			return target, err
-		}
-	}
-
+func (target *ElasticsearchTarget) initElasticsearch() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	err := target.checkAndInitClient(ctx)
 	if err != nil {
-		if target.store == nil || err != errNotConnected {
-			target.loggerOnce(context.Background(), err, target.ID())
-			return target, err
+		if err != errNotConnected {
+			target.loggerOnce(context.Background(), err, target.ID().String())
+		}
+		return err
+	}
+
+	return nil
+}
+
+// NewElasticsearchTarget - creates new Elasticsearch target.
+func NewElasticsearchTarget(id string, args ElasticsearchArgs, loggerOnce logger.LogOnce) (*ElasticsearchTarget, error) {
+	var store Store
+	if args.QueueDir != "" {
+		queueDir := filepath.Join(args.QueueDir, storePrefix+"-elasticsearch-"+id)
+		store = NewQueueStore(queueDir, args.QueueLimit)
+		if err := store.Open(); err != nil {
+			return nil, fmt.Errorf("unable to initialize the queue store of Elasticsearch `%s`: %w", id, err)
 		}
 	}
 
-	if target.store != nil && !test {
-		// Replays the events from the store.
-		eventKeyCh := replayEvents(target.store, doneCh, target.loggerOnce, target.ID())
-		// Start replaying events from the store.
-		go sendEvents(target, eventKeyCh, doneCh, target.loggerOnce)
+	target := &ElasticsearchTarget{
+		id:         event.TargetID{ID: id, Name: "elasticsearch"},
+		args:       args,
+		store:      store,
+		loggerOnce: loggerOnce,
+		quitCh:     make(chan struct{}),
+	}
+
+	if target.store != nil {
+		streamEventsFromStore(target.store, target, target.quitCh, target.loggerOnce)
 	}
 
 	return target, nil
@@ -448,7 +469,7 @@ func (c *esClientV7) createIndex(args ElasticsearchArgs) error {
 			err := fmt.Errorf("Create index err: %s", res.String())
 			return err
 		}
-		io.Copy(ioutil.Discard, resp.Body)
+		io.Copy(io.Discard, resp.Body)
 		return nil
 	}
 	return nil
@@ -461,7 +482,7 @@ func (c *esClientV7) ping(ctx context.Context, _ ElasticsearchArgs) (bool, error
 	if err != nil {
 		return false, errNotConnected
 	}
-	io.Copy(ioutil.Discard, resp.Body)
+	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	return !resp.IsError(), nil
 }
@@ -475,7 +496,7 @@ func (c *esClientV7) entryExists(ctx context.Context, index string, key string) 
 	if err != nil {
 		return false, err
 	}
-	io.Copy(ioutil.Discard, res.Body)
+	io.Copy(io.Discard, res.Body)
 	res.Body.Close()
 	return !res.IsError(), nil
 }
@@ -492,11 +513,10 @@ func (c *esClientV7) removeEntry(ctx context.Context, index string, key string) 
 			return err
 		}
 		defer res.Body.Close()
+		defer io.Copy(io.Discard, res.Body)
 		if res.IsError() {
-			err := fmt.Errorf("Delete err: %s", res.String())
-			return err
+			return fmt.Errorf("Delete err: %s", res.String())
 		}
-		io.Copy(ioutil.Discard, res.Body)
 		return nil
 	}
 	return err
@@ -522,11 +542,11 @@ func (c *esClientV7) updateEntry(ctx context.Context, index string, key string, 
 		return err
 	}
 	defer res.Body.Close()
+	defer io.Copy(io.Discard, res.Body)
 	if res.IsError() {
-		err := fmt.Errorf("Update err: %s", res.String())
-		return err
+		return fmt.Errorf("Update err: %s", res.String())
 	}
-	io.Copy(ioutil.Discard, res.Body)
+
 	return nil
 }
 
@@ -549,11 +569,10 @@ func (c *esClientV7) addEntry(ctx context.Context, index string, eventData event
 		return err
 	}
 	defer res.Body.Close()
+	defer io.Copy(io.Discard, res.Body)
 	if res.IsError() {
-		err := fmt.Errorf("Add err: %s", res.String())
-		return err
+		return fmt.Errorf("Add err: %s", res.String())
 	}
-	io.Copy(ioutil.Discard, res.Body)
 	return nil
 }
 

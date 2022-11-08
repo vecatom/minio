@@ -27,10 +27,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/dustin/go-humanize"
 	"github.com/minio/minio-go/v7/pkg/set"
 	xnet "github.com/minio/pkg/net"
 
-	"github.com/dustin/go-humanize"
+	"github.com/minio/minio/internal/amztime"
 	"github.com/minio/minio/internal/config/dns"
 	"github.com/minio/minio/internal/crypto"
 	xhttp "github.com/minio/minio/internal/http"
@@ -52,6 +53,9 @@ const (
 
 	// Maximum size for user-defined metadata - See: https://docs.aws.amazon.com/AmazonS3/latest/dev/UsingMetadata.html
 	maxUserDataSize = 2 * 1024
+
+	// maxBuckets upto 500000 for any MinIO deployment.
+	maxBuckets = 500 * 1000
 )
 
 // ReservedMetadataPrefix is the prefix of a metadata key which
@@ -97,12 +101,25 @@ func isHTTPHeaderSizeTooLarge(header http.Header) bool {
 // Limits body and header to specific allowed maximum limits as per S3/MinIO API requirements.
 func setRequestLimitHandler(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tc, ok := r.Context().Value(contextTraceReqKey).(*traceCtxt)
+
 		// Reject unsupported reserved metadata first before validation.
 		if containsReservedMetadata(r.Header) {
+			if ok {
+				tc.funcName = "handler.ValidRequest"
+				tc.responseRecorder.LogErrBody = true
+			}
+
 			writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrUnsupportedMetadata), r.URL)
 			return
 		}
+
 		if isHTTPHeaderSizeTooLarge(r.Header) {
+			if ok {
+				tc.funcName = "handler.ValidRequest"
+				tc.responseRecorder.LogErrBody = true
+			}
+
 			writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrMetadataTooLarge), r.URL)
 			atomic.AddUint64(&globalHTTPStats.rejectedRequestsHeader, 1)
 			return
@@ -228,15 +245,10 @@ func isAdminReq(r *http.Request) bool {
 	return strings.HasPrefix(r.URL.Path, adminPathPrefix)
 }
 
-// Supported amz date formats.
-var amzDateFormats = []string{
-	// Do not change this order, x-amz-date format is usually in
-	// iso8601Format rest are meant for relaxed handling of other
-	// odd SDKs that might be out there.
-	iso8601Format,
-	time.RFC1123,
-	time.RFC1123Z,
-	// Add new AMZ date formats here.
+// Check to allow access to the reserved "bucket" `/minio` for KMS
+// API requests.
+func isKMSReq(r *http.Request) bool {
+	return strings.HasPrefix(r.URL.Path, kmsPathPrefix)
 }
 
 // Supported Amz date headers.
@@ -247,24 +259,17 @@ var amzDateHeaders = []string{
 	"date",
 }
 
-// parseAmzDate - parses date string into supported amz date formats.
-func parseAmzDate(amzDateStr string) (amzDate time.Time, apiErr APIErrorCode) {
-	for _, dateFormat := range amzDateFormats {
-		amzDate, err := time.Parse(dateFormat, amzDateStr)
-		if err == nil {
-			return amzDate, ErrNone
-		}
-	}
-	return time.Time{}, ErrMalformedDate
-}
-
 // parseAmzDateHeader - parses supported amz date headers, in
 // supported amz date formats.
 func parseAmzDateHeader(req *http.Request) (time.Time, APIErrorCode) {
 	for _, amzDateHeader := range amzDateHeaders {
 		amzDateStr := req.Header.Get(amzDateHeader)
 		if amzDateStr != "" {
-			return parseAmzDate(amzDateStr)
+			t, err := amztime.Parse(amzDateStr)
+			if err != nil {
+				return time.Time{}, ErrMalformedDate
+			}
+			return t, ErrNone
 		}
 	}
 	// Date header missing.
@@ -373,7 +378,14 @@ func hasMultipleAuth(r *http.Request) bool {
 // any malicious requests.
 func setRequestValidityHandler(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tc, ok := r.Context().Value(contextTraceReqKey).(*traceCtxt)
+
 		if err := hasBadHost(r.Host); err != nil {
+			if ok {
+				tc.funcName = "handler.ValidRequest"
+				tc.responseRecorder.LogErrBody = true
+			}
+
 			invalidReq := errorCodes.ToAPIErr(ErrInvalidRequest)
 			invalidReq.Description = fmt.Sprintf("%s (%s)", invalidReq.Description, err)
 			writeErrorResponse(r.Context(), w, invalidReq, r.URL)
@@ -383,6 +395,11 @@ func setRequestValidityHandler(h http.Handler) http.Handler {
 
 		// Check for bad components in URL path.
 		if hasBadPathComponent(r.URL.Path) {
+			if ok {
+				tc.funcName = "handler.ValidRequest"
+				tc.responseRecorder.LogErrBody = true
+			}
+
 			writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrInvalidResourceName), r.URL)
 			atomic.AddUint64(&globalHTTPStats.rejectedRequestsInvalid, 1)
 			return
@@ -391,6 +408,11 @@ func setRequestValidityHandler(h http.Handler) http.Handler {
 		for _, vv := range r.Form {
 			for _, v := range vv {
 				if hasBadPathComponent(v) {
+					if ok {
+						tc.funcName = "handler.ValidRequest"
+						tc.responseRecorder.LogErrBody = true
+					}
+
 					writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrInvalidResourceName), r.URL)
 					atomic.AddUint64(&globalHTTPStats.rejectedRequestsInvalid, 1)
 					return
@@ -398,6 +420,11 @@ func setRequestValidityHandler(h http.Handler) http.Handler {
 			}
 		}
 		if hasMultipleAuth(r) {
+			if ok {
+				tc.funcName = "handler.Auth"
+				tc.responseRecorder.LogErrBody = true
+			}
+
 			invalidReq := errorCodes.ToAPIErr(ErrInvalidRequest)
 			invalidReq.Description = fmt.Sprintf("%s (request has multiple authentication types, please use one)", invalidReq.Description)
 			writeErrorResponse(r.Context(), w, invalidReq, r.URL)
@@ -407,7 +434,11 @@ func setRequestValidityHandler(h http.Handler) http.Handler {
 		// For all other requests reject access to reserved buckets
 		bucketName, _ := request2BucketObjectName(r)
 		if isMinioReservedBucket(bucketName) || isMinioMetaBucket(bucketName) {
-			if !guessIsRPCReq(r) && !guessIsBrowserReq(r) && !guessIsHealthCheckReq(r) && !guessIsMetricsReq(r) && !isAdminReq(r) {
+			if !guessIsRPCReq(r) && !guessIsBrowserReq(r) && !guessIsHealthCheckReq(r) && !guessIsMetricsReq(r) && !isAdminReq(r) && !isKMSReq(r) {
+				if ok {
+					tc.funcName = "handler.ValidRequest"
+					tc.responseRecorder.LogErrBody = true
+				}
 				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrAllAccessDisabled), r.URL)
 				return
 			}
@@ -415,8 +446,18 @@ func setRequestValidityHandler(h http.Handler) http.Handler {
 		// Deny SSE-C requests if not made over TLS
 		if !globalIsTLS && (crypto.SSEC.IsRequested(r.Header) || crypto.SSECopy.IsRequested(r.Header)) {
 			if r.Method == http.MethodHead {
+				if ok {
+					tc.funcName = "handler.ValidRequest"
+					tc.responseRecorder.LogErrBody = false
+				}
+
 				writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(ErrInsecureSSECustomerRequest))
 			} else {
+				if ok {
+					tc.funcName = "handler.ValidRequest"
+					tc.responseRecorder.LogErrBody = true
+				}
+
 				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrInsecureSSECustomerRequest), r.URL)
 			}
 			return
@@ -532,6 +573,50 @@ func setCriticalErrorHandler(h http.Handler) http.Handler {
 				return
 			}
 		}()
+		h.ServeHTTP(w, r)
+	})
+}
+
+// setUploadForwardingHandler middleware forwards multiparts requests
+// in a site replication setup to peer that initiated the upload
+func setUploadForwardingHandler(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !globalSiteReplicationSys.isEnabled() ||
+			guessIsHealthCheckReq(r) || guessIsMetricsReq(r) ||
+			guessIsRPCReq(r) || guessIsLoginSTSReq(r) || isAdminReq(r) {
+			h.ServeHTTP(w, r)
+			return
+		}
+		bucket, object := request2BucketObjectName(r)
+		uploadID := r.Form.Get(xhttp.UploadID)
+
+		if bucket != "" && object != "" && uploadID != "" {
+			deplID, err := getDeplIDFromUpload(uploadID)
+			if err != nil {
+				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrNoSuchUpload), r.URL)
+				return
+			}
+			remote, self := globalSiteReplicationSys.getPeerForUpload(deplID)
+			if self {
+				h.ServeHTTP(w, r)
+				return
+			}
+			// forward request to peer handling this upload
+			if globalBucketTargetSys.isOffline(remote.EndpointURL) {
+				writeErrorResponse(r.Context(), w, errorCodes.ToAPIErr(ErrReplicationRemoteConnectionError), r.URL)
+				return
+			}
+
+			r.URL.Scheme = remote.EndpointURL.Scheme
+			r.URL.Host = remote.EndpointURL.Host
+			// Make sure we remove any existing headers before
+			// proxying the request to another node.
+			for k := range w.Header() {
+				w.Header().Del(k)
+			}
+			globalForwarder.ServeHTTP(w, r)
+			return
+		}
 		h.ServeHTTP(w, r)
 	})
 }

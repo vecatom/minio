@@ -1,4 +1,4 @@
-// Copyright (c) 2015-2021 MinIO, Inc.
+// Copyright (c) 2015-2022 MinIO, Inc.
 //
 // This file is part of MinIO Object Storage stack
 //
@@ -18,7 +18,7 @@
 package cmd
 
 const (
-	storageRESTVersion       = "v45" // Added ReadXL API
+	storageRESTVersion       = "v49" // Added RenameData() to return versions
 	storageRESTVersionPrefix = SlashSeparator + storageRESTVersion
 	storageRESTPrefix        = minioReservedBucketPath + "/storage"
 )
@@ -53,6 +53,7 @@ const (
 	storageRESTMethodVerifyFile     = "/verifyfile"
 	storageRESTMethodWalkDir        = "/walkdir"
 	storageRESTMethodStatInfoFile   = "/statfile"
+	storageRESTMethodReadMultiple   = "/readmultiple"
 )
 
 const (

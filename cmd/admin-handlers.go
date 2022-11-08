@@ -21,13 +21,17 @@ import (
 	"bytes"
 	"context"
 	crand "crypto/rand"
+	"crypto/rsa"
 	"crypto/subtle"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
-	"io/ioutil"
+	"math"
 	"math/rand"
 	"net/http"
 	"net/url"
@@ -44,6 +48,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/klauspost/compress/zip"
 	"github.com/minio/madmin-go"
+	"github.com/minio/madmin-go/estream"
 	"github.com/minio/minio/internal/dsync"
 	"github.com/minio/minio/internal/handlers"
 	xhttp "github.com/minio/minio/internal/http"
@@ -68,16 +73,6 @@ const (
 	mgmtForceStart  = "forceStart"
 	mgmtForceStop   = "forceStop"
 )
-
-func updateServer(u *url.URL, sha256Sum []byte, lrTime time.Time, releaseInfo string, mode string) (us madmin.ServerUpdateStatus, err error) {
-	if err = doUpdate(u, lrTime, sha256Sum, releaseInfo, mode); err != nil {
-		return us, err
-	}
-
-	us.CurrentVersion = Version
-	us.UpdatedVersion = lrTime.Format(minioReleaseTagTimeLayout)
-	return us, nil
-}
 
 // ServerUpdateHandler - POST /minio/admin/v3/update?updateURL={updateURL}
 // ----------
@@ -150,7 +145,16 @@ func (a adminAPIHandlers) ServerUpdateHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	for _, nerr := range globalNotificationSys.ServerUpdate(ctx, u, sha256Sum, lrTime, releaseInfo) {
+	// Download Binary Once
+	reader, err := downloadBinary(u, mode)
+	if err != nil {
+		logger.LogIf(ctx, fmt.Errorf("server update failed with %w", err))
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+
+	// Push binary to other servers
+	for _, nerr := range globalNotificationSys.VerifyBinary(ctx, u, sha256Sum, releaseInfo, reader) {
 		if nerr.Err != nil {
 			err := AdminError{
 				Code:       AdminUpdateApplyFailure,
@@ -164,11 +168,37 @@ func (a adminAPIHandlers) ServerUpdateHandler(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	updateStatus, err := updateServer(u, sha256Sum, lrTime, releaseInfo, mode)
+	err = verifyBinary(u, sha256Sum, releaseInfo, mode, reader)
 	if err != nil {
 		logger.LogIf(ctx, fmt.Errorf("server update failed with %w", err))
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
+	}
+
+	for _, nerr := range globalNotificationSys.CommitBinary(ctx) {
+		if nerr.Err != nil {
+			err := AdminError{
+				Code:       AdminUpdateApplyFailure,
+				Message:    nerr.Err.Error(),
+				StatusCode: http.StatusInternalServerError,
+			}
+			logger.GetReqInfo(ctx).SetTags("peerAddress", nerr.Host.String())
+			logger.LogIf(ctx, fmt.Errorf("server update failed with %w", err))
+			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+			return
+		}
+	}
+
+	err = commitBinary()
+	if err != nil {
+		logger.LogIf(ctx, fmt.Errorf("server update failed with %w", err))
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+
+	updateStatus := madmin.ServerUpdateStatus{
+		CurrentVersion: Version,
+		UpdatedVersion: lrTime.Format(minioReleaseTagTimeLayout),
 	}
 
 	// Marshal API response
@@ -341,6 +371,116 @@ func (a adminAPIHandlers) StorageInfoHandler(w http.ResponseWriter, r *http.Requ
 	// Reply with storage information (across nodes in a
 	// distributed setup) as json.
 	writeSuccessResponseJSON(w, jsonBytes)
+}
+
+// MetricsHandler - GET /minio/admin/v3/metrics
+// ----------
+// Get realtime server metrics
+func (a adminAPIHandlers) MetricsHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "Metrics")
+
+	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
+
+	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.ServerInfoAdminAction)
+	if objectAPI == nil {
+		return
+	}
+	const defaultMetricsInterval = time.Second
+
+	interval, err := time.ParseDuration(r.Form.Get("interval"))
+	if err != nil || interval < time.Second {
+		interval = defaultMetricsInterval
+	}
+
+	n, err := strconv.Atoi(r.Form.Get("n"))
+	if err != nil || n <= 0 {
+		n = math.MaxInt32
+	}
+
+	var types madmin.MetricType
+	if t, _ := strconv.ParseUint(r.Form.Get("types"), 10, 64); t != 0 {
+		types = madmin.MetricType(t)
+	} else {
+		types = madmin.MetricsAll
+	}
+
+	disks := strings.Split(r.Form.Get("disks"), ",")
+	byDisk := strings.EqualFold(r.Form.Get("by-disk"), "true")
+	var diskMap map[string]struct{}
+	if len(disks) > 0 && disks[0] != "" {
+		diskMap = make(map[string]struct{}, len(disks))
+		for _, k := range disks {
+			if k != "" {
+				diskMap[k] = struct{}{}
+			}
+		}
+	}
+	jobID := r.Form.Get("by-jobID")
+
+	hosts := strings.Split(r.Form.Get("hosts"), ",")
+	byHost := strings.EqualFold(r.Form.Get("by-host"), "true")
+	var hostMap map[string]struct{}
+	if len(hosts) > 0 && hosts[0] != "" {
+		hostMap = make(map[string]struct{}, len(hosts))
+		for _, k := range hosts {
+			if k != "" {
+				hostMap[k] = struct{}{}
+			}
+		}
+	}
+
+	done := ctx.Done()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	w.Header().Set(xhttp.ContentType, string(mimeJSON))
+
+	enc := json.NewEncoder(w)
+	for n > 0 {
+		var m madmin.RealtimeMetrics
+		mLocal := collectLocalMetrics(types, collectMetricsOpts{
+			hosts: hostMap,
+			disks: diskMap,
+			jobID: jobID,
+		})
+		m.Merge(&mLocal)
+
+		// Allow half the interval for collecting remote...
+		cctx, cancel := context.WithTimeout(ctx, interval/2)
+		mRemote := collectRemoteMetrics(cctx, types, collectMetricsOpts{
+			hosts: hostMap,
+			disks: diskMap,
+			jobID: jobID,
+		})
+		cancel()
+		m.Merge(&mRemote)
+		if !byHost {
+			m.ByHost = nil
+		}
+		if !byDisk {
+			m.ByDisk = nil
+		}
+
+		m.Final = n <= 1
+
+		// Marshal API reesponse
+		if err := enc.Encode(&m); err != nil {
+			n = 0
+		}
+
+		n--
+		if n <= 0 {
+			break
+		}
+
+		// Flush before waiting for next...
+		w.(http.Flusher).Flush()
+
+		select {
+		case <-ticker.C:
+		case <-done:
+			return
+		}
+	}
 }
 
 // DataUsageInfoHandler - GET /minio/admin/v3/datausage
@@ -630,7 +770,7 @@ func (a adminAPIHandlers) ProfileHandler(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	// read request body
-	io.CopyN(ioutil.Discard, r.Body, 1)
+	io.CopyN(io.Discard, r.Body, 1)
 
 	globalProfilerMu.Lock()
 
@@ -805,11 +945,6 @@ func (a adminAPIHandlers) HealHandler(w http.ResponseWriter, r *http.Request) {
 
 	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.HealAdminAction)
 	if objectAPI == nil {
-		return
-	}
-
-	if globalIsGateway {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrHealNotImplemented), r.URL)
 		return
 	}
 
@@ -999,12 +1134,6 @@ func (a adminAPIHandlers) BackgroundHealStatusHandler(w http.ResponseWriter, r *
 		return
 	}
 
-	// Check if this setup has an erasure coded backend.
-	if globalIsGateway {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrHealNotImplemented), r.URL)
-		return
-	}
-
 	aggregateHealStateResult, err := getAggregatedBackgroundHealState(r.Context(), objectAPI)
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
@@ -1061,17 +1190,17 @@ func (a adminAPIHandlers) NetperfHandler(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-// SpeedtestHandler - Deprecated. See ObjectSpeedtestHandler
-func (a adminAPIHandlers) SpeedtestHandler(w http.ResponseWriter, r *http.Request) {
-	a.ObjectSpeedtestHandler(w, r)
+// SpeedtestHandler - Deprecated. See ObjectSpeedTestHandler
+func (a adminAPIHandlers) SpeedTestHandler(w http.ResponseWriter, r *http.Request) {
+	a.ObjectSpeedTestHandler(w, r)
 }
 
-// ObjectSpeedtestHandler - reports maximum speed of a cluster by performing PUT and
+// ObjectSpeedTestHandler - reports maximum speed of a cluster by performing PUT and
 // GET operations on the server, supports auto tuning by default by automatically
 // increasing concurrency and stopping when we have reached the limits on the
 // system.
-func (a adminAPIHandlers) ObjectSpeedtestHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := newContext(r, w, "ObjectSpeedtestHandler")
+func (a adminAPIHandlers) ObjectSpeedTestHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := newContext(r, w, "ObjectSpeedTestHandler")
 
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
@@ -1080,16 +1209,12 @@ func (a adminAPIHandlers) ObjectSpeedtestHandler(w http.ResponseWriter, r *http.
 		return
 	}
 
-	if globalIsGateway {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
-		return
-	}
-
 	sizeStr := r.Form.Get(peerRESTSize)
 	durationStr := r.Form.Get(peerRESTDuration)
 	concurrentStr := r.Form.Get(peerRESTConcurrent)
+	storageClass := strings.TrimSpace(r.Form.Get(peerRESTStorageClass))
+	customBucket := strings.TrimSpace(r.Form.Get(peerRESTBucket))
 	autotune := r.Form.Get("autotune") == "true"
-	storageClass := r.Form.Get("storage-class")
 
 	size, err := strconv.Atoi(sizeStr)
 	if err != nil {
@@ -1101,16 +1226,14 @@ func (a adminAPIHandlers) ObjectSpeedtestHandler(w http.ResponseWriter, r *http.
 		concurrent = 32
 	}
 
-	if runtime.GOMAXPROCS(0) < concurrent {
-		concurrent = runtime.GOMAXPROCS(0)
-	}
-
 	duration, err := time.ParseDuration(durationStr)
 	if err != nil {
 		duration = time.Second * 10
 	}
 
-	sufficientCapacity, canAutotune, capacityErrMsg := validateObjPerfOptions(ctx, objectAPI, concurrent, size, autotune)
+	storageInfo, _ := objectAPI.StorageInfo(ctx)
+
+	sufficientCapacity, canAutotune, capacityErrMsg := validateObjPerfOptions(ctx, storageInfo, concurrent, size, autotune)
 	if !sufficientCapacity {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, AdminError{
 			Code:       "XMinioSpeedtestInsufficientCapacity",
@@ -1124,15 +1247,23 @@ func (a adminAPIHandlers) ObjectSpeedtestHandler(w http.ResponseWriter, r *http.
 		autotune = false
 	}
 
-	bucketExists, err := makeObjectPerfBucket(ctx, objectAPI)
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
-		return
+	if customBucket == "" {
+		customBucket = globalObjectPerfBucket
+
+		bucketExists, err := makeObjectPerfBucket(ctx, objectAPI, customBucket)
+		if err != nil {
+			writeErrorResponseJSON(ctx, w, toAPIError(ctx, err), r.URL)
+			return
+		}
+
+		if !bucketExists {
+			defer deleteObjectPerfBucket(objectAPI)
+		}
 	}
 
-	if !bucketExists {
-		defer deleteObjectPerfBucket(objectAPI)
-	}
+	defer objectAPI.DeleteObject(ctx, customBucket, speedTest+SlashSeparator, ObjectOptions{
+		DeletePrefix: true,
+	})
 
 	// Freeze all incoming S3 API calls before running speedtest.
 	globalNotificationSys.ServiceFreeze(ctx, true)
@@ -1144,15 +1275,32 @@ func (a adminAPIHandlers) ObjectSpeedtestHandler(w http.ResponseWriter, r *http.
 	defer keepAliveTicker.Stop()
 
 	enc := json.NewEncoder(w)
-	ch := objectSpeedTest(ctx, speedTestOpts{size, concurrent, duration, autotune, storageClass})
+	ch := objectSpeedTest(ctx, speedTestOpts{
+		objectSize:       size,
+		concurrencyStart: concurrent,
+		duration:         duration,
+		autotune:         autotune,
+		storageClass:     storageClass,
+		bucketName:       customBucket,
+	})
+	var prevResult madmin.SpeedTestResult
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-keepAliveTicker.C:
-			// Write a blank entry to prevent client from disconnecting
-			if err := enc.Encode(madmin.SpeedTestResult{}); err != nil {
-				return
+			// if previous result is set keep writing the
+			// previous result back to the client
+			if prevResult.Version != "" {
+				if err := enc.Encode(prevResult); err != nil {
+					return
+				}
+			} else {
+				// first result is not yet obtained, keep writing
+				// empty entry to prevent client from disconnecting.
+				if err := enc.Encode(madmin.SpeedTestResult{}); err != nil {
+					return
+				}
 			}
 			w.(http.Flusher).Flush()
 		case result, ok := <-ch:
@@ -1162,14 +1310,14 @@ func (a adminAPIHandlers) ObjectSpeedtestHandler(w http.ResponseWriter, r *http.
 			if err := enc.Encode(result); err != nil {
 				return
 			}
+			prevResult = result
 			w.(http.Flusher).Flush()
 		}
 	}
 }
 
-func makeObjectPerfBucket(ctx context.Context, objectAPI ObjectLayer) (bucketExists bool, err error) {
-	err = objectAPI.MakeBucketWithLocation(ctx, globalObjectPerfBucket, BucketOptions{})
-	if err != nil {
+func makeObjectPerfBucket(ctx context.Context, objectAPI ObjectLayer, bucketName string) (bucketExists bool, err error) {
+	if err = objectAPI.MakeBucketWithLocation(ctx, bucketName, MakeBucketOptions{}); err != nil {
 		if _, ok := err.(BucketExists); !ok {
 			// Only BucketExists error can be ignored.
 			return false, err
@@ -1183,13 +1331,13 @@ func deleteObjectPerfBucket(objectAPI ObjectLayer) {
 	objectAPI.DeleteBucket(context.Background(), globalObjectPerfBucket, DeleteBucketOptions{
 		Force:      true,
 		NoRecreate: true,
+		SRDeleteOp: getSRBucketDeleteOp(globalSiteReplicationSys.isEnabled()),
 	})
 }
 
-func validateObjPerfOptions(ctx context.Context, objectAPI ObjectLayer, concurrent int, size int, autotune bool) (sufficientCapacity bool, canAutotune bool, capacityErrMsg string) {
-	storageInfo, _ := objectAPI.StorageInfo(ctx)
+func validateObjPerfOptions(ctx context.Context, storageInfo madmin.StorageInfo, concurrent int, size int, autotune bool) (bool, bool, string) {
 	capacityNeeded := uint64(concurrent * size)
-	capacity := uint64(GetTotalUsableCapacityFree(storageInfo.Disks, storageInfo))
+	capacity := GetTotalUsableCapacityFree(storageInfo.Disks, storageInfo)
 
 	if capacity < capacityNeeded {
 		return false, false, fmt.Sprintf("not enough usable space available to perform speedtest - expected %s, got %s",
@@ -1226,11 +1374,6 @@ func (a adminAPIHandlers) DriveSpeedtestHandler(w http.ResponseWriter, r *http.R
 
 	objectAPI, _ := validateAdminReq(ctx, w, r, iampolicy.HealthInfoAdminAction)
 	if objectAPI == nil {
-		return
-	}
-
-	if globalIsGateway {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
 		return
 	}
 
@@ -1300,72 +1443,45 @@ const (
 // - input entry is not of the type *madmin.TraceInfo*
 // - errOnly entries are to be traced, not status code 2xx, 3xx.
 // - madmin.TraceInfo type is asked by opts
-func mustTrace(entry interface{}, opts madmin.ServiceTraceOpts) (shouldTrace bool) {
-	trcInfo, ok := entry.(madmin.TraceInfo)
-	if !ok {
+func shouldTrace(trcInfo madmin.TraceInfo, opts madmin.ServiceTraceOpts) (shouldTrace bool) {
+	// Reject all unwanted types.
+	want := opts.TraceTypes()
+	if !want.Contains(trcInfo.TraceType) {
 		return false
 	}
 
-	// Override shouldTrace decision with errOnly filtering
-	defer func() {
-		if shouldTrace && opts.OnlyErrors {
-			shouldTrace = trcInfo.RespInfo.StatusCode >= http.StatusBadRequest
-		}
-	}()
+	isHTTP := trcInfo.TraceType.Overlaps(madmin.TraceInternal|madmin.TraceS3) && trcInfo.HTTP != nil
 
-	if opts.Threshold > 0 {
-		var latency time.Duration
-		switch trcInfo.TraceType {
-		case madmin.TraceOS:
-			latency = trcInfo.OSStats.Duration
-		case madmin.TraceStorage:
-			latency = trcInfo.StorageStats.Duration
-		case madmin.TraceHTTP:
-			latency = trcInfo.CallStats.Latency
-		}
-		if latency < opts.Threshold {
-			return false
-		}
+	// Check latency...
+	if opts.Threshold > 0 && trcInfo.Duration < opts.Threshold {
+		return false
 	}
 
-	if opts.Internal && trcInfo.TraceType == madmin.TraceHTTP && HasPrefix(trcInfo.ReqInfo.Path, minioReservedBucketPath+SlashSeparator) {
-		return true
+	// Check internal path
+	isInternal := isHTTP && HasPrefix(trcInfo.HTTP.ReqInfo.Path, minioReservedBucketPath+SlashSeparator)
+	if isInternal && !opts.Internal {
+		return false
 	}
 
-	if opts.S3 && trcInfo.TraceType == madmin.TraceHTTP && !HasPrefix(trcInfo.ReqInfo.Path, minioReservedBucketPath+SlashSeparator) {
-		return true
+	// Filter non-errors.
+	if isHTTP && opts.OnlyErrors && trcInfo.HTTP.RespInfo.StatusCode < http.StatusBadRequest {
+		return false
 	}
 
-	if opts.Storage && trcInfo.TraceType == madmin.TraceStorage {
-		return true
-	}
-
-	return opts.OS && trcInfo.TraceType == madmin.TraceOS
+	return true
 }
 
 func extractTraceOptions(r *http.Request) (opts madmin.ServiceTraceOpts, err error) {
-	q := r.Form
-
-	opts.OnlyErrors = q.Get("err") == "true"
-	opts.S3 = q.Get("s3") == "true"
-	opts.Internal = q.Get("internal") == "true"
-	opts.Storage = q.Get("storage") == "true"
-	opts.OS = q.Get("os") == "true"
-
+	if err := opts.ParseParams(r); err != nil {
+		return opts, err
+	}
 	// Support deprecated 'all' query
-	if q.Get("all") == "true" {
+	if r.Form.Get("all") == "true" {
 		opts.S3 = true
 		opts.Internal = true
 		opts.Storage = true
 		opts.OS = true
-	}
-
-	if t := q.Get("threshold"); t != "" {
-		d, err := time.ParseDuration(t)
-		if err != nil {
-			return opts, err
-		}
-		opts.Threshold = d
+		// Older mc - cannot deal with more types...
 	}
 	return
 }
@@ -1388,20 +1504,17 @@ func (a adminAPIHandlers) TraceHandler(w http.ResponseWriter, r *http.Request) {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
 		return
 	}
-
 	setEventStreamHeaders(w)
 
 	// Trace Publisher and peer-trace-client uses nonblocking send and hence does not wait for slow receivers.
 	// Use buffered channel to take care of burst sends or slow w.Write()
-	traceCh := make(chan interface{}, 4000)
+	traceCh := make(chan madmin.TraceInfo, 4000)
 
 	peers, _ := newPeerRestClients(globalEndpoints)
 
-	traceFn := func(entry interface{}) bool {
-		return mustTrace(entry, traceOpts)
-	}
-
-	err = globalTrace.Subscribe(traceCh, ctx.Done(), traceFn)
+	err = globalTrace.Subscribe(traceOpts.TraceTypes(), traceCh, ctx.Done(), func(entry madmin.TraceInfo) bool {
+		return shouldTrace(entry, traceOpts)
+	})
 	if err != nil {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrSlowDown), r.URL)
 		return
@@ -1442,7 +1555,7 @@ func (a adminAPIHandlers) TraceHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// The handler sends console logs to the connected HTTP client.
+// The ConsoleLogHandler handler sends console logs to the connected HTTP client.
 func (a adminAPIHandlers) ConsoleLogHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := newContext(r, w, "ConsoleLog")
 
@@ -1460,11 +1573,10 @@ func (a adminAPIHandlers) ConsoleLogHandler(w http.ResponseWriter, r *http.Reque
 		limitLines = 10
 	}
 
-	logKind := r.Form.Get("logType")
-	if logKind == "" {
-		logKind = string(logger.All)
+	logKind := madmin.LogKind(strings.ToUpper(r.Form.Get("logType"))).LogMask()
+	if logKind == 0 {
+		logKind = madmin.LogMaskAll
 	}
-	logKind = strings.ToUpper(logKind)
 
 	// Avoid reusing tcp connection if read timeout is hit
 	// This is needed to make r.Context().Done() work as
@@ -1473,7 +1585,7 @@ func (a adminAPIHandlers) ConsoleLogHandler(w http.ResponseWriter, r *http.Reque
 
 	setEventStreamHeaders(w)
 
-	logCh := make(chan interface{}, 4000)
+	logCh := make(chan log.Info, 4000)
 
 	peers, _ := newPeerRestClients(globalEndpoints)
 
@@ -1499,9 +1611,11 @@ func (a adminAPIHandlers) ConsoleLogHandler(w http.ResponseWriter, r *http.Reque
 
 	for {
 		select {
-		case entry := <-logCh:
-			log, ok := entry.(log.Info)
-			if ok && log.SendLog(node, logKind) {
+		case log, ok := <-logCh:
+			if !ok {
+				return
+			}
+			if log.SendLog(node, logKind) {
 				if err := enc.Encode(log); err != nil {
 					return
 				}
@@ -1539,7 +1653,7 @@ func (a adminAPIHandlers) KMSCreateKeyHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	if err := GlobalKMS.CreateKey(r.Form.Get("key-id")); err != nil {
+	if err := GlobalKMS.CreateKey(ctx, r.Form.Get("key-id")); err != nil {
 		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
 		return
 	}
@@ -1561,7 +1675,7 @@ func (a adminAPIHandlers) KMSStatusHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	stat, err := GlobalKMS.Stat()
+	stat, err := GlobalKMS.Stat(ctx)
 	if err != nil {
 		writeCustomErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInternalError), err.Error(), r.URL)
 		return
@@ -1600,7 +1714,7 @@ func (a adminAPIHandlers) KMSKeyStatusHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	stat, err := GlobalKMS.Stat()
+	stat, err := GlobalKMS.Stat(ctx)
 	if err != nil {
 		writeCustomErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInternalError), err.Error(), r.URL)
 		return
@@ -1616,7 +1730,7 @@ func (a adminAPIHandlers) KMSKeyStatusHandler(w http.ResponseWriter, r *http.Req
 
 	kmsContext := kms.Context{"MinIO admin API": "KMSKeyStatusHandler"} // Context for a test key operation
 	// 1. Generate a new key using the KMS.
-	key, err := GlobalKMS.GenerateKey(keyID, kmsContext)
+	key, err := GlobalKMS.GenerateKey(ctx, keyID, kmsContext)
 	if err != nil {
 		response.EncryptionErr = err.Error()
 		resp, err := json.Marshal(response)
@@ -1665,8 +1779,8 @@ func getServerInfo(ctx context.Context, r *http.Request) madmin.InfoMessage {
 	kmsStat := fetchKMSStatus()
 
 	ldap := madmin.LDAP{}
-	if globalLDAPConfig.Enabled {
-		ldapConn, err := globalLDAPConfig.Connect()
+	if globalLDAPConfig.Enabled() {
+		ldapConn, err := globalLDAPConfig.LDAP.Connect()
 		//nolint:gocritic
 		if err != nil {
 			ldap.Status = string(madmin.ItemOffline)
@@ -1752,7 +1866,7 @@ func getServerInfo(ctx context.Context, r *http.Request) madmin.InfoMessage {
 		Mode:         string(mode),
 		Domain:       domain,
 		Region:       globalSite.Region,
-		SQSARN:       globalNotificationSys.GetARNList(false),
+		SQSARN:       globalEventNotifier.GetARNList(false),
 		DeploymentID: globalDeploymentID,
 		Buckets:      buckets,
 		Objects:      objects,
@@ -1777,7 +1891,7 @@ func getKubernetesInfo(dctx context.Context) madmin.KubernetesInfo {
 	}
 
 	client := &http.Client{
-		Transport: NewGatewayHTTPTransport(),
+		Transport: NewHTTPTransport(),
 		Timeout:   10 * time.Second,
 	}
 
@@ -1835,11 +1949,6 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	deadline := 10 * time.Second // Default deadline is 10secs for health diagnostics.
-	if query.Get(string(madmin.HealthDataTypePerfNet)) != "" ||
-		query.Get(string(madmin.HealthDataTypePerfDrive)) != "" ||
-		query.Get(string(madmin.HealthDataTypePerfObj)) != "" {
-		deadline = 1 * time.Hour
-	}
 	if dstr := r.Form.Get("deadline"); dstr != "" {
 		var err error
 		deadline, err = time.ParseDuration(dstr)
@@ -1859,12 +1968,6 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 
 	healthCtx, healthCancel := context.WithTimeout(lkctx.Context(), deadline)
 	defer healthCancel()
-
-	// Freeze all incoming S3 API calls before running speedtest.
-	globalNotificationSys.ServiceFreeze(ctx, true)
-
-	// unfreeze all incoming S3 API calls after speedtest.
-	defer globalNotificationSys.ServiceFreeze(ctx, false)
 
 	hostAnonymizer := createHostAnonymizer()
 	// anonAddr - Anonymizes hosts in given input string.
@@ -2011,7 +2114,10 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 		if !globalIsDistErasure {
 			// FS mode - single server - hard code to `server1`
 			anonCmdLine := strings.ReplaceAll(cmdLine, globalLocalNodeName, "server1")
-			return strings.ReplaceAll(anonCmdLine, globalMinioConsoleHost, "server1")
+			if len(globalMinioConsoleHost) > 0 {
+				anonCmdLine = strings.ReplaceAll(anonCmdLine, globalMinioConsoleHost, "server1")
+			}
+			return anonCmdLine
 		}
 
 		// Server start command regex groups:
@@ -2101,89 +2207,6 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 		}
 	}
 
-	getAndWriteDrivePerfInfo := func() {
-		if query.Get(string(madmin.HealthDataTypePerfDrive)) == "true" {
-			opts := madmin.DriveSpeedTestOpts{
-				Serial:    false,
-				BlockSize: 4 * humanize.MiByte,
-				FileSize:  1 * humanize.GiByte,
-			}
-
-			localDPI := driveSpeedTest(ctx, opts)
-			healthInfo.Perf.DrivePerf = append(healthInfo.Perf.DrivePerf, localDPI)
-
-			perfCh := globalNotificationSys.DriveSpeedTest(ctx, opts)
-			for perfInfo := range perfCh {
-				healthInfo.Perf.DrivePerf = append(healthInfo.Perf.DrivePerf, perfInfo)
-			}
-			partialWrite(healthInfo)
-		}
-	}
-
-	getAndWriteObjPerfInfo := func() {
-		if query.Get(string(madmin.HealthDataTypePerfObj)) == "true" {
-			concurrent := 32
-			if runtime.GOMAXPROCS(0) < concurrent {
-				concurrent = runtime.GOMAXPROCS(0)
-			}
-
-			size := 64 * humanize.MiByte
-			autotune := true
-
-			sufficientCapacity, canAutotune, capacityErrMsg := validateObjPerfOptions(ctx, objectAPI, concurrent, size, autotune)
-
-			if !sufficientCapacity {
-				healthInfo.Perf.Error = capacityErrMsg
-				partialWrite(healthInfo)
-				return
-			}
-
-			if !canAutotune {
-				autotune = false
-			}
-
-			bucketExists, err := makeObjectPerfBucket(ctx, objectAPI)
-			if err != nil {
-				healthInfo.Perf.Error = "Could not make object perf bucket: " + err.Error()
-				partialWrite(healthInfo)
-				return
-			}
-
-			if !bucketExists {
-				defer deleteObjectPerfBucket(objectAPI)
-			}
-
-			opts := speedTestOpts{
-				throughputSize:   size,
-				concurrencyStart: concurrent,
-				duration:         10 * time.Second,
-				autotune:         autotune,
-			}
-
-			perfCh := objectSpeedTest(ctx, opts)
-			for perfInfo := range perfCh {
-				healthInfo.Perf.ObjPerf = append(healthInfo.Perf.ObjPerf, perfInfo)
-			}
-			partialWrite(healthInfo)
-		}
-	}
-
-	getAndWriteNetPerfInfo := func() {
-		if query.Get(string(madmin.HealthDataTypePerfObj)) == "true" {
-			if !globalIsDistErasure {
-				return
-			}
-
-			netPerf := globalNotificationSys.Netperf(ctx, time.Second*10)
-			for _, np := range netPerf {
-				np.Endpoint = anonAddr(np.Endpoint)
-				healthInfo.Perf.NetPerf = append(healthInfo.Perf.NetPerf, np)
-			}
-
-			partialWrite(healthInfo)
-		}
-	}
-
 	anonymizeNetwork := func(network map[string]string) map[string]string {
 		anonNetwork := map[string]string{}
 		for endpoint, status := range network {
@@ -2213,16 +2236,13 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 		getAndWriteMemInfo()
 		getAndWriteProcInfo()
 		getAndWriteMinioConfig()
-		getAndWriteDrivePerfInfo()
-		getAndWriteObjPerfInfo()
-		getAndWriteNetPerfInfo()
 		getAndWriteSysErrors()
 		getAndWriteSysServices()
 		getAndWriteSysConfig()
 
 		if query.Get("minioinfo") == "true" {
 			infoMessage := getServerInfo(ctx, r)
-			servers := []madmin.ServerInfo{}
+			servers := make([]madmin.ServerInfo, 0, len(infoMessage.Servers))
 			for _, server := range infoMessage.Servers {
 				anonEndpoint := anonAddr(server.Endpoint)
 				servers = append(servers, madmin.ServerInfo{
@@ -2241,6 +2261,11 @@ func (a adminAPIHandlers) HealthInfoHandler(w http.ResponseWriter, r *http.Reque
 						Frees:      server.MemStats.Frees,
 						HeapAlloc:  server.MemStats.HeapAlloc,
 					},
+					GoMaxProcs:     server.GoMaxProcs,
+					NumCPU:         server.NumCPU,
+					RuntimeVersion: server.RuntimeVersion,
+					GCStats:        server.GCStats,
+					MinioEnvVars:   server.MinioEnvVars,
 				})
 			}
 
@@ -2433,20 +2458,6 @@ func fetchLambdaInfo() []map[string][]madmin.TargetIDStatus {
 		lambdaMap[targetID.Name] = list
 	}
 
-	for _, tgt := range globalEnvTargetList.Targets() {
-		targetIDStatus := make(map[string]madmin.Status)
-		active, _ := tgt.IsActive()
-		targetID := tgt.ID()
-		if active {
-			targetIDStatus[targetID.ID] = madmin.Status{Status: string(madmin.ItemOnline)}
-		} else {
-			targetIDStatus[targetID.ID] = madmin.Status{Status: string(madmin.ItemOffline)}
-		}
-		list := lambdaMap[targetID.Name]
-		list = append(list, targetIDStatus)
-		lambdaMap[targetID.Name] = list
-	}
-
 	notify := make([]map[string][]madmin.TargetIDStatus, len(lambdaMap))
 	counter := 0
 	for key, value := range lambdaMap {
@@ -2466,7 +2477,7 @@ func fetchKMSStatus() madmin.KMS {
 		return kmsStat
 	}
 
-	stat, err := GlobalKMS.Stat()
+	stat, err := GlobalKMS.Stat(context.Background())
 	if err != nil {
 		kmsStat.Status = string(madmin.ItemOffline)
 		return kmsStat
@@ -2479,7 +2490,7 @@ func fetchKMSStatus() madmin.KMS {
 
 	kmsContext := kms.Context{"MinIO admin API": "ServerInfoHandler"} // Context for a test key operation
 	// 1. Generate a new key using the KMS.
-	key, err := GlobalKMS.GenerateKey("", kmsContext)
+	key, err := GlobalKMS.GenerateKey(context.Background(), "", kmsContext)
 	if err != nil {
 		kmsStat.Encrypt = fmt.Sprintf("Encryption failed: %v", err)
 	} else {
@@ -2560,6 +2571,94 @@ func checkConnection(endpointStr string, timeout time.Duration) error {
 	return nil
 }
 
+func embedFileInZip(zipWriter *zip.Writer, name string, data []byte) error {
+	// Send profiling data to zip as file
+	header, zerr := zip.FileInfoHeader(dummyFileInfo{
+		name:    name,
+		size:    int64(len(data)),
+		mode:    0o600,
+		modTime: UTCNow(),
+		isDir:   false,
+		sys:     nil,
+	})
+	if zerr != nil {
+		return zerr
+	}
+	header.Method = zip.Deflate
+	zwriter, zerr := zipWriter.CreateHeader(header)
+	if zerr != nil {
+		return zerr
+	}
+	_, err := io.Copy(zwriter, bytes.NewReader(data))
+	return err
+}
+
+// getClusterMetaInfo gets information of the current cluster and
+// returns it.
+// This is not a critical function, and it is allowed
+// to fail with a ten seconds timeout, returning nil.
+func getClusterMetaInfo(ctx context.Context) []byte {
+	objectAPI := newObjectLayerFn()
+	if objectAPI == nil {
+		return nil
+	}
+
+	// Add a ten seconds timeout because getting profiling data
+	// is critical for debugging, in contrary to getting cluster info
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	resultCh := make(chan madmin.ClusterRegistrationInfo)
+	go func() {
+		ci := madmin.ClusterRegistrationInfo{}
+		ci.Info.NoOfServerPools = len(globalEndpoints)
+		ci.Info.NoOfServers = len(globalEndpoints.Hostnames())
+		ci.Info.MinioVersion = Version
+
+		si, _ := objectAPI.StorageInfo(ctx)
+
+		ci.Info.NoOfDrives = len(si.Disks)
+		for _, disk := range si.Disks {
+			ci.Info.TotalDriveSpace += disk.TotalSpace
+			ci.Info.UsedDriveSpace += disk.UsedSpace
+		}
+
+		dataUsageInfo, _ := loadDataUsageFromBackend(ctx, objectAPI)
+
+		ci.UsedCapacity = dataUsageInfo.ObjectsTotalSize
+		ci.Info.NoOfBuckets = dataUsageInfo.BucketsCount
+		ci.Info.NoOfObjects = dataUsageInfo.ObjectsTotalCount
+
+		ci.DeploymentID = globalDeploymentID
+		ci.ClusterName = fmt.Sprintf("%d-servers-%d-disks-%s", ci.Info.NoOfServers, ci.Info.NoOfDrives, ci.Info.MinioVersion)
+		resultCh <- ci
+	}()
+
+	select {
+	case <-ctx.Done():
+		return nil
+	case ci := <-resultCh:
+		out, err := json.MarshalIndent(ci, "", "  ")
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return nil
+		}
+		return out
+	}
+}
+
+func bytesToPublicKey(pub []byte) (*rsa.PublicKey, error) {
+	block, _ := pem.Decode(pub)
+	if block != nil {
+		pub = block.Bytes
+	}
+	key, err := x509.ParsePKCS1PublicKey(pub)
+	if err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
 // getRawDataer provides an interface for getting raw FS files.
 type getRawDataer interface {
 	GetRawData(ctx context.Context, volume, file string, fn func(r io.Reader, host string, disk string, filename string, info StatInfo) error) error
@@ -2579,18 +2678,24 @@ func (a adminAPIHandlers) InspectDataHandler(w http.ResponseWriter, r *http.Requ
 	}
 	defer logger.AuditLog(ctx, w, r, mustGetClaimsFromToken(r))
 
-	o, ok := newObjectLayerFn().(getRawDataer)
+	objLayer := newObjectLayerFn()
+	o, ok := objLayer.(getRawDataer)
 	if !ok {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL)
 		return
 	}
 
+	if err := parseForm(r); err != nil {
+		writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+		return
+	}
+
 	volume := r.Form.Get("volume")
-	file := r.Form.Get("file")
 	if len(volume) == 0 {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidBucketName), r.URL)
 		return
 	}
+	file := r.Form.Get("file")
 	if len(file) == 0 {
 		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInvalidRequest), r.URL)
 		return
@@ -2603,41 +2708,102 @@ func (a adminAPIHandlers) InspectDataHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	var key [32]byte
-	// MUST use crypto/rand
-	n, err := crand.Read(key[:])
-	if err != nil || n != len(key) {
-		logger.LogIf(ctx, err)
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInternalError), r.URL)
-		return
-	}
-	stream, err := sio.AES_256_GCM.Stream(key[:])
-	if err != nil {
-		logger.LogIf(ctx, err)
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInternalError), r.URL)
-		return
-	}
-	// Zero nonce, we only use each key once, and 32 bytes is plenty.
-	nonce := make([]byte, stream.NonceSize())
-	encw := stream.EncryptWriter(w, nonce, nil)
+	var publicKey *rsa.PublicKey
 
-	defer encw.Close()
+	publicKeyB64 := r.Form.Get("public-key")
+	if publicKeyB64 != "" {
+		publicKeyBytes, err := base64.StdEncoding.DecodeString(publicKeyB64)
+		if err != nil {
+			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+			return
+		}
+		publicKey, err = bytesToPublicKey(publicKeyBytes)
+		if err != nil {
+			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+			return
+		}
+	}
 
 	// Write a version for making *incompatible* changes.
 	// The AdminClient will reject any version it does not know.
-	w.Write([]byte{1})
+	var inspectZipW *zip.Writer
+	if publicKey != nil {
+		w.WriteHeader(200)
+		stream := estream.NewWriter(w)
+		defer stream.Close()
 
-	// Write key first (without encryption)
-	_, err = w.Write(key[:])
-	if err != nil {
-		writeErrorResponseJSON(ctx, w, errorCodes.ToAPIErr(ErrInternalError), r.URL)
-		return
+		clusterKey, err := bytesToPublicKey(subnetAdminPublicKey)
+		if err != nil {
+			logger.LogIf(ctx, stream.AddError(err.Error()))
+			return
+		}
+		err = stream.AddKeyEncrypted(clusterKey)
+		if err != nil {
+			logger.LogIf(ctx, stream.AddError(err.Error()))
+			return
+		}
+		if b := getClusterMetaInfo(ctx); len(b) > 0 {
+			w, err := stream.AddEncryptedStream("cluster.info", nil)
+			if err != nil {
+				logger.LogIf(ctx, err)
+				return
+			}
+			w.Write(b)
+			w.Close()
+		}
+
+		// Add new key for inspect data.
+		if err := stream.AddKeyEncrypted(publicKey); err != nil {
+			logger.LogIf(ctx, stream.AddError(err.Error()))
+			return
+		}
+		encStream, err := stream.AddEncryptedStream("inspect.zip", nil)
+		if err != nil {
+			logger.LogIf(ctx, stream.AddError(err.Error()))
+			return
+		}
+		defer encStream.Close()
+
+		inspectZipW = zip.NewWriter(encStream)
+		defer inspectZipW.Close()
+	} else {
+		// Legacy: Remove if we stop supporting inspection without public key.
+		var key [32]byte
+		// MUST use crypto/rand
+		n, err := crand.Read(key[:])
+		if err != nil || n != len(key) {
+			logger.LogIf(ctx, err)
+			writeErrorResponseJSON(ctx, w, toAdminAPIErr(ctx, err), r.URL)
+			return
+		}
+
+		// Write a version for making *incompatible* changes.
+		// The AdminClient will reject any version it does not know.
+		if publicKey == nil {
+			w.Write([]byte{1})
+			w.Write(key[:])
+		}
+
+		stream, err := sio.AES_256_GCM.Stream(key[:])
+		if err != nil {
+			logger.LogIf(ctx, err)
+			return
+		}
+		// Zero nonce, we only use each key once, and 32 bytes is plenty.
+		nonce := make([]byte, stream.NonceSize())
+		encw := stream.EncryptWriter(w, nonce, nil)
+		defer encw.Close()
+
+		// Initialize a zip writer which will provide a zipped content
+		// of profiling data of all nodes
+		inspectZipW = zip.NewWriter(encw)
+		defer inspectZipW.Close()
+
+		if b := getClusterMetaInfo(ctx); len(b) > 0 {
+			logger.LogIf(ctx, embedFileInZip(inspectZipW, "cluster.info", b))
+		}
 	}
 
-	// Initialize a zip writer which will provide a zipped content
-	// of profiling data of all nodes
-	zipWriter := zip.NewWriter(encw)
-	defer zipWriter.Close()
 	rawDataFn := func(r io.Reader, host, disk, filename string, si StatInfo) error {
 		// Prefix host+disk
 		filename = path.Join(host, disk, filename)
@@ -2666,17 +2832,17 @@ func (a adminAPIHandlers) InspectDataHandler(w http.ResponseWriter, r *http.Requ
 			return nil
 		}
 		header.Method = zip.Deflate
-		zwriter, zerr := zipWriter.CreateHeader(header)
+		zwriter, zerr := inspectZipW.CreateHeader(header)
 		if zerr != nil {
 			logger.LogIf(ctx, zerr)
 			return nil
 		}
-		if _, err = io.Copy(zwriter, r); err != nil {
+		if _, err := io.Copy(zwriter, r); err != nil {
 			logger.LogIf(ctx, err)
 		}
 		return nil
 	}
-	err = o.GetRawData(ctx, volume, file, rawDataFn)
+	err := o.GetRawData(ctx, volume, file, rawDataFn)
 	if !errors.Is(err, errFileNotFound) {
 		logger.LogIf(ctx, err)
 	}
@@ -2688,20 +2854,17 @@ func (a adminAPIHandlers) InspectDataHandler(w http.ResponseWriter, r *http.Requ
 	if !errors.Is(err, errFileNotFound) {
 		logger.LogIf(ctx, err)
 	}
+
 	// save args passed to inspect command
-	inspectArgs := []string{fmt.Sprintf(" Inspect path: %s%s%s\n", volume, slashSeparator, file)}
-	cmdLine := []string{"Server command line args: "}
+	var sb bytes.Buffer
+	fmt.Fprintf(&sb, "Inspect path: %s%s%s\n", volume, slashSeparator, file)
+	sb.WriteString("Server command line args:")
 	for _, pool := range globalEndpoints {
-		cmdLine = append(cmdLine, pool.CmdLine)
+		sb.WriteString(" ")
+		sb.WriteString(pool.CmdLine)
 	}
-	cmdLine = append(cmdLine, "\n")
-	inspectArgs = append(inspectArgs, cmdLine...)
-	inspectArgsBytes := []byte(strings.Join(inspectArgs, " "))
-	if err = rawDataFn(bytes.NewReader(inspectArgsBytes), "", "", "inspect-input.txt", StatInfo{
-		Size: int64(len(inspectArgsBytes)),
-	}); err != nil {
-		logger.LogIf(ctx, err)
-	}
+	sb.WriteString("\n")
+	logger.LogIf(ctx, embedFileInZip(inspectZipW, "inspect-input.txt", sb.Bytes()))
 }
 
 func createHostAnonymizerForFSMode() map[string]string {

@@ -21,7 +21,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"path"
@@ -63,7 +62,7 @@ func (t *testingLogger) Type() types.TargetType {
 	return types.TargetHTTP
 }
 
-func (t *testingLogger) Send(entry interface{}, errKind string) error {
+func (t *testingLogger) Send(entry interface{}) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.t == nil {
@@ -75,7 +74,7 @@ func (t *testingLogger) Send(entry interface{}, errKind string) error {
 	}
 
 	t.t.Helper()
-	t.t.Log(e.Level, ":", errKind, e.Message)
+	t.t.Log(e.Level, ":", e.Message)
 	return nil
 }
 
@@ -100,15 +99,11 @@ func TestDataUpdateTracker(t *testing.T) {
 
 	dut.Current.bf = dut.newBloomFilter()
 
-	tmpDir, err := ioutil.TempDir("", "TestDataUpdateTracker")
+	tmpDir := t.TempDir()
+	err := os.MkdirAll(filepath.Dir(filepath.Join(tmpDir, dataUpdateTrackerFilename)), os.ModePerm)
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = os.MkdirAll(filepath.Dir(filepath.Join(tmpDir, dataUpdateTrackerFilename)), os.ModePerm)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	dut.start(ctx, tmpDir)
@@ -205,11 +200,13 @@ func TestDataUpdateTracker(t *testing.T) {
 	}
 
 	ctx, cancel = context.WithCancel(context.Background())
-	defer cancel()
-
 	// Reload...
 	dut = newDataUpdateTracker()
 	dut.start(ctx, tmpDir)
+	defer func() {
+		cancel()
+		<-dut.saveExited
+	}()
 
 	if dut.current() != 2 {
 		t.Fatal("current idx after load not preserved. want 2, got:", dut.current())

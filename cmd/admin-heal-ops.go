@@ -100,14 +100,14 @@ type allHealState struct {
 }
 
 // newHealState - initialize global heal state management
-func newHealState(cleanup bool) *allHealState {
+func newHealState(ctx context.Context, cleanup bool) *allHealState {
 	hstate := &allHealState{
 		healSeqMap:     make(map[string]*healSequence),
 		healLocalDisks: make(map[Endpoint]bool),
 		healStatus:     make(map[string]healingTracker),
 	}
 	if cleanup {
-		go hstate.periodicHealSeqsClean(GlobalContext)
+		go hstate.periodicHealSeqsClean(ctx)
 	}
 	return hstate
 }
@@ -822,7 +822,7 @@ func (h *healSequence) healBuckets(objAPI ObjectLayer, bucketsOnly bool) error {
 		return h.healBucket(objAPI, h.bucket, bucketsOnly)
 	}
 
-	buckets, err := objAPI.ListBuckets(h.ctx)
+	buckets, err := objAPI.ListBuckets(h.ctx, BucketOptions{})
 	if err != nil {
 		return errFnHealFromAPIErr(h.ctx, err)
 	}

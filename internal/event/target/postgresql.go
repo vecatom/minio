@@ -33,6 +33,7 @@ import (
 	_ "github.com/lib/pq" // Register postgres driver
 
 	"github.com/minio/minio/internal/event"
+	"github.com/minio/minio/internal/logger"
 	xnet "github.com/minio/pkg/net"
 )
 
@@ -136,6 +137,8 @@ func (p PostgreSQLArgs) Validate() error {
 
 // PostgreSQLTarget - PostgreSQL target.
 type PostgreSQLTarget struct {
+	lazyInit lazyInit
+
 	id         event.TargetID
 	args       PostgreSQLArgs
 	updateStmt *sql.Stmt
@@ -145,7 +148,8 @@ type PostgreSQLTarget struct {
 	store      Store
 	firstPing  bool
 	connString string
-	loggerOnce func(ctx context.Context, err error, id interface{}, errKind ...interface{})
+	loggerOnce logger.LogOnce
+	quitCh     chan struct{}
 }
 
 // ID - returns target ID.
@@ -153,24 +157,15 @@ func (target *PostgreSQLTarget) ID() event.TargetID {
 	return target.id
 }
 
-// HasQueueStore - Checks if the queueStore has been configured for the target
-func (target *PostgreSQLTarget) HasQueueStore() bool {
-	return target.store != nil
-}
-
 // IsActive - Return true if target is up and active
 func (target *PostgreSQLTarget) IsActive() (bool, error) {
-	if target.db == nil {
-		db, err := sql.Open("postgres", target.connString)
-		if err != nil {
-			return false, err
-		}
-		target.db = db
-		if target.args.MaxOpenConnections > 0 {
-			// Set the maximum connections limit
-			target.db.SetMaxOpenConns(target.args.MaxOpenConnections)
-		}
+	if err := target.init(); err != nil {
+		return false, err
 	}
+	return target.isActive()
+}
+
+func (target *PostgreSQLTarget) isActive() (bool, error) {
 	if err := target.db.Ping(); err != nil {
 		if IsConnErr(err) {
 			return false, errNotConnected
@@ -182,10 +177,14 @@ func (target *PostgreSQLTarget) IsActive() (bool, error) {
 
 // Save - saves the events to the store if questore is configured, which will be replayed when the PostgreSQL connection is active.
 func (target *PostgreSQLTarget) Save(eventData event.Event) error {
+	if err := target.init(); err != nil {
+		return err
+	}
+
 	if target.store != nil {
 		return target.store.Put(eventData)
 	}
-	_, err := target.IsActive()
+	_, err := target.isActive()
 	if err != nil {
 		return err
 	}
@@ -240,7 +239,11 @@ func (target *PostgreSQLTarget) send(eventData event.Event) error {
 
 // Send - reads an event from store and sends it to PostgreSQL.
 func (target *PostgreSQLTarget) Send(eventKey string) error {
-	_, err := target.IsActive()
+	if err := target.init(); err != nil {
+		return err
+	}
+
+	_, err := target.isActive()
 	if err != nil {
 		return err
 	}
@@ -276,6 +279,7 @@ func (target *PostgreSQLTarget) Send(eventKey string) error {
 
 // Close - closes underneath connections to PostgreSQL database.
 func (target *PostgreSQLTarget) Close() error {
+	close(target.quitCh)
 	if target.updateStmt != nil {
 		// FIXME: log returned error. ignore time being.
 		_ = target.updateStmt.Close()
@@ -328,8 +332,55 @@ func (target *PostgreSQLTarget) executeStmts() error {
 	return nil
 }
 
+func (target *PostgreSQLTarget) init() error {
+	return target.lazyInit.Do(target.initPostgreSQL)
+}
+
+func (target *PostgreSQLTarget) initPostgreSQL() error {
+	args := target.args
+
+	db, err := sql.Open("postgres", target.connString)
+	if err != nil {
+		return err
+	}
+	target.db = db
+
+	if args.MaxOpenConnections > 0 {
+		// Set the maximum connections limit
+		target.db.SetMaxOpenConns(args.MaxOpenConnections)
+	}
+
+	err = target.db.Ping()
+	if err != nil {
+		if !(IsConnRefusedErr(err) || IsConnResetErr(err)) {
+			target.loggerOnce(context.Background(), err, target.ID().String())
+		}
+	} else {
+		if err = target.executeStmts(); err != nil {
+			target.loggerOnce(context.Background(), err, target.ID().String())
+		} else {
+			target.firstPing = true
+		}
+	}
+
+	if err != nil {
+		target.db.Close()
+		return err
+	}
+
+	yes, err := target.isActive()
+	if err != nil {
+		return err
+	}
+	if !yes {
+		return errNotConnected
+	}
+
+	return nil
+}
+
 // NewPostgreSQLTarget - creates new PostgreSQL target.
-func NewPostgreSQLTarget(id string, args PostgreSQLArgs, doneCh <-chan struct{}, loggerOnce func(ctx context.Context, err error, id interface{}, kind ...interface{}), test bool) (*PostgreSQLTarget, error) {
+func NewPostgreSQLTarget(id string, args PostgreSQLArgs, loggerOnce logger.LogOnce) (*PostgreSQLTarget, error) {
 	params := []string{args.ConnectionString}
 	if args.ConnectionString == "" {
 		params = []string{}
@@ -351,56 +402,27 @@ func NewPostgreSQLTarget(id string, args PostgreSQLArgs, doneCh <-chan struct{},
 	}
 	connStr := strings.Join(params, " ")
 
+	var store Store
+	if args.QueueDir != "" {
+		queueDir := filepath.Join(args.QueueDir, storePrefix+"-postgresql-"+id)
+		store = NewQueueStore(queueDir, args.QueueLimit)
+		if err := store.Open(); err != nil {
+			return nil, fmt.Errorf("unable to initialize the queue store of PostgreSQL `%s`: %w", id, err)
+		}
+	}
+
 	target := &PostgreSQLTarget{
 		id:         event.TargetID{ID: id, Name: "postgresql"},
 		args:       args,
 		firstPing:  false,
+		store:      store,
 		connString: connStr,
 		loggerOnce: loggerOnce,
+		quitCh:     make(chan struct{}),
 	}
 
-	db, err := sql.Open("postgres", connStr)
-	if err != nil {
-		return target, err
-	}
-	target.db = db
-
-	if args.MaxOpenConnections > 0 {
-		// Set the maximum connections limit
-		target.db.SetMaxOpenConns(args.MaxOpenConnections)
-	}
-
-	var store Store
-
-	if args.QueueDir != "" {
-		queueDir := filepath.Join(args.QueueDir, storePrefix+"-postgresql-"+id)
-		store = NewQueueStore(queueDir, args.QueueLimit)
-		if oErr := store.Open(); oErr != nil {
-			target.loggerOnce(context.Background(), oErr, target.ID())
-			return target, oErr
-		}
-		target.store = store
-	}
-
-	err = target.db.Ping()
-	if err != nil {
-		if target.store == nil || !(IsConnRefusedErr(err) || IsConnResetErr(err)) {
-			target.loggerOnce(context.Background(), err, target.ID())
-			return target, err
-		}
-	} else {
-		if err = target.executeStmts(); err != nil {
-			target.loggerOnce(context.Background(), err, target.ID())
-			return target, err
-		}
-		target.firstPing = true
-	}
-
-	if target.store != nil && !test {
-		// Replays the events from the store.
-		eventKeyCh := replayEvents(target.store, doneCh, target.loggerOnce, target.ID())
-		// Start replaying events from the store.
-		go sendEvents(target, eventKeyCh, doneCh, target.loggerOnce)
+	if target.store != nil {
+		streamEventsFromStore(target.store, target, target.quitCh, target.loggerOnce)
 	}
 
 	return target, nil
